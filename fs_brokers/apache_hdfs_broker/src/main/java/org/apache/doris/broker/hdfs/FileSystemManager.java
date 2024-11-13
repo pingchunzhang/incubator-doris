@@ -152,6 +152,7 @@ public class FileSystemManager {
     private static final String FS_BOS_SECRET_KEY = "fs.bos.secret.access.key";
     private static final String FS_BOS_ENDPOINT = "fs.bos.endpoint";
     private static final String FS_BOS_IMPL = "fs.bos.impl";
+    private static final String FS_BOS_IMPL_DISABLE_CACHE = "fs.bos.impl.disable.cache";
     private static final String FS_BOS_MULTIPART_UPLOADS_BLOCK_SIZE = "fs.bos.multipart.uploads.block.size";
 
     // arguments for afs
@@ -159,11 +160,10 @@ public class FileSystemManager {
     private static final String HADOOP_JOB_UGI = "hadoop.job.ugi";
     private static final String FS_DEFAULT_NAME = "fs.default.name";
     private static final String FS_AFS_IMPL = "fs.afs.impl";
+    private static final String FS_AFS_IMPL_DISABLE_CACHE = "fs.afs.impl.disable.cache";
     private static final String DFS_AGENT_PORT = "dfs.agent.port";
     private static final String DFS_CLIENT_AUTH_METHOD = "dfs.client.auth.method";
     private static final String DFS_RPC_TIMEOUT = "dfs.rpc.timeout";
-
-    private ScheduledExecutorService handleManagementPool = Executors.newScheduledThreadPool(2);
 
     private int readBufferSize = 128 << 10; // 128k
     private int writeBufferSize = 128 << 10; // 128k
@@ -173,7 +173,7 @@ public class FileSystemManager {
 
     public FileSystemManager() {
         cachedFileSystem = new ConcurrentHashMap<>();
-        clientContextManager = new ClientContextManager(handleManagementPool);
+        clientContextManager = new ClientContextManager();
         readBufferSize = BrokerConfig.hdfs_read_buffer_size_kb << 10;
         writeBufferSize = BrokerConfig.hdfs_write_buffer_size_kb << 10;
     }
@@ -236,6 +236,8 @@ public class FileSystemManager {
             brokerFileSystem = getGooseFSFileSystem(path, properties);
         } else if (scheme.equals(GCS_SCHEME)) {
             brokerFileSystem = getGCSFileSystem(path, properties);
+        } else if (scheme.equals(AFS_SCHEME)) {
+            brokerFileSystem = getAfsFileSystem(path, properties);
         } else {
             throw new BrokerException(TBrokerOperationStatusCode.INVALID_INPUT_FILE_PATH,
                 "invalid path. scheme is not supported");
@@ -847,6 +849,7 @@ public class FileSystemManager {
                 conf.set(FS_BOS_SECRET_KEY, secretKey);
                 conf.set(FS_BOS_ENDPOINT, endpoint);
                 conf.set(FS_BOS_IMPL, "org.apache.hadoop.fs.bos.BaiduBosFileSystem");
+                conf.set(FS_BOS_IMPL_DISABLE_CACHE, "true");
                 conf.set(FS_BOS_MULTIPART_UPLOADS_BLOCK_SIZE, multiPartUploadBlockSize);
                 FileSystem bosFileSystem = FileSystem.get(pathUri.getUri(), conf);
                 fileSystem.setFileSystem(bosFileSystem);
@@ -1010,7 +1013,8 @@ public class FileSystemManager {
                 conf.set(HADOOP_JOB_UGI, afsUgi);
                 conf.set(HADOOP_JOB_GROUP_NAME, group);
                 conf.set(FS_DEFAULT_NAME, host);
-                conf.set(FS_AFS_IMPL, "org.apache.hadoop.fs.DFileSystem");
+                conf.set(FS_AFS_IMPL, properties.getOrDefault(FS_AFS_IMPL, "org.apache.hadoop.fs.LiteFileSystem"));
+                conf.set(FS_AFS_IMPL_DISABLE_CACHE, "true");
                 conf.set(DFS_CLIENT_AUTH_METHOD, properties.getOrDefault(DFS_CLIENT_AUTH_METHOD, "3"));
                 conf.set(DFS_AGENT_PORT, properties.getOrDefault(DFS_AGENT_PORT, "20001"));
                 conf.set(DFS_RPC_TIMEOUT, properties.getOrDefault(DFS_RPC_TIMEOUT, "300000"));

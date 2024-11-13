@@ -39,23 +39,25 @@ namespace vectorized {
 class IColumn;
 
 Status DataTypeHLLSerDe::serialize_column_to_json(const IColumn& column, int start_idx, int end_idx,
-                                                  BufferWritable& bw, FormatOptions& options,
-                                                  int nesting_level) const {
+                                                  BufferWritable& bw,
+                                                  FormatOptions& options) const {
     SERIALIZE_COLUMN_TO_JSON();
 }
 
 Status DataTypeHLLSerDe::serialize_one_cell_to_json(const IColumn& column, int row_num,
-                                                    BufferWritable& bw, FormatOptions& options,
-                                                    int nesting_level) const {
+                                                    BufferWritable& bw,
+                                                    FormatOptions& options) const {
     if (!options._output_object_data) {
         /**
          * For null values in ordinary types, we use \N to represent them;
          * for null values in nested types, we use null to represent them, just like the json format.
          */
-        if (nesting_level >= 2) {
-            bw.write(DataTypeNullableSerDe::NULL_IN_CSV_FOR_NESTED_TYPE.c_str(), 4);
+        if (_nesting_level >= 2) {
+            bw.write(DataTypeNullableSerDe::NULL_IN_COMPLEX_TYPE.c_str(),
+                     strlen(NULL_IN_COMPLEX_TYPE.c_str()));
         } else {
-            bw.write(DataTypeNullableSerDe::NULL_IN_CSV_FOR_ORDINARY_TYPE.c_str(), 2);
+            bw.write(DataTypeNullableSerDe::NULL_IN_CSV_FOR_ORDINARY_TYPE.c_str(),
+                     strlen(NULL_IN_CSV_FOR_ORDINARY_TYPE.c_str()));
         }
         return Status::OK();
     }
@@ -63,7 +65,8 @@ Status DataTypeHLLSerDe::serialize_one_cell_to_json(const IColumn& column, int r
     ColumnPtr ptr = col_row.first;
     row_num = col_row.second;
     auto& data = const_cast<HyperLogLog&>(assert_cast<const ColumnHLL&>(*ptr).get_element(row_num));
-    std::unique_ptr<char[]> buf = std::make_unique<char[]>(data.max_serialized_size());
+    std::unique_ptr<char[]> buf =
+            std::make_unique_for_overwrite<char[]>(data.max_serialized_size());
     size_t size = data.serialize((uint8*)buf.get());
     bw.write(buf.get(), size);
     return Status::OK();
@@ -72,15 +75,13 @@ Status DataTypeHLLSerDe::serialize_one_cell_to_json(const IColumn& column, int r
 Status DataTypeHLLSerDe::deserialize_column_from_json_vector(IColumn& column,
                                                              std::vector<Slice>& slices,
                                                              int* num_deserialized,
-                                                             const FormatOptions& options,
-                                                             int nesting_level) const {
+                                                             const FormatOptions& options) const {
     DESERIALIZE_COLUMN_FROM_JSON_VECTOR();
     return Status::OK();
 }
 
 Status DataTypeHLLSerDe::deserialize_one_cell_from_json(IColumn& column, Slice& slice,
-                                                        const FormatOptions& options,
-                                                        int nesting_level) const {
+                                                        const FormatOptions& options) const {
     auto& data_column = assert_cast<ColumnHLL&>(column);
 
     HyperLogLog hyper_log_log(slice);
@@ -133,8 +134,8 @@ void DataTypeHLLSerDe::read_one_cell_from_jsonb(IColumn& column, const JsonbValu
 }
 
 void DataTypeHLLSerDe::write_column_to_arrow(const IColumn& column, const NullMap* null_map,
-                                             arrow::ArrayBuilder* array_builder, int start,
-                                             int end) const {
+                                             arrow::ArrayBuilder* array_builder, int start, int end,
+                                             const cctz::time_zone& ctz) const {
     const auto& col = assert_cast<const ColumnHLL&>(column);
     auto& builder = assert_cast<arrow::StringBuilder&>(*array_builder);
     for (size_t string_i = start; string_i < end; ++string_i) {
@@ -155,13 +156,14 @@ void DataTypeHLLSerDe::write_column_to_arrow(const IColumn& column, const NullMa
 template <bool is_binary_format>
 Status DataTypeHLLSerDe::_write_column_to_mysql(const IColumn& column,
                                                 MysqlRowBuffer<is_binary_format>& result,
-                                                int row_idx, bool col_const) const {
+                                                int row_idx, bool col_const,
+                                                const FormatOptions& options) const {
     auto& data_column = assert_cast<const ColumnHLL&>(column);
     if (_return_object_as_string) {
         const auto col_index = index_check_const(row_idx, col_const);
         HyperLogLog hyperLogLog = data_column.get_element(col_index);
         size_t size = hyperLogLog.max_serialized_size();
-        std::unique_ptr<char[]> buf = std::make_unique<char[]>(size);
+        std::unique_ptr<char[]> buf = std::make_unique_for_overwrite<char[]>(size);
         hyperLogLog.serialize((uint8*)buf.get());
         if (UNLIKELY(0 != result.push_string(buf.get(), size))) {
             return Status::InternalError("pack mysql buffer failed.");
@@ -176,17 +178,18 @@ Status DataTypeHLLSerDe::_write_column_to_mysql(const IColumn& column,
 
 Status DataTypeHLLSerDe::write_column_to_mysql(const IColumn& column,
                                                MysqlRowBuffer<true>& row_buffer, int row_idx,
-                                               bool col_const) const {
-    return _write_column_to_mysql(column, row_buffer, row_idx, col_const);
+                                               bool col_const, const FormatOptions& options) const {
+    return _write_column_to_mysql(column, row_buffer, row_idx, col_const, options);
 }
 
 Status DataTypeHLLSerDe::write_column_to_mysql(const IColumn& column,
                                                MysqlRowBuffer<false>& row_buffer, int row_idx,
-                                               bool col_const) const {
-    return _write_column_to_mysql(column, row_buffer, row_idx, col_const);
+                                               bool col_const, const FormatOptions& options) const {
+    return _write_column_to_mysql(column, row_buffer, row_idx, col_const, options);
 }
 
-Status DataTypeHLLSerDe::write_column_to_orc(const IColumn& column, const NullMap* null_map,
+Status DataTypeHLLSerDe::write_column_to_orc(const std::string& timezone, const IColumn& column,
+                                             const NullMap* null_map,
                                              orc::ColumnVectorBatch* orc_col_batch, int start,
                                              int end, std::vector<StringRef>& buffer_list) const {
     auto& col_data = assert_cast<const ColumnHLL&>(column);

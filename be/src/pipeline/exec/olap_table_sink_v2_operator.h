@@ -18,32 +18,62 @@
 #pragma once
 
 #include "operator.h"
-#include "vec/sink/vtablet_sink_v2.h"
+#include "vec/sink/writer/vtablet_writer_v2.h"
 
-namespace doris {
+namespace doris::pipeline {
 
-namespace pipeline {
+class OlapTableSinkV2OperatorX;
 
-class OlapTableSinkV2OperatorBuilder final
-        : public DataSinkOperatorBuilder<vectorized::VOlapTableSinkV2> {
+class OlapTableSinkV2LocalState final
+        : public AsyncWriterSink<vectorized::VTabletWriterV2, OlapTableSinkV2OperatorX> {
 public:
-    OlapTableSinkV2OperatorBuilder(int32_t id, DataSink* sink)
-            : DataSinkOperatorBuilder(id, "OlapTableSinkV2Operator", sink) {}
-
-    OperatorPtr build_operator() override;
+    using Base = AsyncWriterSink<vectorized::VTabletWriterV2, OlapTableSinkV2OperatorX>;
+    using Parent = OlapTableSinkV2OperatorX;
+    ENABLE_FACTORY_CREATOR(OlapTableSinkV2LocalState);
+    OlapTableSinkV2LocalState(DataSinkOperatorXBase* parent, RuntimeState* state)
+            : Base(parent, state) {};
+    friend class OlapTableSinkV2OperatorX;
 };
 
-class OlapTableSinkV2Operator final : public DataSinkOperator<OlapTableSinkV2OperatorBuilder> {
+class OlapTableSinkV2OperatorX final : public DataSinkOperatorX<OlapTableSinkV2LocalState> {
 public:
-    OlapTableSinkV2Operator(OperatorBuilderBase* operator_builder, DataSink* sink)
-            : DataSinkOperator(operator_builder, sink) {}
+    using Base = DataSinkOperatorX<OlapTableSinkV2LocalState>;
+    OlapTableSinkV2OperatorX(ObjectPool* pool, int operator_id, const RowDescriptor& row_desc,
+                             const std::vector<TExpr>& t_output_expr)
+            : Base(operator_id, 0),
+              _row_desc(row_desc),
+              _t_output_expr(t_output_expr),
+              _pool(pool) {};
 
-    bool can_write() override { return true; } // TODO: need use mem_limit
+    Status init(const TDataSink& thrift_sink) override {
+        RETURN_IF_ERROR(Base::init(thrift_sink));
+        // From the thrift expressions create the real exprs.
+        RETURN_IF_ERROR(vectorized::VExpr::create_expr_trees(_t_output_expr, _output_vexpr_ctxs));
+        return Status::OK();
+    }
+
+    Status open(RuntimeState* state) override {
+        RETURN_IF_ERROR(Base::open(state));
+        RETURN_IF_ERROR(vectorized::VExpr::prepare(_output_vexpr_ctxs, state, _row_desc));
+        return vectorized::VExpr::open(_output_vexpr_ctxs, state);
+    }
+
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override {
+        auto& local_state = get_local_state(state);
+        SCOPED_TIMER(local_state.exec_time_counter());
+        COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)in_block->rows());
+        return local_state.sink(state, in_block, eos);
+    }
+
+private:
+    friend class OlapTableSinkV2LocalState;
+    template <typename Writer, typename Parent>
+        requires(std::is_base_of_v<vectorized::AsyncResultWriter, Writer>)
+    friend class AsyncWriterSink;
+    const RowDescriptor& _row_desc;
+    vectorized::VExprContextSPtrs _output_vexpr_ctxs;
+    const std::vector<TExpr>& _t_output_expr;
+    ObjectPool* _pool = nullptr;
 };
 
-OperatorPtr OlapTableSinkV2OperatorBuilder::build_operator() {
-    return std::make_shared<OlapTableSinkV2Operator>(this, _sink);
-}
-
-} // namespace pipeline
-} // namespace doris
+} // namespace doris::pipeline

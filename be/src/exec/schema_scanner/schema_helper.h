@@ -37,6 +37,10 @@ class TListTableStatusResult;
 class TListTableMetadataNameIdsResult;
 class TShowVariableRequest;
 class TShowVariableResult;
+class TShowProcessListRequest;
+class TShowProcessListResult;
+class TShowUserRequest;
+class TShowUserResult;
 
 // this class is a helper for getting schema info from FE
 class SchemaHelper {
@@ -54,10 +58,6 @@ public:
     static Status list_table_metadata_name_ids(const std::string& ip, const int32_t port,
                                                const doris::TGetTablesParams& request,
                                                TListTableMetadataNameIdsResult* result);
-
-    static Status describe_table(const std::string& ip, const int32_t port,
-                                 const TDescribeTableParams& desc_params,
-                                 TDescribeTableResult* desc_result);
 
     static Status describe_tables(const std::string& ip, const int32_t port,
                                   const TDescribeTablesParams& desc_params,
@@ -80,6 +80,12 @@ public:
                                              TListPrivilegesResult* privileges_result);
 
     static std::string extract_db_name(const std::string& full_name);
+
+    static Status show_process_list(const std::string& ip, const int32_t port,
+                                    const TShowProcessListRequest& request,
+                                    TShowProcessListResult* result);
+    static Status show_user(const std::string& ip, const int32_t port,
+                            const TShowUserRequest& request, TShowUserResult* result);
 };
 
 } // namespace doris

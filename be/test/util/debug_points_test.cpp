@@ -60,7 +60,7 @@ TEST(DebugPointsTest, BaseTest) {
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ(1, dp->param<int>("v1", 100)));
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ("a", dp->param<std::string>("v2")));
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ("a", dp->param("v2", std::string())));
-    DBUG_EXECUTE_IF("dbug5", EXPECT_EQ("a", dp->param("v2", "b")));
+    DBUG_EXECUTE_IF("dbug5", EXPECT_STREQ("a", dp->param("v2", "b")));
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ(1.2, dp->param<double>("v3")));
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ(1.2, dp->param("v3", 0.0)));
     DBUG_EXECUTE_IF("dbug5", EXPECT_TRUE(dp->param("v4", false)));
@@ -68,7 +68,55 @@ TEST(DebugPointsTest, BaseTest) {
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ(0L, dp->param<int64_t>("v_not_exist")));
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ(0L, dp->param("v_not_exist", 0L)));
     DBUG_EXECUTE_IF("dbug5", EXPECT_EQ(123, dp->param("v_not_exist", 123)));
-    DBUG_EXECUTE_IF("dbug5", EXPECT_EQ("abcd", dp->param("v_not_exist", "abcd")));
+    DBUG_EXECUTE_IF("dbug5", EXPECT_STREQ("abcd", dp->param("v_not_exist", "abcd")));
+
+    EXPECT_EQ(1.2, DebugPoints::instance()->get_debug_param_or_default("dbug5", "v3", 0.0));
+    EXPECT_EQ(100,
+              DebugPoints::instance()->get_debug_param_or_default("point_not_exists", "k", 100));
+
+    POST_HTTP_TO_TEST_SERVER("/api/debug_point/add/dbug6?value=567");
+    EXPECT_EQ(567, DebugPoints::instance()->get_debug_param_or_default("dbug6", 0));
+}
+
+TEST(DebugPointsTest, AddTest) {
+    config::enable_debug_points = true;
+    DebugPoints::instance()->clear();
+
+    DebugPoints::instance()->add("dbug1");
+    EXPECT_TRUE(DebugPoints::instance()->is_enable("dbug1"));
+
+    DebugPoints::instance()->add_with_params("dbug2", {{"k1", "100"}});
+    EXPECT_EQ(100, DebugPoints::instance()->get_debug_param_or_default("dbug2", "k1", 0));
+
+    DebugPoints::instance()->add_with_value("dbug3", 567);
+    EXPECT_EQ(567, DebugPoints::instance()->get_debug_param_or_default("dbug3", 567));
+
+    DebugPoints::instance()->add_with_value("dbug4", "hello");
+    EXPECT_EQ("hello",
+              DebugPoints::instance()->get_debug_param_or_default<std::string>("dbug4", ""));
+}
+
+void demo_callback() {
+    int a = 0;
+
+    DBUG_EXECUTE_IF("set_a", DBUG_RUN_CALLBACK(&a));
+    DBUG_EXECUTE_IF("get_a", DBUG_RUN_CALLBACK(a));
+}
+
+TEST(DebugPointsTest, Callback) {
+    config::enable_debug_points = true;
+    DebugPoints::instance()->clear();
+
+    int got_a = 0;
+
+    std::function<void(int*)> set_handler = [](int* a) { *a = 1000; };
+    std::function<void(int)> get_handler = [&got_a](int a) { got_a = a; };
+    DebugPoints::instance()->add_with_callback("set_a", set_handler);
+    DebugPoints::instance()->add_with_callback("get_a", get_handler);
+
+    demo_callback();
+
+    EXPECT_EQ(1000, got_a);
 }
 
 } // namespace doris

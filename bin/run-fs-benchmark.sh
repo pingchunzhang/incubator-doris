@@ -47,12 +47,17 @@ if [[ "${MAX_FILE_COUNT}" -lt 65536 ]]; then
 fi
 
 # add java libs
-for f in "${DORIS_HOME}/lib/java_extensions"/*.jar; do
-    if [[ -z "${DORIS_CLASSPATH}" ]]; then
-        export DORIS_CLASSPATH="${f}"
-    else
-        export DORIS_CLASSPATH="${f}:${DORIS_CLASSPATH}"
-    fi
+preload_jars=("preload-extensions")
+preload_jars+=("java-udf")
+
+for preload_jar_dir in "${preload_jars[@]}"; do
+    for f in "${DORIS_HOME}/lib/java_extensions/${preload_jar_dir}"/*.jar; do
+        if [[ -z "${DORIS_CLASSPATH}" ]]; then
+            export DORIS_CLASSPATH="${f}"
+        else
+            export DORIS_CLASSPATH="${DORIS_CLASSPATH}:${f}"
+        fi
+    done
 done
 
 if [[ -d "${DORIS_HOME}/lib/hadoop_hdfs/" ]]; then
@@ -68,6 +73,13 @@ if [[ -d "${DORIS_HOME}/lib/hadoop_hdfs/" ]]; then
     done
     for f in "${DORIS_HOME}/lib/hadoop_hdfs/hdfs/lib"/*.jar; do
         DORIS_CLASSPATH="${f}:${DORIS_CLASSPATH}"
+    done
+fi
+
+# add custome_libs to CLASSPATH
+if [[ -d "${DORIS_HOME}/custom_lib" ]]; then
+    for f in "${DORIS_HOME}/custom_lib"/*.jar; do
+        DORIS_CLASSPATH="${DORIS_CLASSPATH}:${f}"
     done
 fi
 
@@ -177,7 +189,7 @@ else
 fi
 
 ## set asan and ubsan env to generate core file
-export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1:detect_container_overflow=0
+export ASAN_OPTIONS=symbolize=1:abort_on_error=1:disable_coredump=0:unmap_shadow_on_exit=1:detect_container_overflow=0:check_malloc_usable_size=0
 export UBSAN_OPTIONS=print_stacktrace=1
 
 ## set TCMALLOC_HEAP_LIMIT_MB to limit memory used by tcmalloc
@@ -268,7 +280,7 @@ export LIBHDFS_OPTS="${final_java_opt}"
 #echo "LIBHDFS_OPTS: ${LIBHDFS_OPTS}"
 
 # see https://github.com/apache/doris/blob/master/docs/zh-CN/community/developer-guide/debug-tool.md#jemalloc-heap-profile
-export JEMALLOC_CONF="percpu_arena:percpu,background_thread:true,metadata_thp:auto,muzzy_decay_ms:30000,dirty_decay_ms:30000,oversize_threshold:0,lg_tcache_max:16,prof_prefix:jeprof.out"
+export JEMALLOC_CONF="percpu_arena:percpu,background_thread:true,metadata_thp:auto,muzzy_decay_ms:5000,dirty_decay_ms:5000,oversize_threshold:0,prof:true,prof_active:false,lg_prof_interval:-1"
 export AWS_EC2_METADATA_DISABLED=true
 export AWS_MAX_ATTEMPTS=2
 

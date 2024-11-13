@@ -37,10 +37,9 @@ import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
-import org.apache.doris.catalog.PrimitiveType;
-import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.common.Config;
+import org.apache.doris.common.FormatOptions;
 import org.apache.doris.common.UserException;
 import org.apache.doris.qe.CommonResultSet;
 import org.apache.doris.qe.ConnectContext;
@@ -61,7 +60,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -98,7 +96,11 @@ public class OriginalPlanner extends Planner {
 
     public void plan(StatementBase queryStmt, TQueryOptions queryOptions)
             throws UserException {
+        this.queryOptions = queryOptions;
         createPlanFragments(queryStmt, analyzer, queryOptions);
+
+        // update scan nodes visible version at the end of plan phase.
+        ScanNode.setVisibleVersionForOlapScanNodes(getScanNodes());
     }
 
     @Override
@@ -211,7 +213,7 @@ public class OriginalPlanner extends Planner {
         }
         checkAndSetTopnOpt(singleNodePlan);
 
-        if (queryOptions.num_nodes == 1 || queryStmt.isPointQuery()) {
+        if ((queryOptions.num_nodes == 1 || queryStmt.isPointQuery()) && !(statement instanceof InsertStmt)) {
             // single-node execution; we're almost done
             singleNodePlan = addUnassignedConjuncts(analyzer, singleNodePlan);
             fragments.add(new PlanFragment(plannerContext.getNextFragmentId(), singleNodePlan,
@@ -247,17 +249,21 @@ public class OriginalPlanner extends Planner {
             rootFragment.setSink(insertStmt.getDataSink());
             insertStmt.complete();
             List<Expr> exprs = statement.getResultExprs();
-            List<Expr> resExprs = Expr.substituteList(
-                    exprs, rootFragment.getPlanRoot().getOutputSmap(), analyzer, true);
-            rootFragment.setOutputExprs(resExprs);
+            rootFragment.setOutputExprs(
+                    Expr.substituteList(exprs, rootFragment.getPlanRoot().getOutputSmap(), analyzer, true));
         } else {
             List<Expr> resExprs = Expr.substituteList(queryStmt.getResultExprs(),
                     rootFragment.getPlanRoot().getOutputSmap(), analyzer, false);
-            LOG.debug("result Exprs {}", queryStmt.getResultExprs());
-            LOG.debug("substitute result Exprs {}", resExprs);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("result Exprs {}", queryStmt.getResultExprs());
+                LOG.debug("substitute result Exprs {}", resExprs);
+            }
             rootFragment.setOutputExprs(resExprs);
         }
-        LOG.debug("finalize plan fragments");
+        rootFragment.setResultSinkType(ConnectContext.get().getResultSinkType());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("finalize plan fragments");
+        }
         for (PlanFragment fragment : fragments) {
             fragment.finalize(queryStmt);
         }
@@ -272,26 +278,16 @@ public class OriginalPlanner extends Planner {
             SelectStmt selectStmt = (SelectStmt) queryStmt;
             if (queryStmt.getSortInfo() != null || selectStmt.getAggInfo() != null) {
                 isBlockQuery = true;
-                LOG.debug("this is block query");
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("this is block query");
+                }
             } else {
                 isBlockQuery = false;
-                LOG.debug("this isn't block query");
-            }
-            // Check SelectStatement if optimization condition satisfied
-            if (selectStmt.isPointQueryShortCircuit()) {
-                // Optimize for point query like: SELECT * FROM t1 WHERE pk1 = 1 and pk2 = 2
-                // such query will use direct RPC to do point query
-                LOG.debug("it's a point query");
-                Map<SlotRef, Expr> eqConjuncts = ((SelectStmt) selectStmt).getPointQueryEQPredicates();
-                OlapScanNode olapScanNode = (OlapScanNode) singleNodePlan;
-                olapScanNode.setDescTable(analyzer.getDescTbl());
-                olapScanNode.setPointQueryEqualPredicates(eqConjuncts);
-                if (analyzer.getPrepareStmt() != null) {
-                    // Cache them for later request better performance
-                    analyzer.getPrepareStmt().cacheSerializedDescriptorTable(olapScanNode.getDescTable());
-                    analyzer.getPrepareStmt().cacheSerializedOutputExprs(rootFragment.getOutputExprs());
+                if (LOG.isDebugEnabled()) {
+                    LOG.debug("this isn't block query");
                 }
-            } else if (selectStmt.isTwoPhaseReadOptEnabled()) {
+            }
+            if (selectStmt.isTwoPhaseReadOptEnabled()) {
                 // Optimize query like `SELECT ... FROM <tbl> WHERE ... ORDER BY ... LIMIT ...`
                 if (singleNodePlan instanceof SortNode
                         && singleNodePlan.getChildren().size() == 1
@@ -362,7 +358,7 @@ public class OriginalPlanner extends Planner {
         PlanFragment topPlanFragment = fragments.get(0);
         ExchangeNode topPlanNode = (ExchangeNode) topPlanFragment.getPlanRoot();
         // try to push down result file sink
-        if (topPlanNode.isMergingExchange()) {
+        if (topPlanNode.isFunctionalExchange()) {
             return;
         }
         PlanFragment secondPlanFragment = fragments.get(1);
@@ -374,7 +370,7 @@ public class OriginalPlanner extends Planner {
             return;
         }
         // create result file sink desc
-        TupleDescriptor fileStatusDesc = constructFileStatusTupleDesc(analyzer);
+        TupleDescriptor fileStatusDesc = ResultFileSink.constructFileStatusTupleDesc(analyzer.getDescTbl());
         resultFileSink.resetByDataStreamSink((DataStreamSink) secondPlanFragment.getSink());
         resultFileSink.setOutputTupleId(fileStatusDesc.getId());
         secondPlanFragment.setOutputExprs(topPlanFragment.getOutputExprs());
@@ -387,7 +383,9 @@ public class OriginalPlanner extends Planner {
 
     private SlotDescriptor injectRowIdColumnSlot(Analyzer analyzer, TupleDescriptor tupleDesc) {
         SlotDescriptor slotDesc = analyzer.getDescTbl().addSlotDescriptor(tupleDesc);
-        LOG.debug("inject slot {}", slotDesc);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("inject slot {}", slotDesc);
+        }
         String name = Column.ROWID_COL;
         Column col = new Column(name, Type.STRING, false, null, false, "",
                                         "rowid column");
@@ -527,54 +525,17 @@ public class OriginalPlanner extends Planner {
             PlanNode child = sortNode.getChild(0);
             if (child instanceof OlapScanNode && sortNode.getLimit() > 0
                     && ConnectContext.get() != null && ConnectContext.get().getSessionVariable() != null
-                    && sortNode.getLimit() <= ConnectContext.get().getSessionVariable().topnOptLimitThreshold
                     && sortNode.getSortInfo().getOrigOrderingExprs().size() > 0) {
                 Expr firstSortExpr = sortNode.getSortInfo().getOrigOrderingExprs().get(0);
-                if (firstSortExpr instanceof SlotRef && !firstSortExpr.getType().isStringType()
-                        && !firstSortExpr.getType().isFloatingPointType()) {
+                if (firstSortExpr instanceof SlotRef && !firstSortExpr.getType().isFloatingPointType()) {
                     OlapScanNode scanNode = (OlapScanNode) child;
                     if (scanNode.isDupKeysOrMergeOnWrite()) {
                         sortNode.setUseTopnOpt(true);
-                        scanNode.setUseTopnOpt(true);
+                        // scanNode.setUseTopnOpt(true);
                     }
                 }
             }
         }
-    }
-
-    /**
-     * Construct a tuple for file status, the tuple schema as following:
-     * | FileNumber | Int     |
-     * | TotalRows  | Bigint  |
-     * | FileSize   | Bigint  |
-     * | URL        | Varchar |
-     */
-    private TupleDescriptor constructFileStatusTupleDesc(Analyzer analyzer) {
-        TupleDescriptor resultFileStatusTupleDesc =
-                analyzer.getDescTbl().createTupleDescriptor("result_file_status");
-        resultFileStatusTupleDesc.setIsMaterialized(true);
-        SlotDescriptor fileNumber = analyzer.getDescTbl().addSlotDescriptor(resultFileStatusTupleDesc);
-        fileNumber.setLabel("FileNumber");
-        fileNumber.setType(ScalarType.createType(PrimitiveType.INT));
-        fileNumber.setIsMaterialized(true);
-        fileNumber.setIsNullable(false);
-        SlotDescriptor totalRows = analyzer.getDescTbl().addSlotDescriptor(resultFileStatusTupleDesc);
-        totalRows.setLabel("TotalRows");
-        totalRows.setType(ScalarType.createType(PrimitiveType.BIGINT));
-        totalRows.setIsMaterialized(true);
-        totalRows.setIsNullable(false);
-        SlotDescriptor fileSize = analyzer.getDescTbl().addSlotDescriptor(resultFileStatusTupleDesc);
-        fileSize.setLabel("FileSize");
-        fileSize.setType(ScalarType.createType(PrimitiveType.BIGINT));
-        fileSize.setIsMaterialized(true);
-        fileSize.setIsNullable(false);
-        SlotDescriptor url = analyzer.getDescTbl().addSlotDescriptor(resultFileStatusTupleDesc);
-        url.setLabel("URL");
-        url.setType(ScalarType.createType(PrimitiveType.VARCHAR));
-        url.setIsMaterialized(true);
-        url.setIsNullable(false);
-        resultFileStatusTupleDesc.computeStatAndMemLayout();
-        return resultFileStatusTupleDesc;
     }
 
     private static class QueryStatisticsTransferOptimizer {
@@ -663,13 +624,14 @@ public class OriginalPlanner extends Planner {
         List<Column> columns = new ArrayList<>(selectItems.size());
         List<String> columnLabels = parsedSelectStmt.getColLabels();
         List<String> data = new ArrayList<>();
+        FormatOptions options = FormatOptions.getDefault();
         for (int i = 0; i < selectItems.size(); i++) {
             SelectListItem item = selectItems.get(i);
             Expr expr = item.getExpr();
             String columnName = columnLabels.get(i);
             if (expr instanceof LiteralExpr) {
                 columns.add(new Column(columnName, expr.getType()));
-                super.handleLiteralInFe((LiteralExpr) expr, data);
+                data.add(((LiteralExpr) expr).getStringValueInFe(options));
             } else {
                 return Optional.empty();
             }

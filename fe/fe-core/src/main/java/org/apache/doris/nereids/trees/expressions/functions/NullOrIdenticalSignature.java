@@ -21,6 +21,7 @@ import org.apache.doris.catalog.FunctionSignature;
 import org.apache.doris.nereids.types.DataType;
 import org.apache.doris.nereids.types.NullType;
 import org.apache.doris.nereids.types.coercion.AnyDataType;
+import org.apache.doris.nereids.types.coercion.ComplexDataType;
 
 import java.util.List;
 
@@ -31,8 +32,14 @@ import java.util.List;
  * when matching a particular instantiation. That is, their fixed arguments.
  */
 public interface NullOrIdenticalSignature extends ComputeSignature {
-    /** isNullOrIdentical */
+
     static boolean isNullOrIdentical(DataType signatureType, DataType realType) {
+        return ComputeSignature.processComplexType(
+                signatureType, realType, NullOrIdenticalSignature::isPrimitiveNullOrIdentical);
+    }
+
+    /** isNullOrIdentical */
+    static boolean isPrimitiveNullOrIdentical(DataType signatureType, DataType realType) {
         try {
             // TODO: copy matchesType to DataType
             // TODO: resolve AnyDataType invoke toCatalogDataType
@@ -40,6 +47,9 @@ public interface NullOrIdenticalSignature extends ComputeSignature {
                 return true;
             }
             if (signatureType instanceof AnyDataType) {
+                return false;
+            }
+            if (signatureType instanceof ComplexDataType && !(realType instanceof ComplexDataType)) {
                 return false;
             }
             return realType.toCatalogDataType().matchesType(signatureType.toCatalogDataType());

@@ -23,6 +23,7 @@
 #include "vec/columns/column_array.h"
 #include "vec/columns/column_map.h"
 #include "vec/columns/column_nullable.h"
+#include "vec/columns/column_object.h"
 #include "vec/columns/column_struct.h"
 #include "vec/columns/column_vector.h"
 #include "vec/data_types/data_type_decimal.h"
@@ -42,17 +43,19 @@ public:
             return true;
         }
         if constexpr (arg_is_nullable) {
-            return assert_cast<const ColumnNullable*>(_ptr)->is_null_at(_offset);
+            return assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(_ptr)
+                    ->is_null_at(_offset);
         }
         return false;
     }
 
     void insert_into(IColumn& to) const {
         if constexpr (arg_is_nullable) {
-            auto* col = assert_cast<const ColumnNullable*>(_ptr);
-            assert_cast<ColVecType&>(to).insert_from(col->get_nested_column(), _offset);
+            auto* col = assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(_ptr);
+            assert_cast<ColVecType&, TypeCheckOnRelease::DISABLE>(to).insert_from(
+                    col->get_nested_column(), _offset);
         } else {
-            assert_cast<ColVecType&>(to).insert_from(*_ptr, _offset);
+            assert_cast<ColVecType&, TypeCheckOnRelease::DISABLE>(to).insert_from(*_ptr, _offset);
         }
     }
 
@@ -74,7 +77,9 @@ protected:
 template <typename ColVecType, bool arg_is_nullable>
 struct CopiedValue : public Value<ColVecType, arg_is_nullable> {
 public:
-    void insert_into(IColumn& to) const { assert_cast<ColVecType&>(to).insert(_copied_value); }
+    void insert_into(IColumn& to) const {
+        assert_cast<ColVecType&, TypeCheckOnRelease::DISABLE>(to).insert(_copied_value);
+    }
 
     bool is_null() const { return this->_ptr == nullptr; }
 
@@ -84,12 +89,13 @@ public:
         // because the address have meaningless, only need it to check is nullptr
         this->_ptr = (IColumn*)0x00000001;
         if constexpr (arg_is_nullable) {
-            auto* col = assert_cast<const ColumnNullable*>(column);
+            auto* col = assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(column);
             if (col->is_null_at(row)) {
                 this->reset();
                 return;
             } else {
-                auto& nested_col = assert_cast<const ColVecType&>(col->get_nested_column());
+                auto& nested_col = assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(
+                        col->get_nested_column());
                 nested_col.get(row, _copied_value);
             }
         } else {
@@ -107,6 +113,7 @@ public:
     using StoreType = std::conditional_t<is_copy, CopiedValue<ColVecType, arg_is_nullable>,
                                          Value<ColVecType, arg_is_nullable>>;
     static constexpr bool nullable = arg_is_nullable;
+    static constexpr bool result_nullable = result_is_nullable;
 
     void reset() {
         _data_value.reset();
@@ -160,7 +167,8 @@ struct ReaderFunctionFirstNonNullData : Data {
             return;
         }
         if constexpr (Data::nullable) {
-            const auto* nullable_column = assert_cast<const ColumnNullable*>(columns[0]);
+            const auto* nullable_column =
+                    assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(columns[0]);
             if (nullable_column->is_null_at(row)) {
                 return;
             }
@@ -180,7 +188,8 @@ template <typename Data>
 struct ReaderFunctionLastNonNullData : Data {
     void add(int64_t row, const IColumn** columns) {
         if constexpr (Data::nullable) {
-            const auto* nullable_column = assert_cast<const ColumnNullable*>(columns[0]);
+            const auto* nullable_column =
+                    assert_cast<const ColumnNullable*, TypeCheckOnRelease::DISABLE>(columns[0]);
             if (nullable_column->is_null_at(row)) {
                 return;
             }
@@ -195,20 +204,26 @@ template <typename Data>
 class ReaderFunctionData final
         : public IAggregateFunctionDataHelper<Data, ReaderFunctionData<Data>> {
 public:
-    ReaderFunctionData(const DataTypes& argument_types)
-            : IAggregateFunctionDataHelper<Data, ReaderFunctionData<Data>>(argument_types),
-              _argument_type(argument_types[0]) {}
+    ReaderFunctionData(const DataTypes& argument_types_)
+            : IAggregateFunctionDataHelper<Data, ReaderFunctionData<Data>>(argument_types_),
+              _argument_type(argument_types_[0]) {}
 
     String get_name() const override { return Data::name(); }
 
-    DataTypePtr get_return_type() const override { return _argument_type; }
+    DataTypePtr get_return_type() const override {
+        if constexpr (Data::result_nullable) {
+            return make_nullable(_argument_type);
+        } else {
+            return _argument_type;
+        }
+    }
 
     void insert_result_into(ConstAggregateDataPtr place, IColumn& to) const override {
         this->data(place).insert_result_into(to);
     }
 
-    void add(AggregateDataPtr place, const IColumn** columns, size_t row_num,
-             Arena* arena) const override {
+    void add(AggregateDataPtr place, const IColumn** columns, ssize_t row_num,
+             Arena*) const override {
         this->data(place).add(row_num, columns);
     }
 
@@ -216,17 +231,25 @@ public:
 
     void add_range_single_place(int64_t partition_start, int64_t partition_end, int64_t frame_start,
                                 int64_t frame_end, AggregateDataPtr place, const IColumn** columns,
-                                Arena* arena) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support add_range_single_place";
+                                Arena*) const override {
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support add_range_single_place");
+        __builtin_unreachable();
     }
     void merge(AggregateDataPtr place, ConstAggregateDataPtr rhs, Arena*) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support merge";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support merge");
+        __builtin_unreachable();
     }
     void serialize(ConstAggregateDataPtr place, BufferWritable& buf) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support serialize";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support serialize");
+        __builtin_unreachable();
     }
     void deserialize(AggregateDataPtr place, BufferReadable& buf, Arena*) const override {
-        LOG(FATAL) << "ReaderFunctionData do not support deserialize";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR,
+                               "ReaderFunctionData do not support deserialize");
+        __builtin_unreachable();
     }
 
 private:
@@ -252,25 +275,26 @@ AggregateFunctionPtr create_function_single_value(const String& name,
     return nullptr;
 }
 
-#define CREATE_READER_FUNCTION_WITH_NAME_AND_DATA(CREATE_FUNCTION_NAME, FUNCTION_DATA)           \
-    template <bool is_copy>                                                                      \
-    AggregateFunctionPtr CREATE_FUNCTION_NAME(                                                   \
-            const std::string& name, const DataTypes& argument_types, bool result_is_nullable) { \
-        const bool arg_is_nullable = argument_types[0]->is_nullable();                           \
-        AggregateFunctionPtr res = nullptr;                                                      \
-        std::visit(                                                                              \
-                [&](auto result_is_nullable, auto arg_is_nullable) {                             \
-                    res = AggregateFunctionPtr(                                                  \
-                            create_function_single_value<ReaderFunctionData, FUNCTION_DATA,      \
-                                                         result_is_nullable, arg_is_nullable,    \
-                                                         is_copy>(name, argument_types));        \
-                },                                                                               \
-                make_bool_variant(result_is_nullable), make_bool_variant(arg_is_nullable));      \
-        if (!res) {                                                                              \
-            LOG(WARNING) << " failed in  create_aggregate_function_" << name                     \
-                         << " and type is: " << argument_types[0]->get_name();                   \
-        }                                                                                        \
-        return res;                                                                              \
+#define CREATE_READER_FUNCTION_WITH_NAME_AND_DATA(CREATE_FUNCTION_NAME, FUNCTION_DATA)         \
+    template <bool is_copy>                                                                    \
+    AggregateFunctionPtr CREATE_FUNCTION_NAME(                                                 \
+            const std::string& name, const DataTypes& argument_types, bool result_is_nullable, \
+            const AggregateFunctionAttr& attr) {                                               \
+        const bool arg_is_nullable = argument_types[0]->is_nullable();                         \
+        AggregateFunctionPtr res = nullptr;                                                    \
+        std::visit(                                                                            \
+                [&](auto result_is_nullable, auto arg_is_nullable) {                           \
+                    res = AggregateFunctionPtr(                                                \
+                            create_function_single_value<ReaderFunctionData, FUNCTION_DATA,    \
+                                                         result_is_nullable, arg_is_nullable,  \
+                                                         is_copy>(name, argument_types));      \
+                },                                                                             \
+                make_bool_variant(result_is_nullable), make_bool_variant(arg_is_nullable));    \
+        if (!res) {                                                                            \
+            LOG(WARNING) << " failed in  create_aggregate_function_" << name                   \
+                         << " and type is: " << argument_types[0]->get_name();                 \
+        }                                                                                      \
+        return res;                                                                            \
     }
 
 CREATE_READER_FUNCTION_WITH_NAME_AND_DATA(create_aggregate_function_first, ReaderFunctionFirstData);

@@ -40,7 +40,7 @@ public class OutFileTest extends TestWithFeService implements PlanPatternMatchSu
     @Override
     protected void runBeforeAll() throws Exception {
         createDatabase("test");
-        connectContext.setDatabase("default_cluster:test");
+        connectContext.setDatabase("test");
 
         createTables(
                 "CREATE TABLE IF NOT EXISTS T1 (\n"
@@ -82,7 +82,7 @@ public class OutFileTest extends TestWithFeService implements PlanPatternMatchSu
         StatementScopeIdGenerator.clear();
         StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
         NereidsPlanner planner = new NereidsPlanner(statementContext);
-        PhysicalPlan plan = planner.plan(
+        PhysicalPlan plan = planner.planWithLock(
                 parser.parseSingle(sql),
                 PhysicalProperties.ANY
         );

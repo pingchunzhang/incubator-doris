@@ -33,26 +33,29 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalExcept;
 import org.apache.doris.nereids.trees.plans.logical.LogicalFilter;
 import org.apache.doris.nereids.trees.plans.logical.LogicalGenerate;
 import org.apache.doris.nereids.trees.plans.logical.LogicalHaving;
+import org.apache.doris.nereids.trees.plans.logical.LogicalInlineTable;
 import org.apache.doris.nereids.trees.plans.logical.LogicalIntersect;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalLimit;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPartitionTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
+import org.apache.doris.nereids.trees.plans.logical.LogicalQualify;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRepeat;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSelectHint;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSetOperation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSink;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSort;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSqlCache;
 import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
 import org.apache.doris.nereids.trees.plans.logical.LogicalTopN;
 import org.apache.doris.nereids.trees.plans.logical.LogicalUnion;
+import org.apache.doris.nereids.trees.plans.logical.LogicalView;
 import org.apache.doris.nereids.trees.plans.logical.LogicalWindow;
 import org.apache.doris.nereids.trees.plans.physical.AbstractPhysicalJoin;
 import org.apache.doris.nereids.trees.plans.physical.AbstractPhysicalSort;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalAssertNumRows;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEAnchor;
-import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEConsumer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalCTEProducer;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDeferMaterializeTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalDistribute;
@@ -71,6 +74,7 @@ import org.apache.doris.nereids.trees.plans.physical.PhysicalRelation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalRepeat;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSetOperation;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalSink;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalSqlCache;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalStorageLayerAggregate;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalTopN;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalUnion;
@@ -126,6 +130,9 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
     // *******************************
     // Logical plans
     // *******************************
+    public R visitLogicalSqlCache(LogicalSqlCache sqlCache, C context) {
+        return visit(sqlCache, context);
+    }
 
     public R visitLogicalAggregate(LogicalAggregate<? extends Plan> aggregate, C context) {
         return visit(aggregate, context);
@@ -163,6 +170,10 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
         return visit(filter, context);
     }
 
+    public R visitLogicalQualify(LogicalQualify<? extends Plan> filter, C context) {
+        return visit(filter, context);
+    }
+
     public R visitLogicalGenerate(LogicalGenerate<? extends Plan> generate, C context) {
         return visit(generate, context);
     }
@@ -173,6 +184,10 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
 
     public R visitLogicalHaving(LogicalHaving<? extends Plan> having, C context) {
         return visit(having, context);
+    }
+
+    public R visitLogicalInlineTable(LogicalInlineTable logicalInlineTable, C context) {
+        return visit(logicalInlineTable, context);
     }
 
     public R visitLogicalJoin(LogicalJoin<? extends Plan, ? extends Plan> join, C context) {
@@ -223,6 +238,10 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
         return visit(alias, context);
     }
 
+    public R visitLogicalView(LogicalView<? extends Plan> alias, C context) {
+        return visit(alias, context);
+    }
+
     public R visitLogicalTopN(LogicalTopN<? extends Plan> topN, C context) {
         return visit(topN, context);
     }
@@ -238,6 +257,9 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
     // *******************************
     // Physical plans
     // *******************************
+    public R visitPhysicalSqlCache(PhysicalSqlCache sqlCache, C context) {
+        return visit(sqlCache, context);
+    }
 
     public R visitPhysicalHashAggregate(PhysicalHashAggregate<? extends Plan> agg, C context) {
         return visit(agg, context);
@@ -254,10 +276,6 @@ public abstract class PlanVisitor<R, C> implements CommandVisitor<R, C>, Relatio
     public R visitPhysicalCTEAnchor(
             PhysicalCTEAnchor<? extends Plan, ? extends Plan> cteAnchor, C context) {
         return visit(cteAnchor, context);
-    }
-
-    public R visitPhysicalCTEConsumer(PhysicalCTEConsumer cteConsumer, C context) {
-        return visit(cteConsumer, context);
     }
 
     public R visitPhysicalCTEProducer(PhysicalCTEProducer<? extends Plan> cteProducer, C context) {

@@ -74,21 +74,22 @@ TEST(TextSerde, ScalaDataTypeSerdeTextTest) {
                 FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_STRING, {"doris be better"},
                                   {"doris be better"}),
                 // decimal ==> decimalv2(decimal<128>(27,9))
-                FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_DECIMAL,
-                                  {
-                                          // (17, 9)(first 0 will ignore)
-                                          "012345678901234567.012345678",
-                                          // (18, 8) (automatically fill 0 for scala)
-                                          "123456789012345678.01234567",
-                                          // (17, 10) (rounding last to make it fit)
-                                          "12345678901234567.0123456779",
-                                          // (17, 11) (rounding last to make it fit)
-                                          "12345678901234567.01234567791",
-                                          // (19, 8) (wrong)
-                                          "1234567890123456789.01234567",
-                                  },
-                                  {"12345678901234567.012345678", "123456789012345678.012345670",
-                                   "12345678901234567.012345678", "", ""}),
+                FieldType_RandStr(
+                        FieldType::OLAP_FIELD_TYPE_DECIMAL,
+                        {
+                                // (17, 9)(first 0 will ignore)
+                                "012345678901234567.012345678",
+                                // (18, 8) (automatically fill 0 for scala)
+                                "123456789012345678.01234567",
+                                // (17, 10) (rounding last to make it fit)
+                                "12345678901234567.0123456779",
+                                // (17, 11) (rounding last to make it fit)
+                                "12345678901234567.01234567791",
+                                // (19, 8) (wrong)
+                                "1234567890123456789.01234567",
+                        },
+                        {"12345678901234567.012345678", "123456789012345678.012345670",
+                         "12345678901234567.012345678", "12345678901234567.012345678", ""}),
                 // decimal32 ==>  decimal32(9,2)                       (7,2)         (6,3)         (7,3)           (8,1)
                 FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_DECIMAL32,
                                   {"1234567.12", "123456.123", "1234567.123", "12345679.1"},
@@ -124,7 +125,9 @@ TEST(TextSerde, ScalaDataTypeSerdeTextTest) {
         for (auto type_pair : arithmetic_scala_field_types) {
             auto type = std::get<0>(type_pair);
             DataTypePtr data_type_ptr;
-            if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL32) {
+            if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL) {
+                data_type_ptr = DataTypeFactory::instance().create_data_type(type, 27, 9);
+            } else if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL32) {
                 // decimal32(7, 2)
                 data_type_ptr = DataTypeFactory::instance().create_data_type(type, 9, 2);
             } else if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL64) {
@@ -238,12 +241,80 @@ TEST(TextSerde, ScalaDataTypeSerdeTextTest) {
             StringRef max_s_d = ser_col->get_data_at(1);
             StringRef rand_s_d = ser_col->get_data_at(2);
 
-            std::cout << "min(" << min_s << ") with datat_ype_str:" << min_s_d << std::endl;
-            std::cout << "max(" << max_s << ") with datat_ype_str:" << max_s_d << std::endl;
-            std::cout << "rand(" << rand_date << ") with datat_type_str:" << rand_s_d << std::endl;
+            std::cout << "min(" << min_s << ") with data_type_str:" << min_s_d << std::endl;
+            std::cout << "max(" << max_s << ") with data_type_str:" << max_s_d << std::endl;
+            std::cout << "rand(" << rand_date << ") with data_type_str:" << rand_s_d << std::endl;
             EXPECT_EQ(min_s, min_s_d.to_string());
             EXPECT_EQ(max_s, max_s_d.to_string());
             EXPECT_EQ(rand_date, rand_s_d.to_string());
+        }
+    }
+
+    // ipv4 and ipv6
+    {
+        typedef std::pair<FieldType, string> FieldType_RandStr;
+        std::vector<FieldType_RandStr> ip_scala_field_types = {
+                FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_IPV4, "127.0.0.1"),
+                FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_IPV6, "2405:9800:9800:66::2")};
+        for (auto pair : ip_scala_field_types) {
+            auto type = pair.first;
+            DataTypePtr data_type_ptr = DataTypeFactory::instance().create_data_type(type, 0, 0);
+            std::cout << "========= This type is  " << data_type_ptr->get_name() << ": "
+                      << fmt::format("{}", type) << std::endl;
+
+            std::unique_ptr<WrapperField> min_wf(WrapperField::create_by_type(type));
+            std::unique_ptr<WrapperField> max_wf(WrapperField::create_by_type(type));
+            std::unique_ptr<WrapperField> rand_wf(WrapperField::create_by_type(type));
+
+            min_wf->set_to_min();
+            max_wf->set_to_max();
+            static_cast<void>(rand_wf->from_string(pair.second, 0, 0));
+
+            string min_s = min_wf->to_string();
+            string max_s = max_wf->to_string();
+            string rand_ip = rand_wf->to_string();
+
+            Slice min_rb(min_s.data(), min_s.size());
+            Slice max_rb(max_s.data(), max_s.size());
+            Slice rand_rb(rand_ip.data(), rand_ip.size());
+
+            auto col = data_type_ptr->create_column();
+            DataTypeSerDeSPtr serde = data_type_ptr->get_serde();
+            // make use c++ lib equals to wrapper field from_string behavior
+            DataTypeSerDe::FormatOptions formatOptions;
+
+            Status st = serde->deserialize_one_cell_from_json(*col, min_rb, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            st = serde->deserialize_one_cell_from_json(*col, max_rb, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            st = serde->deserialize_one_cell_from_json(*col, rand_rb, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+
+            auto ser_col = ColumnString::create();
+            ser_col->reserve(3);
+            VectorBufferWriter buffer_writer(*ser_col.get());
+            st = serde->serialize_one_cell_to_json(*col, 0, buffer_writer, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            buffer_writer.commit();
+            st = serde->serialize_one_cell_to_json(*col, 1, buffer_writer, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            buffer_writer.commit();
+            st = serde->serialize_one_cell_to_json(*col, 2, buffer_writer, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            buffer_writer.commit();
+            rtrim(min_s);
+            rtrim(max_s);
+            rtrim(rand_ip);
+            StringRef min_s_d = ser_col->get_data_at(0);
+            StringRef max_s_d = ser_col->get_data_at(1);
+            StringRef rand_s_d = ser_col->get_data_at(2);
+
+            std::cout << "min(" << min_s << ") with data_type_str:" << min_s_d << std::endl;
+            std::cout << "max(" << max_s << ") with data_type_str:" << max_s_d << std::endl;
+            std::cout << "rand(" << rand_ip << ") with data_type_str:" << rand_s_d << std::endl;
+            EXPECT_EQ(min_s, min_s_d.to_string());
+            EXPECT_EQ(max_s, max_s_d.to_string());
+            EXPECT_EQ(rand_ip, rand_s_d.to_string());
         }
     }
 
@@ -361,20 +432,24 @@ TEST(TextSerde, ComplexTypeSerdeTextTest) {
                          "[\\1234567890123456789.01234567\\]"},
                         {"[4.000000000, 5.500000000, 6.670000000]",
                          "[12345678901234567.012345678, 123456789012345678.012345670, "
-                         "12345678901234567.012345678, null, null]",
+                         "12345678901234567.012345678, 12345678901234567.012345678, null]",
                          "[null, null, null, null, null]", "[null]"},
                         {"[4.000000000, 5.500000000, 6.670000000]",
                          "[12345678901234567.012345678, 123456789012345678.012345670, "
-                         "12345678901234567.012345678, null, null]",
+                         "12345678901234567.012345678, 12345678901234567.012345678, null]",
                          "[12345678901234567.012345678, 123456789012345678.012345670, "
-                         "12345678901234567.012345678, null, null]",
+                         "12345678901234567.012345678, 12345678901234567.012345678, null]",
                          "[null]"}),
         };
         // array type
         for (auto type_pair : nested_field_types) {
             auto type = std::get<0>(type_pair);
-            DataTypePtr nested_data_type_ptr =
-                    DataTypeFactory::instance().create_data_type(type, 0, 0);
+            DataTypePtr nested_data_type_ptr;
+            if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL) {
+                nested_data_type_ptr = DataTypeFactory::instance().create_data_type(type, 27, 9);
+            } else {
+                nested_data_type_ptr = DataTypeFactory::instance().create_data_type(type, 0, 0);
+            }
             DataTypePtr array_data_type_ptr = make_nullable(
                     std::make_shared<DataTypeArray>(make_nullable(nested_data_type_ptr)));
 
@@ -496,9 +571,9 @@ TEST(TextSerde, ComplexTypeSerdeTextTest) {
                          "{\"hello "
                          "world\":0.2222222,\"hello2\":null,null:1111.1,\"null\":null,\"null\":"
                          "null,\"null\":0.1}"},
-                        {"{\" ,.amory\":111.2343, \"\"\"\":112, \"dggs\":13.14, "
+                        {"{\" ,.amory\":111.2343, \"\":112, \"dggs\":13.14, "
                          "null:12.2222222, \"\":null}",
-                         "{\"\"\"\":null, null:12.44}", "{}", "{}", "\\N", "{}", "\\N",
+                         "{\"\":null, null:12.44}", "{}", "{}", "\\N", "{}", "\\N",
                          "{null:null, \"null\":null}",
                          "{\"hello world\":0.2222222, \"hello2\":null, null:1111.1, "
                          "\"null\":null, \"null\":null, "
@@ -542,8 +617,14 @@ TEST(TextSerde, ComplexTypeSerdeTextTest) {
             auto value_type = std::get<1>(type_pair);
             DataTypePtr nested_key_type_ptr =
                     DataTypeFactory::instance().create_data_type(key_type, 0, 0);
-            DataTypePtr nested_value_type_ptr =
-                    DataTypeFactory::instance().create_data_type(value_type, 0, 0);
+            DataTypePtr nested_value_type_ptr;
+            if (value_type == FieldType::OLAP_FIELD_TYPE_DECIMAL) {
+                nested_value_type_ptr =
+                        DataTypeFactory::instance().create_data_type(value_type, 27, 9);
+            } else {
+                nested_value_type_ptr =
+                        DataTypeFactory::instance().create_data_type(value_type, 0, 0);
+            }
             DataTypePtr map_data_type_ptr = make_nullable(std::make_shared<DataTypeMap>(
                     make_nullable(nested_key_type_ptr), make_nullable(nested_value_type_ptr)));
 
@@ -628,8 +709,14 @@ TEST(TextSerde, ComplexTypeSerdeTextTest) {
             auto value_type = std::get<1>(type_pair);
             DataTypePtr nested_key_type_ptr =
                     DataTypeFactory::instance().create_data_type(key_type, 0, 0);
-            DataTypePtr nested_value_type_ptr =
-                    DataTypeFactory::instance().create_data_type(value_type, 0, 0);
+            DataTypePtr nested_value_type_ptr;
+            if (value_type == FieldType::OLAP_FIELD_TYPE_DECIMAL) {
+                nested_value_type_ptr =
+                        DataTypeFactory::instance().create_data_type(value_type, 27, 9);
+            } else {
+                nested_value_type_ptr =
+                        DataTypeFactory::instance().create_data_type(value_type, 0, 0);
+            }
             DataTypePtr map_data_type_ptr = std::make_shared<DataTypeMap>(
                     make_nullable(nested_key_type_ptr), make_nullable(nested_value_type_ptr));
 

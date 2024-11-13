@@ -16,7 +16,7 @@
 // under the License.
 
 suite("test_hdfs_tvf","external,hive,tvf,external_docker") {
-    String hdfs_port = context.config.otherConfigs.get("hdfs_port")
+    String hdfs_port = context.config.otherConfigs.get("hive2HdfsPort")
     String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
 
     // It's okay to use random `hdfsUser`, but can not be empty.
@@ -107,6 +107,22 @@ suite("test_hdfs_tvf","external,hive,tvf,external_docker") {
                             "uri" = "${uri}",
                             "hadoop.username" = "${hdfsUserName}",
                             "format" = "${format}") order by s_suppkey limit 20; """
+            
+            // test parquet brotli
+            uri = "${defaultFS}" + "/user/doris/preinstalled_data/hdfs_tvf/test_parquet.brotli.parquet"
+            format = "parquet"
+            qt_parquet_brotli """ select * from HDFS(
+                            "uri" = "${uri}",
+                            "hadoop.username" = "${hdfsUserName}",
+                            "format" = "${format}") order by s_suppkey limit 20; """
+
+            // test parquet decimal256
+            uri = "${defaultFS}" + "/user/doris/preinstalled_data/hdfs_tvf/test_parquet_decimal256.parquet"
+            format = "parquet"
+            qt_parquet_decimal256 """ select * from HDFS(
+                            "uri" = "${uri}",
+                            "hadoop.username" = "${hdfsUserName}",
+                            "format" = "${format}") order by id; """
 
             // test orc
             uri = "${defaultFS}" + "/user/doris/preinstalled_data/hdfs_tvf/test_orc.snappy.orc"
@@ -206,13 +222,13 @@ suite("test_hdfs_tvf","external,hive,tvf,external_docker") {
                         "strip_outer_array" = "false",
                         "read_json_by_line" = "true") order by id; """
 
-            // test insert into select
+            // test insert into select in strict mode or insert_insert_max_filter_ratio is setted
             def testTable = "test_hdfs_tvf"
             sql "DROP TABLE IF EXISTS ${testTable}"
             def result1 = sql """ CREATE TABLE IF NOT EXISTS ${testTable}
                 (
                     id int,
-                    city varchar(50),
+                    city varchar(8),
                     code int
                 )
                 COMMENT "test hdfs tvf table"
@@ -225,6 +241,9 @@ suite("test_hdfs_tvf","external,hive,tvf,external_docker") {
 
             uri = "${defaultFS}" + "/user/doris/preinstalled_data/json_format_test/nest_json.json"
             format = "json"
+
+            sql "set enable_insert_strict=false;"
+            sql "set insert_max_filter_ratio=0.2;"
             def result2 = sql """ insert into ${testTable}(id,city,code)
                     select cast (id as INT) as id, city, cast (code as INT) as code
                     from HDFS(
@@ -234,9 +253,41 @@ suite("test_hdfs_tvf","external,hive,tvf,external_docker") {
                         "strip_outer_array" = "false",
                         "read_json_by_line" = "true",
                         "json_root" = "\$.item") """
-            
             sql "sync"
-            assertTrue(result2[0][0] == 5, "Insert should update 12 rows")
+            assertTrue(result2[0][0] == 4, "Insert should update 4 rows")
+
+            try{
+                sql "set insert_max_filter_ratio=0.1;"
+                def result3 = sql """ insert into ${testTable}(id,city,code)
+                        select cast (id as INT) as id, city, cast (code as INT) as code
+                        from HDFS(
+                            "uri" = "${uri}",
+                            "hadoop.username" = "${hdfsUserName}",
+                            "format" = "${format}",
+                            "strip_outer_array" = "false",
+                            "read_json_by_line" = "true",
+                            "json_root" = "\$.item") """
+            } catch (Exception e) {
+                logger.info(e.getMessage())
+                assertTrue(e.getMessage().contains('Insert has too many filtered data 1/5 insert_max_filter_ratio is 0.100000.'))
+            }
+
+            try{
+                sql " set enable_insert_strict=true;"
+                def result4 = sql """ insert into ${testTable}(id,city,code)
+                        select cast (id as INT) as id, city, cast (code as INT) as code
+                        from HDFS(
+                            "uri" = "${uri}",
+                            "hadoop.username" = "${hdfsUserName}",
+                            "format" = "${format}",
+                            "strip_outer_array" = "false",
+                            "read_json_by_line" = "true",
+                            "json_root" = "\$.item") """
+            } catch (Exception e) {
+                logger.info(e.getMessage())
+                assertTrue(e.getMessage().contains('Insert has filtered data in strict mode.'))
+            }
+
             qt_insert """ select * from test_hdfs_tvf order by id; """
 
             // test desc function
@@ -246,7 +297,119 @@ suite("test_hdfs_tvf","external,hive,tvf,external_docker") {
                             "uri" = "${uri}",
                             "hadoop.username" = "${hdfsUserName}",
                             "format" = "${format}"); """
+
+
+            // test hdfs function compatible
+            // because the property `fs.defaultFS` has been delete by pr https://github.com/apache/doris/pull/24706
+            // we should test the compatible of `fs.defaultFS`
+            uri = "${defaultFS}" + "/user/doris/preinstalled_data/csv_format_test/all_types.csv"
+            format = "csv"
+            order_qt_hdfs_compatible """ select * from HDFS(
+                        "uri" = "${uri}",
+                        "fs.defaultFS"= "${defaultFS}",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "${format}") order by c1; """
+
+            // test csv_schema property
+            uri = "${defaultFS}" + "/user/doris/preinstalled_data/csv_format_test/all_types.csv"
+            format = "csv"
+            order_qt_hdfs_csv_schema """ select * from HDFS(
+                        "uri" = "${uri}",
+                        "csv_schema" = "id:int;tinyint_col:tinyint;smallint_col:smallint;bigint_col:bigint;largeint_col:largeint;float_col:float;double_col:double;decimal_col:decimal(10,5);string_col:string;string_col:string;string_col:string;date_col:date;datetime_col:datetime(3)",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "${format}") order by id; """
+
+            order_qt_hdfs_desc_csv_schema """ desc function HDFS(
+                        "uri" = "${uri}",
+                        "csv_schema" = "id:int;tinyint_col:tinyint;smallint_col:smallint;bigint_col:bigint;largeint_col:largeint;float_col:float;double_col:double;decimal_col:decimal(10,5);string_col:string;string_col:string;string_col:string;date_col:date;datetime_col:datetime(3)",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "${format}"); """
+
+
+            // test create view from tvf and alter view from tvf
+            uri = "${defaultFS}" + "/user/doris/preinstalled_data/csv_format_test/all_types.csv"
+            format = "csv"
+            sql """ DROP VIEW IF EXISTS test_hdfs_tvf_create_view;"""
+            sql """
+                create view test_hdfs_tvf_create_view as
+                select * from HDFS(
+                        "uri" = "${uri}",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "${format}") order by c1;
+                """
+
+            order_qt_create_view """ select * from test_hdfs_tvf_create_view order by c1 limit 20; """
+
+            sql """
+                alter view test_hdfs_tvf_create_view as
+                select c1 from HDFS(
+                        "uri" = "${uri}",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "${format}") order by c1;
+                """
+
+            order_qt_alter_view """ select * from test_hdfs_tvf_create_view order by c1 limit 20; """
         } finally {
         }
     }
+
+    // test exception
+    test {
+        sql """ select * from HDFS(
+                        "uri" = "",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "csv") order by c1;
+            """
+
+        // check exception
+        exception """Properties 'uri' is required"""
+    }
+
+    // test exception
+    test {
+        sql """ select * from HDFS(
+                        "uri" = "xx",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = ",",
+                        "format" = "csv") order by c1;
+            """
+
+        // check exception
+        exception """Invalid export path, there is no schema of URI found. please check your path"""
+    }
+
+    // test exception
+    test {
+        sql """ select * from HDFS(
+                        "uri" = "xx",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "column_separator" = "",
+                        "format" = "csv") order by c1;
+            """
+
+        // check exception
+        exception """column_separator can not be empty"""
+    }
+
+
+    // test exception
+    test {
+        sql """ select * from HDFS(
+                        "uri" = "xx",
+                        "hadoop.username" = "${hdfsUserName}",
+                        "line_delimiter" = "",
+                        "format" = "csv") order by c1;
+            """
+
+        // check exception
+        exception """line_delimiter can not be empty"""
+    }
+
+
 }

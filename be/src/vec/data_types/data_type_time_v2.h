@@ -27,7 +27,6 @@
 #include <memory>
 #include <string>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/status.h"
 #include "runtime/define_primitive_type.h"
@@ -61,15 +60,16 @@ public:
     TypeDescriptor get_type_as_type_descriptor() const override {
         return TypeDescriptor(TYPE_DATEV2);
     }
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
-        return TPrimitiveType::DATEV2;
+
+    doris::FieldType get_storage_field_type() const override {
+        return doris::FieldType::OLAP_FIELD_TYPE_DATEV2;
     }
     const char* get_family_name() const override { return "DateV2"; }
     std::string do_get_name() const override { return "DateV2"; }
 
-    bool can_be_inside_nullable() const override { return true; }
-
-    DataTypeSerDeSPtr get_serde() const override { return std::make_shared<DataTypeDateV2SerDe>(); }
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
+        return std::make_shared<DataTypeDateV2SerDe>(nesting_level);
+    }
 
     Field get_field(const TExprNode& node) const override {
         DateV2Value<DateV2ValueType> value;
@@ -81,8 +81,16 @@ public:
         }
     }
     bool equals(const IDataType& rhs) const override;
+    void to_string_batch(const IColumn& column, ColumnString& column_to) const final {
+        DataTypeNumberBase<UInt32>::template to_string_batch_impl<DataTypeDateV2>(column,
+                                                                                  column_to);
+    }
+
+    size_t number_length() const;
+    void push_number(ColumnString::Chars& chars, const UInt32& num) const;
     std::string to_string(const IColumn& column, size_t row_num) const override;
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
+    std::string to_string(UInt32 int_val) const;
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
 
     MutableColumnPtr create_column() const override;
@@ -106,7 +114,7 @@ public:
 
     DataTypeDateTimeV2(UInt32 scale = 0) : _scale(scale) {
         if (UNLIKELY(scale > 6)) {
-            LOG(FATAL) << fmt::format("Scale {} is out of bounds", scale);
+            throw doris::Exception(ErrorCode::INTERNAL_ERROR, "Scale {} is out of bounds", scale);
         }
     }
 
@@ -115,25 +123,35 @@ public:
     TypeDescriptor get_type_as_type_descriptor() const override {
         return TypeDescriptor(TYPE_DATETIMEV2);
     }
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
-        return TPrimitiveType::DATETIMEV2;
+
+    doris::FieldType get_storage_field_type() const override {
+        return doris::FieldType::OLAP_FIELD_TYPE_DATETIMEV2;
     }
     const char* get_family_name() const override { return "DateTimeV2"; }
     std::string do_get_name() const override { return "DateTimeV2"; }
 
-    bool can_be_inside_nullable() const override { return true; }
-
     bool equals(const IDataType& rhs) const override;
     std::string to_string(const IColumn& column, size_t row_num) const override;
+    void to_string_batch(const IColumn& column, ColumnString& column_to) const final {
+        DataTypeNumberBase<UInt64>::template to_string_batch_impl<DataTypeDateTimeV2>(column,
+                                                                                      column_to);
+    }
+
+    size_t number_length() const;
+    void push_number(ColumnString::Chars& chars, const UInt64& num) const;
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
+    std::string to_string(UInt64 int_val) const;
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
-    DataTypeSerDeSPtr get_serde() const override {
-        return std::make_shared<DataTypeDateTimeV2SerDe>(_scale);
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
+        return std::make_shared<DataTypeDateTimeV2SerDe>(_scale, nesting_level);
     };
 
     Field get_field(const TExprNode& node) const override {
         DateV2Value<DateTimeV2ValueType> value;
-        if (value.from_date_str(node.date_literal.value.c_str(), node.date_literal.value.size())) {
+        const int32_t scale =
+                node.type.types.empty() ? -1 : node.type.types.front().scalar_type.scale;
+        if (value.from_date_str(node.date_literal.value.c_str(), node.date_literal.value.size(),
+                                scale)) {
             return value.to_date_int_val();
         } else {
             throw doris::Exception(doris::ErrorCode::INVALID_ARGUMENT,

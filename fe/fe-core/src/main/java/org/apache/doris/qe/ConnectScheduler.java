@@ -17,7 +17,9 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.Status;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.util.DebugUtil;
 import org.apache.doris.mysql.privilege.PrivPredicate;
@@ -29,6 +31,7 @@ import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.TimerTask;
@@ -102,7 +105,7 @@ public class ConnectScheduler {
             return false;
         }
         connectionMap.put(ctx.getConnectionId(), ctx);
-        if (ctx.getConnectType().equals(ConnectType.ARROW_FLIGHT)) {
+        if (ctx.getConnectType().equals(ConnectType.ARROW_FLIGHT_SQL)) {
             flightToken2ConnectionId.put(ctx.getPeerIdentity(), ctx.getConnectionId());
         }
         return true;
@@ -116,7 +119,7 @@ public class ConnectScheduler {
                 conns.decrementAndGet();
             }
             numberConnection.decrementAndGet();
-            if (ctx.getConnectType().equals(ConnectType.ARROW_FLIGHT)) {
+            if (ctx.getConnectType().equals(ConnectType.ARROW_FLIGHT_SQL)) {
                 flightToken2ConnectionId.remove(ctx.getPeerIdentity());
             }
         }
@@ -124,6 +127,15 @@ public class ConnectScheduler {
 
     public ConnectContext getContext(int connectionId) {
         return connectionMap.get(connectionId);
+    }
+
+    public ConnectContext getContextWithQueryId(String queryId) {
+        for (ConnectContext context : connectionMap.values()) {
+            if (queryId.equals(DebugUtil.printId(context.queryId))) {
+                return context;
+            }
+        }
+        return null;
     }
 
     public ConnectContext getContext(String flightToken) {
@@ -134,11 +146,11 @@ public class ConnectScheduler {
         return null;
     }
 
-    public void cancelQuery(String queryId) {
+    public void cancelQuery(String queryId, Status cancelReason) {
         for (ConnectContext ctx : connectionMap.values()) {
             TUniqueId qid = ctx.queryId();
             if (qid != null && DebugUtil.printId(qid).equals(queryId)) {
-                ctx.cancelQuery();
+                ctx.cancelQuery(cancelReason);
                 break;
             }
         }
@@ -153,13 +165,29 @@ public class ConnectScheduler {
         for (ConnectContext ctx : connectionMap.values()) {
             // Check auth
             if (!ctx.getQualifiedUser().equals(user) && !Env.getCurrentEnv().getAccessManager()
-                    .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+                    .checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
                 continue;
             }
 
             infos.add(ctx.toThreadInfo(isFull));
         }
         return infos;
+    }
+
+    // used for thrift
+    public List<List<String>> listConnectionForRpc(UserIdentity userIdentity, boolean isShowFullSql) {
+        List<List<String>> list = new ArrayList<>();
+        long nowMs = System.currentTimeMillis();
+        for (ConnectContext ctx : connectionMap.values()) {
+            // Check auth
+            if (!ctx.getCurrentUserIdentity().equals(userIdentity) && !Env.getCurrentEnv()
+                    .getAccessManager()
+                    .checkGlobalPriv(userIdentity, PrivPredicate.GRANT)) {
+                continue;
+            }
+            list.add(ctx.toThreadInfo(isShowFullSql).toRow(-1, nowMs));
+        }
+        return list;
     }
 
     public void putTraceId2QueryId(String traceId, TUniqueId queryId) {
@@ -169,5 +197,13 @@ public class ConnectScheduler {
     public String getQueryIdByTraceId(String traceId) {
         TUniqueId queryId = traceId2QueryId.get(traceId);
         return queryId == null ? "" : DebugUtil.printId(queryId);
+    }
+
+    public Map<Integer, ConnectContext> getConnectionMap() {
+        return connectionMap;
+    }
+
+    public Map<String, AtomicInteger> getUserConnectionMap() {
+        return connByUser;
     }
 }

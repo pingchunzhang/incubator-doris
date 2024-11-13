@@ -17,14 +17,10 @@
 
 package org.apache.doris.qe;
 
-import org.apache.doris.analysis.BoolLiteral;
-import org.apache.doris.analysis.DecimalLiteral;
-import org.apache.doris.analysis.FloatLiteral;
-import org.apache.doris.analysis.IntLiteral;
 import org.apache.doris.analysis.LiteralExpr;
-import org.apache.doris.analysis.NullLiteral;
 import org.apache.doris.analysis.SetType;
 import org.apache.doris.analysis.SetVar;
+import org.apache.doris.analysis.SetVar.SetVarType;
 import org.apache.doris.analysis.StringLiteral;
 import org.apache.doris.analysis.VariableExpr;
 import org.apache.doris.catalog.Env;
@@ -35,15 +31,18 @@ import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.PatternMatcher;
 import org.apache.doris.common.VariableAnnotation;
+import org.apache.doris.common.util.SerializationUtils;
 import org.apache.doris.nereids.trees.expressions.literal.Literal;
 import org.apache.doris.persist.GlobalVarPersistInfo;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import org.apache.commons.lang3.SerializationUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.text.similarity.JaroWinklerDistance;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.jetbrains.annotations.NotNull;
@@ -56,11 +55,13 @@ import java.io.IOException;
 import java.lang.annotation.Retention;
 import java.lang.annotation.RetentionPolicy;
 import java.lang.reflect.Field;
+import java.lang.reflect.InvocationTargetException;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.StringJoiner;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -155,8 +156,13 @@ public class VariableMgr {
     }
 
     // Set value to a variable
-    private static boolean setValue(Object obj, Field field, String value) throws DdlException {
+    private static boolean setValue(Object obj, SessionVariableField sessionVariableField, String value)
+            throws DdlException {
+
+        Field field = sessionVariableField.getField();
+        field.setAccessible(true);
         VarAttr attr = field.getAnnotation(VarAttr.class);
+
         if (VariableVarConverters.hasConverter(attr.name())) {
             value = VariableVarConverters.encode(attr.name(), value).toString();
         }
@@ -164,8 +170,11 @@ public class VariableMgr {
             Preconditions.checkArgument(obj instanceof SessionVariable);
             try {
                 SessionVariable.class.getDeclaredMethod(attr.checker(), String.class).invoke(obj, value);
+            } catch (InvocationTargetException e) {
+                // Exception thrown from reflect method will always be InvocationTargetException
+                ErrorReport.reportDdlException(((InvocationTargetException) e).getTargetException().getMessage());
             } catch (Exception e) {
-                ErrorReport.reportDdlException(ErrorCode.ERR_INVALID_VALUE, attr.name(), value, e.getMessage());
+                ErrorReport.reportDdlException(ErrorCode.ERR_INVALID_VALUE, value, attr.name(), e.getMessage());
             }
         }
         // If the session variable has specified the setter, then not use reflect
@@ -173,8 +182,10 @@ public class VariableMgr {
             Preconditions.checkArgument(obj instanceof SessionVariable);
             try {
                 SessionVariable.class.getDeclaredMethod(attr.setter(), String.class).invoke(obj, value);
+            } catch (InvocationTargetException e) {
+                ErrorReport.reportDdlException(((InvocationTargetException) e).getTargetException().getMessage());
             } catch (Exception e) {
-                ErrorReport.reportDdlException(ErrorCode.ERR_INVALID_VALUE, attr.name(), value, e.getMessage());
+                ErrorReport.reportDdlException(ErrorCode.ERR_INVALID_VALUE, value, attr.name(), e.getMessage());
             }
         } else  {
             try {
@@ -193,22 +204,22 @@ public class VariableMgr {
                         }
                         break;
                     case "byte":
-                        field.setByte(obj, Byte.valueOf(value));
+                        field.setByte(obj, Byte.parseByte(value));
                         break;
                     case "short":
-                        field.setShort(obj, Short.valueOf(value));
+                        field.setShort(obj, Short.parseShort(value));
                         break;
                     case "int":
-                        field.setInt(obj, Integer.valueOf(value));
+                        field.setInt(obj, Integer.parseInt(value));
                         break;
                     case "long":
-                        field.setLong(obj, Long.valueOf(value));
+                        field.setLong(obj, Long.parseLong(value));
                         break;
                     case "float":
-                        field.setFloat(obj, Float.valueOf(value));
+                        field.setFloat(obj, Float.parseFloat(value));
                         break;
                     case "double":
-                        field.setDouble(obj, Double.valueOf(value));
+                        field.setDouble(obj, Double.parseDouble(value));
                         break;
                     case "String":
                         field.set(obj, value);
@@ -233,9 +244,9 @@ public class VariableMgr {
 
     // revert the operator[set_var] on select/*+ SET_VAR()*/  sql;
     public static void revertSessionValue(SessionVariable obj) throws DdlException {
-        Map<Field, String> sessionOriginValue = obj.getSessionOriginValue();
+        Map<SessionVariableField, String> sessionOriginValue = obj.getSessionOriginValue();
         if (!sessionOriginValue.isEmpty()) {
-            for (Field field : sessionOriginValue.keySet()) {
+            for (SessionVariableField field : sessionOriginValue.keySet()) {
                 // revert session value
                 setValue(obj, field, sessionOriginValue.get(field));
             }
@@ -264,15 +275,11 @@ public class VariableMgr {
             throw new DdlException(ErrorCode.ERR_VARIABLE_IS_READONLY.formatErrorMsg(setVar.getVariable()));
         }
         if (setVar.getType() == SetType.GLOBAL && (flag & SESSION_ONLY) != 0) {
-            throw new DdlException(ErrorCode.ERR_GLOBAL_VARIABLE.formatErrorMsg(setVar.getVariable()));
+            throw new DdlException(ErrorCode.ERR_LOCAL_VARIABLE.formatErrorMsg(setVar.getVariable()));
         }
         if (setVar.getType() != SetType.GLOBAL && (flag & GLOBAL) != 0) {
             throw new DdlException(ErrorCode.ERR_GLOBAL_VARIABLE.formatErrorMsg(setVar.getVariable()));
         }
-    }
-
-    public static void setUserVar(SetVar setVar) {
-        userVars.put(setVar.getVariable(), setVar.getResult());
     }
 
     // Entry of handling SetVarStmt
@@ -281,9 +288,23 @@ public class VariableMgr {
     //      setVar: variable information that needs to be set
     public static void setVar(SessionVariable sessionVariable, SetVar setVar)
             throws DdlException {
-        VarContext varCtx = setVarPreCheck(setVar);
+        VarContext varCtx = getVarContext(setVar.getVariable());
+        if (varCtx == null) {
+            ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_SYSTEM_VARIABLE, setVar.getVariable(),
+                    findSimilarSessionVarNames(setVar.getVariable()));
+        }
         checkUpdate(setVar, varCtx.getFlag());
         setVarInternal(sessionVariable, setVar, varCtx);
+    }
+
+    public static String findSimilarSessionVarNames(String inputName) {
+        JaroWinklerDistance jaroWinklerDistance = new JaroWinklerDistance();
+        StringJoiner joiner = new StringJoiner(", ", "{", "}");
+        ctxByDisplayVarName.keySet().stream()
+                .sorted(Comparator.comparingDouble(
+                        s -> jaroWinklerDistance.apply(StringUtils.upperCase(s), StringUtils.upperCase(inputName))))
+                .limit(3).map(e -> "'" + e + "'").forEach(joiner::add);
+        return joiner.toString();
     }
 
     // The only difference between setVar and setVarForNonMasterFE
@@ -296,19 +317,24 @@ public class VariableMgr {
     // So in this case, we should just ignore this exception and return.
     public static void setVarForNonMasterFE(SessionVariable sessionVariable, SetVar setVar)
             throws DdlException {
-        VarContext varCtx = setVarPreCheck(setVar);
+        VarContext varCtx = getVarContext(setVar.getVariable());
+        if (varCtx == null) {
+            ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_SYSTEM_VARIABLE, setVar.getVariable());
+        }
         try {
             checkUpdate(setVar, varCtx.getFlag());
         } catch (DdlException e) {
-            LOG.debug("no need to set var for non master fe: {}", setVar.getVariable(), e);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("no need to set var for non master fe: {}", setVar.getVariable(), e);
+            }
             return;
         }
         setVarInternal(sessionVariable, setVar, varCtx);
     }
 
-    @NotNull
-    private static VarContext setVarPreCheck(SetVar setVar) throws DdlException {
-        String varName = setVar.getVariable();
+    @Nullable
+    private static VarContext getVarContext(String name) {
+        String varName = name;
         boolean hasExpPrefix = false;
         if (varName.startsWith(VariableAnnotation.EXPERIMENTAL.getPrefix())) {
             varName = varName.substring(VariableAnnotation.EXPERIMENTAL.getPrefix().length());
@@ -320,13 +346,13 @@ public class VariableMgr {
         }
         VarContext ctx = ctxByVarName.get(varName);
         if (ctx == null) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_SYSTEM_VARIABLE, setVar.getVariable());
+            return null;
         }
         // for non-matched prefix, report an error
         VariableAnnotation varType = ctx.getField().getAnnotation(VarAttr.class).varType();
-        if (hasExpPrefix && (!setVar.getVariable().startsWith(varType.getPrefix())
+        if (hasExpPrefix && (!name.startsWith(varType.getPrefix())
                 || varType == VariableAnnotation.NONE)) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_UNKNOWN_SYSTEM_VARIABLE, setVar.getVariable());
+            return null;
         }
         return ctx;
     }
@@ -352,22 +378,24 @@ public class VariableMgr {
 
         // No matter this is a global setting or not, always set session variable.
         Field field = ctx.getField();
+        SessionVariableField sessionVariableField = new SessionVariableField(field);
         // if stmt is "Select /*+ SET_VAR(...)*/"
         if (sessionVariable.getIsSingleSetVar()) {
             try {
-                sessionVariable.addSessionOriginValue(field, field.get(sessionVariable).toString());
+                sessionVariable.addSessionOriginValue(sessionVariableField, field.get(sessionVariable).toString());
             } catch (Exception e) {
                 LOG.warn("failed to collect origin session value ", e);
             }
         }
-        setValue(sessionVariable, field, value);
+        setValue(sessionVariable, sessionVariableField, value);
     }
 
     private static void setGlobalVarAndWriteEditLog(VarContext ctx, String name, String value) throws DdlException {
         // global variable will make effect when is set immediately.
         wlock.lock();
         try {
-            setValue(ctx.getObj(), ctx.getField(), value);
+
+            setValue(ctx.getObj(), new SessionVariableField(ctx.getField()), value);
             // write edit log
             GlobalVarPersistInfo info = new GlobalVarPersistInfo(defaultSessionVariable, Lists.newArrayList(name));
             Env.getCurrentEnv().getEditLog().logGlobalVariableV2(info);
@@ -376,44 +404,25 @@ public class VariableMgr {
         }
     }
 
-    public static void setGlobalPipelineTask(int instance) {
+    public static void refreshDefaultSessionVariables(String versionMsg, String sessionVar, String value) {
         wlock.lock();
         try {
-            VarContext ctx = ctxByVarName.get(SessionVariable.PARALLEL_PIPELINE_TASK_NUM);
+            VarContext ctx = ctxByVarName.get(sessionVar);
             try {
-                setValue(ctx.getObj(), ctx.getField(), String.valueOf(instance));
+                setValue(ctx.getObj(), new SessionVariableField(ctx.getField()), value);
             } catch (DdlException e) {
-                LOG.warn("failed to set global variable: {}", SessionVariable.PARALLEL_PIPELINE_TASK_NUM, e);
+                LOG.warn("failed to set global variable: {}", sessionVar, e);
                 return;
             }
 
             // write edit log
             GlobalVarPersistInfo info = new GlobalVarPersistInfo(defaultSessionVariable,
-                    Lists.newArrayList(SessionVariable.PARALLEL_PIPELINE_TASK_NUM));
+                    Lists.newArrayList(sessionVar));
             Env.getCurrentEnv().getEditLog().logGlobalVariableV2(info);
         } finally {
             wlock.unlock();
         }
-    }
-
-    public static void setGlobalBroadcastScaleFactor(double factor) {
-        wlock.lock();
-        try {
-            VarContext ctx = ctxByVarName.get(SessionVariable.BROADCAST_RIGHT_TABLE_SCALE_FACTOR);
-            try {
-                setValue(ctx.getObj(), ctx.getField(), String.valueOf(factor));
-            } catch (DdlException e) {
-                LOG.warn("failed to set global variable: {}", SessionVariable.BROADCAST_RIGHT_TABLE_SCALE_FACTOR, e);
-                return;
-            }
-
-            // write edit log
-            GlobalVarPersistInfo info = new GlobalVarPersistInfo(defaultSessionVariable,
-                    Lists.newArrayList(SessionVariable.BROADCAST_RIGHT_TABLE_SCALE_FACTOR));
-            Env.getCurrentEnv().getEditLog().logGlobalVariableV2(info);
-        } finally {
-            wlock.unlock();
-        }
+        LOG.info("upgrade FE from {}, set {} to new default value: {}", versionMsg, sessionVar, value);
     }
 
     public static void setLowerCaseTableNames(int mode) throws DdlException {
@@ -460,6 +469,11 @@ public class VariableMgr {
         try {
             String json = info.getPersistJsonString();
             JSONObject root = (JSONObject) JSONValue.parse(json);
+            // if not variable version, we set it to 0 to ensure we could force set global variable.
+            boolean hasVariableVersion = root.containsKey(GlobalVariable.VARIABLE_VERSION);
+            if (!hasVariableVersion) {
+                GlobalVariable.variableVersion = GlobalVariable.VARIABLE_VERSION_0;
+            }
             for (Object varName : root.keySet()) {
                 VarContext varContext = ctxByVarName.get((String) varName);
                 if (Env.isCheckpointThread()) {
@@ -471,7 +485,13 @@ public class VariableMgr {
                     LOG.error("failed to get global variable {} when replaying", (String) varName);
                     continue;
                 }
-                setValue(varContext.getObj(), varContext.getField(), root.get((String) varName).toString());
+                try {
+                    setValue(varContext.getObj(), new SessionVariableField(varContext.getField()),
+                            root.get(varName).toString());
+                } catch (Exception exception) {
+                    LOG.warn("Exception during replay global variabl {} oplog, {}, THIS EXCEPTION WILL BE IGNORED.",
+                            (String) varName, exception.getMessage());
+                }
             }
         } finally {
             wlock.unlock();
@@ -480,7 +500,7 @@ public class VariableMgr {
 
     // Get variable value through variable name, used to satisfy statement like `SELECT @@comment_version`
     public static void fillValue(SessionVariable var, VariableExpr desc) throws AnalysisException {
-        VarContext ctx = ctxByVarName.get(desc.getName());
+        VarContext ctx = getVarContext(desc.getName());
         if (ctx == null) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_UNKNOWN_SYSTEM_VARIABLE, desc.getName());
         }
@@ -498,77 +518,61 @@ public class VariableMgr {
     }
 
     private static void fillValue(Object obj, Field field, VariableExpr desc) {
-        try {
-            switch (field.getType().getSimpleName()) {
-                case "boolean":
-                    desc.setType(Type.BOOLEAN);
-                    desc.setBoolValue(field.getBoolean(obj));
-                    break;
-                case "byte":
-                    desc.setType(Type.TINYINT);
-                    desc.setIntValue(field.getByte(obj));
-                    break;
-                case "short":
-                    desc.setType(Type.SMALLINT);
-                    desc.setIntValue(field.getShort(obj));
-                    break;
-                case "int":
-                    desc.setType(Type.INT);
-                    desc.setIntValue(field.getInt(obj));
-                    break;
-                case "long":
-                    desc.setType(Type.BIGINT);
-                    desc.setIntValue(field.getLong(obj));
-                    break;
-                case "float":
-                    desc.setType(Type.FLOAT);
-                    desc.setFloatValue(field.getFloat(obj));
-                    break;
-                case "double":
-                    desc.setType(Type.DOUBLE);
-                    desc.setFloatValue(field.getDouble(obj));
-                    break;
-                case "String":
-                    desc.setType(Type.VARCHAR);
-                    desc.setStringValue((String) field.get(obj));
-                    break;
-                default:
-                    desc.setType(Type.VARCHAR);
-                    desc.setStringValue("");
-                    break;
-            }
-        } catch (IllegalAccessException e) {
-            LOG.warn("Access failed.", e);
-        }
-    }
-
-    // Get variable value through variable name, used to satisfy statement like `SELECT @@comment_version`
-    public static void fillValueForUserDefinedVar(VariableExpr desc) {
-        String varName = desc.getName();
-        if (userVars.containsKey(varName)) {
-            LiteralExpr literalExpr = userVars.get(varName);
-            desc.setType(literalExpr.getType());
-            if (literalExpr instanceof BoolLiteral) {
-                desc.setBoolValue(((BoolLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof IntLiteral) {
-                desc.setIntValue(((IntLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof FloatLiteral) {
-                desc.setFloatValue(((FloatLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof DecimalLiteral) {
-                desc.setDecimalValue(((DecimalLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof StringLiteral) {
-                desc.setStringValue(((StringLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof NullLiteral) {
-                desc.setType(Type.NULL);
-                desc.setIsNull();
-            } else {
-                desc.setType(Type.VARCHAR);
-                desc.setStringValue("");
+        VarAttr attr = field.getAnnotation(VarAttr.class);
+        if (!Strings.isNullOrEmpty(attr.convertBoolToLongMethod())) {
+            try {
+                Preconditions.checkArgument(obj instanceof SessionVariable);
+                long val = (Long) SessionVariable.class.getDeclaredMethod(attr.convertBoolToLongMethod(), Boolean.class)
+                        .invoke(obj, field.getBoolean(obj));
+                desc.setType(Type.BIGINT);
+                desc.setIntValue(val);
+            } catch (Exception e) {
+                // should not happen
+                LOG.warn("failed to convert bool to long for var: {}", field.getName(), e);
             }
         } else {
-            // If there are no such user defined var, just fill the NULL value.
-            desc.setType(Type.NULL);
-            desc.setIsNull();
+            try {
+                switch (field.getType().getSimpleName()) {
+                    case "boolean":
+                        desc.setType(Type.BOOLEAN);
+                        desc.setBoolValue(field.getBoolean(obj));
+                        break;
+                    case "byte":
+                        desc.setType(Type.TINYINT);
+                        desc.setIntValue(field.getByte(obj));
+                        break;
+                    case "short":
+                        desc.setType(Type.SMALLINT);
+                        desc.setIntValue(field.getShort(obj));
+                        break;
+                    case "int":
+                        desc.setType(Type.INT);
+                        desc.setIntValue(field.getInt(obj));
+                        break;
+                    case "long":
+                        desc.setType(Type.BIGINT);
+                        desc.setIntValue(field.getLong(obj));
+                        break;
+                    case "float":
+                        desc.setType(Type.FLOAT);
+                        desc.setFloatValue(field.getFloat(obj));
+                        break;
+                    case "double":
+                        desc.setType(Type.DOUBLE);
+                        desc.setFloatValue(field.getDouble(obj));
+                        break;
+                    case "String":
+                        desc.setType(Type.VARCHAR);
+                        desc.setStringValue((String) field.get(obj));
+                        break;
+                    default:
+                        desc.setType(Type.VARCHAR);
+                        desc.setStringValue("");
+                        break;
+                }
+            } catch (IllegalAccessException e) {
+                LOG.warn("Access failed.", e);
+            }
         }
     }
 
@@ -598,7 +602,7 @@ public class VariableMgr {
 
     // For Nereids optimizer
     public static @Nullable Literal getLiteral(SessionVariable var, String name, SetType setType) {
-        VarContext ctx = ctxByVarName.get(name);
+        VarContext ctx = getVarContext(name);
         if (ctx == null) {
             return null;
         }
@@ -616,6 +620,18 @@ public class VariableMgr {
     }
 
     private static Literal getLiteral(Object obj, Field field) {
+        VarAttr attr = field.getAnnotation(VarAttr.class);
+        if (!Strings.isNullOrEmpty(attr.convertBoolToLongMethod())) {
+            try {
+                Preconditions.checkArgument(obj instanceof SessionVariable);
+                long val = (Long) SessionVariable.class.getDeclaredMethod(attr.convertBoolToLongMethod(), Boolean.class)
+                        .invoke(obj, field.getBoolean(obj));
+                return Literal.of(Long.valueOf(val));
+            } catch (Exception e) {
+                // should not happen
+                LOG.warn("failed to convert bool to long for var: {}", field.getName(), e);
+            }
+        }
         try {
             switch (field.getType().getSimpleName()) {
                 case "boolean":
@@ -641,30 +657,6 @@ public class VariableMgr {
             LOG.warn("Access failed.", e);
         }
         return Literal.of("");
-    }
-
-    public static @Nullable Literal getLiteralForUserVar(String varName) {
-        if (userVars.containsKey(varName)) {
-            LiteralExpr literalExpr = userVars.get(varName);
-            if (literalExpr instanceof BoolLiteral) {
-                return Literal.of(((BoolLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof IntLiteral) {
-                return Literal.of(((IntLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof FloatLiteral) {
-                return Literal.of(((FloatLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof DecimalLiteral) {
-                return Literal.of(((DecimalLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof StringLiteral) {
-                return Literal.of(((StringLiteral) literalExpr).getValue());
-            } else if (literalExpr instanceof NullLiteral) {
-                return Literal.of(null);
-            } else {
-                return Literal.of("");
-            }
-        } else {
-            // If there are no such user defined var, just return the NULL value.
-            return Literal.of(null);
-        }
     }
 
     private static String getValue(Object obj, Field field) {
@@ -712,13 +704,44 @@ public class VariableMgr {
         return ImmutableMap.copyOf(result);
     }
 
+    public static void setAllVarsToDefaultValue(SessionVariable sessionVariable, SetType setType)
+            throws DdlException {
+        for (Map.Entry<String, VarContext> entry : ctxByDisplayVarName.entrySet()) {
+            VarContext varCtx = entry.getValue();
+            SetVar setVar = new SetVar(setType, entry.getKey(),
+                    new StringLiteral(varCtx.defaultValue), SetVarType.SET_SESSION_VAR);
+            try {
+                checkUpdate(setVar, varCtx.getFlag());
+            } catch (DdlException e) {
+                LOG.debug("no need to set var for non master fe: {}", setVar.getVariable(), e);
+                continue;
+            }
+            setVarInternal(sessionVariable, setVar, varCtx);
+        }
+    }
+
+    public static String getDefaultValue(String key) {
+        VarContext varContext = ctxByDisplayVarName.get(key);
+        return varContext == null ? null : varContext.defaultValue;
+    }
+
     // Dump all fields. Used for `show variables`
     public static List<List<String>> dump(SetType type, SessionVariable sessionVar, PatternMatcher matcher) {
-        List<List<String>> rows = Lists.newArrayList();
+        List<List<String>> changedRows = Lists.newArrayList();
+        List<List<String>> defaultRows = Lists.newArrayList();
         // Hold the read lock when session dump, because this option need to access global variable.
         rlock.lock();
         try {
             for (Map.Entry<String, VarContext> entry : ctxByDisplayVarName.entrySet()) {
+                VarAttr varAttr = entry.getValue().getField().getAnnotation(VarAttr.class);
+                // not show removed variables
+                if (VariableAnnotation.REMOVED.equals(varAttr.varType())) {
+                    continue;
+                }
+                // not show invisible variables
+                if ((VariableMgr.INVISIBLE & varAttr.flag()) != 0) {
+                    continue;
+                }
                 // Filter variable not match to the regex.
                 if (matcher != null && !matcher.match(entry.getKey())) {
                     continue;
@@ -744,30 +767,82 @@ public class VariableMgr {
                     }
                 }
 
-                VarContext varContext = ctxByVarName.get(entry.getKey());
-                if (varContext != null) {
-                    row.add(varContext.defaultValue);
-                    row.add(row.get(1).equals(row.get(2)) ? "0" : "1");
+                VarContext varContext = ctxByDisplayVarName.get(entry.getKey());
+                if (VariableVarConverters.hasConverter(row.get(0))) {
+                    try {
+                        row.add(VariableVarConverters.decode(row.get(0), Long.valueOf(varContext.defaultValue)));
+                    } catch (DdlException e) {
+                        row.add(varContext.defaultValue);
+                        LOG.warn(String.format("encode session variable %s failed", row.get(0)));
+                    }
                 } else {
-                    row.add("-");
-                    row.add("-");
+                    row.add(varContext.defaultValue);
                 }
-
-                rows.add(row);
+                if (row.get(1).equals(row.get(2))) {
+                    row.add("0");
+                    defaultRows.add(row);
+                } else {
+                    row.add("1");
+                    changedRows.add(row);
+                }
             }
         } finally {
             rlock.unlock();
         }
 
         // Sort all variables by variable name.
-        Collections.sort(rows, new Comparator<List<String>>() {
+        Collections.sort(changedRows, new Comparator<List<String>>() {
             @Override
             public int compare(List<String> o1, List<String> o2) {
                 return o1.get(0).compareTo(o2.get(0));
             }
         });
 
-        return rows;
+        Collections.sort(defaultRows, new Comparator<List<String>>() {
+            @Override
+            public int compare(List<String> o1, List<String> o2) {
+                return o1.get(0).compareTo(o2.get(0));
+            }
+        });
+
+        changedRows.addAll(defaultRows);
+        return changedRows;
+    }
+
+    public static List<List<String>> dumpChangedVars(SessionVariable sessionVar) {
+        // Hold the read lock when session dump, because this option need to access global variable.
+        rlock.lock();
+        List<List<String>> changedRows = Lists.newArrayList();
+        try {
+            for (Map.Entry<String, VarContext> entry : ctxByDisplayVarName.entrySet()) {
+                VarContext ctx = entry.getValue();
+                List<String> row = Lists.newArrayList();
+                String varName = entry.getKey();
+                String curValue = getValue(sessionVar, ctx.getField());
+                String defaultValue = ctx.getDefaultValue();
+                if (VariableVarConverters.hasConverter(varName)) {
+                    try {
+                        defaultValue = VariableVarConverters.decode(varName, Long.valueOf(defaultValue));
+                        curValue = VariableVarConverters.decode(varName, Long.valueOf(curValue));
+                    } catch (DdlException e) {
+                        LOG.warn("Decode session variable {} failed, reason: {}", varName, e.getMessage());
+                    }
+                }
+
+                if (curValue.equals(defaultValue)) {
+                    continue;
+                }
+
+                row.add(varName);
+                row.add(curValue);
+                row.add(defaultValue);
+                changedRows.add(row);
+            }
+        } finally {
+            rlock.unlock();
+        }
+
+        return changedRows;
     }
 
     @Retention(RetentionPolicy.RUNTIME)
@@ -806,6 +881,8 @@ public class VariableMgr {
 
         // Enum options for this config item, if it has.
         String[] options() default {};
+
+        String convertBoolToLongMethod() default "";
     }
 
     private static class VarContext {
@@ -878,5 +955,49 @@ public class VariableMgr {
             builder.put(attr.name(), new VarContext(field, null, GLOBAL | attr.flag(), getValue(null, field)));
         }
         return builder;
+    }
+
+    public static void forceUpdateVariables() {
+        int currentVariableVersion = GlobalVariable.variableVersion;
+        if (currentVariableVersion == GlobalVariable.VARIABLE_VERSION_0) {
+            // update from 2.0.15 or below to 2.0.16 or higher
+            if (VariableMgr.newSessionVariable().nereidsTimeoutSecond == 5) {
+                VariableMgr.refreshDefaultSessionVariables("update variable version",
+                        SessionVariable.NEREIDS_TIMEOUT_SECOND, "30");
+            }
+        }
+        if (currentVariableVersion < GlobalVariable.VARIABLE_VERSION_100) {
+            // update from 2.1.6 or below to 2.1.7 or higher
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    SessionVariable.ENABLE_NEREIDS_DML,
+                    String.valueOf(true));
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    SessionVariable.ENABLE_NEREIDS_DML_WITH_PIPELINE,
+                    String.valueOf(true));
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    SessionVariable.ENABLE_NEREIDS_PLANNER,
+                    String.valueOf(true));
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    SessionVariable.ENABLE_FALLBACK_TO_ORIGINAL_PLANNER,
+                    String.valueOf(true));
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    SessionVariable.ENABLE_PIPELINE_X_ENGINE,
+                    String.valueOf(true));
+        }
+        if (currentVariableVersion < GlobalVariable.VARIABLE_VERSION_200) {
+            // update from 3.0.2 or below to 3.0.3 or higher
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    SessionVariable.ENABLE_FALLBACK_TO_ORIGINAL_PLANNER,
+                    String.valueOf(false));
+        }
+        if (currentVariableVersion < GlobalVariable.VARIABLE_VERSION_300) {
+            // update to master
+            // do nothing
+        }
+        if (currentVariableVersion < GlobalVariable.CURRENT_VARIABLE_VERSION) {
+            VariableMgr.refreshDefaultSessionVariables("update variable version",
+                    GlobalVariable.VARIABLE_VERSION,
+                    String.valueOf(GlobalVariable.CURRENT_VARIABLE_VERSION));
+        }
     }
 }

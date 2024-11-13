@@ -26,7 +26,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.time.format.DateTimeFormatter;
 
-suite("test_pk_uk_case", "inverted_index") {
+suite("test_pk_uk_case_unique_with_mow", "inverted_index") {
     def tableNamePk = "primary_key_pk_uk"
     def tableNameUk = "unique_key_pk_uk"
 
@@ -192,15 +192,13 @@ suite("test_pk_uk_case", "inverted_index") {
         """
 
         sql "sync"
+        sql """ set enable_common_expr_pushdown = true """
 
         // count(*)
         def result0 = sql """ SELECT count(*) FROM ${tableNamePk}; """
         def result1 = sql """ SELECT count(*) FROM ${tableNameUk}; """
         logger.info("result:" + result0[0][0] + "|" + result1[0][0])
-        assertTrue(result0[0]==result1[0])
-        if (result0[0][0]!=result1[0][0]) {
-            logger.info("result:" + result0[0][0] + "|" + result1[0][0])
-        }
+        assertEquals(result0[0], result1[0])
 
         result0 = sql """ SELECT
                             l_returnflag,
@@ -242,11 +240,11 @@ suite("test_pk_uk_case", "inverted_index") {
                             l_returnflag,
                             l_linestatus
                         """  
-        assertTrue(result0.size()==result1.size())
+        assertEquals(result0.size(), result1.size())
         for (int i = 0; i < result0.size(); ++i) {
-            for (j = 0; j < result0[0].size(); j++) {
+            for (int j = 0; j < result0[0].size(); j++) {
                 logger.info("result: " + result0[i][j] + "|" + result1[i][j])
-                assertTrue(result0[i][j]==result1[i][j])
+                assertEquals(result0[i][j], result1[i][j])
             }
         }       
 

@@ -152,6 +152,10 @@ public enum JoinType {
         return this == RIGHT_OUTER_JOIN;
     }
 
+    public final boolean isLeftRightOuterOrCrossJoin() {
+        return this == LEFT_OUTER_JOIN || this == RIGHT_OUTER_JOIN || this == CROSS_JOIN;
+    }
+
     public final boolean isLeftSemiOrAntiJoin() {
         return this == LEFT_SEMI_JOIN || this == LEFT_ANTI_JOIN || this == NULL_AWARE_LEFT_ANTI_JOIN;
     }
@@ -160,12 +164,20 @@ public enum JoinType {
         return this == LEFT_ANTI_JOIN;
     }
 
+    public final boolean isLeftSemiJoin() {
+        return this == LEFT_SEMI_JOIN;
+    }
+
     public final boolean isRightSemiOrAntiJoin() {
         return this == RIGHT_SEMI_JOIN || this == RIGHT_ANTI_JOIN;
     }
 
     public final boolean isRightAntiJoin() {
         return this == RIGHT_ANTI_JOIN;
+    }
+
+    public final boolean isRightSemiJoin() {
+        return this == RIGHT_SEMI_JOIN;
     }
 
     public final boolean isSemiOrAntiJoin() {
@@ -177,8 +189,16 @@ public enum JoinType {
         return this == LEFT_SEMI_JOIN || this == RIGHT_SEMI_JOIN;
     }
 
+    public final boolean isAntiJoin() {
+        return this == LEFT_ANTI_JOIN || this == RIGHT_ANTI_JOIN;
+    }
+
     public final boolean isOuterJoin() {
         return this == LEFT_OUTER_JOIN || this == RIGHT_OUTER_JOIN || this == FULL_OUTER_JOIN;
+    }
+
+    public final boolean isOneSideOuterJoin() {
+        return this == LEFT_OUTER_JOIN || this == RIGHT_OUTER_JOIN;
     }
 
     public final boolean isRemainLeftJoin() {

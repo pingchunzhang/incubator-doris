@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.analyzer;
 
+import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.exceptions.UnboundException;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.functions.Function;
@@ -28,6 +29,7 @@ import com.google.common.base.Joiner;
 
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
 
 /**
@@ -35,35 +37,69 @@ import java.util.stream.Collectors;
  */
 public class UnboundFunction extends Function implements Unbound, PropagateNullable {
     private final String dbName;
-    private final String name;
     private final boolean isDistinct;
+    // for create view stmt, the start and end position of the function string in original sql
+    private final Optional<Pair<Integer, Integer>> indexInSqlString;
+    // the start and end position of the function string in original sql
+    private final Optional<FunctionIndexInSql> functionIndexInSql;
+
+    /**
+     * FunctionIndexInSql
+     */
+    public static class FunctionIndexInSql implements Comparable<FunctionIndexInSql> {
+        public final int functionNameBegin;
+        public final int functionNameEnd;
+        public final int functionExpressionEnd;
+
+        public FunctionIndexInSql(int nameBegin, int nameEnd, int expressionEnd) {
+            this.functionNameBegin = nameBegin;
+            this.functionNameEnd = nameEnd;
+            this.functionExpressionEnd = expressionEnd;
+        }
+
+        @Override
+        public int compareTo(FunctionIndexInSql functionIndexInSql) {
+            return this.functionNameBegin - functionIndexInSql.functionNameBegin;
+        }
+
+        public FunctionIndexInSql indexInQueryPart(int offset) {
+            return new FunctionIndexInSql(functionNameBegin - offset, functionNameEnd - offset,
+                    functionExpressionEnd - offset);
+        }
+    }
 
     public UnboundFunction(String name, List<Expression> arguments) {
-        this(null, name, false, arguments);
+        this(null, name, false, arguments, Optional.empty(), Optional.empty());
     }
 
     public UnboundFunction(String dbName, String name, List<Expression> arguments) {
-        this(dbName, name, false, arguments);
+        this(dbName, name, false, arguments, Optional.empty(), Optional.empty());
     }
 
     public UnboundFunction(String name, boolean isDistinct, List<Expression> arguments) {
-        this(null, name, isDistinct, arguments);
+        this(null, name, isDistinct, arguments, Optional.empty(), Optional.empty());
     }
 
     public UnboundFunction(String dbName, String name, boolean isDistinct, List<Expression> arguments) {
-        super(arguments);
-        this.dbName = dbName;
-        this.name = Objects.requireNonNull(name, "name cannot be null");
-        this.isDistinct = isDistinct;
+        this(dbName, name, isDistinct, arguments, Optional.empty(), Optional.empty());
     }
 
-    public String getName() {
-        return name;
+    public UnboundFunction(String dbName, String name, boolean isDistinct,
+            List<Expression> arguments, Optional<FunctionIndexInSql> functionIndexInSql,
+            Optional<Pair<Integer, Integer>> indexInSqlString) {
+        super(name, arguments);
+        this.dbName = dbName;
+        this.isDistinct = isDistinct;
+        this.functionIndexInSql = functionIndexInSql;
+        this.indexInSqlString = indexInSqlString;
     }
 
     @Override
-    protected String getExpressionName() {
-        return Utils.normalizeName(getName(), DEFAULT_EXPRESSION_NAME);
+    public String getExpressionName() {
+        if (!this.exprName.isPresent()) {
+            this.exprName = Optional.of(Utils.normalizeName(getName(), DEFAULT_EXPRESSION_NAME));
+        }
+        return this.exprName.get();
     }
 
     public String getDbName() {
@@ -83,13 +119,13 @@ public class UnboundFunction extends Function implements Unbound, PropagateNulla
         String params = children.stream()
                 .map(Expression::toSql)
                 .collect(Collectors.joining(", "));
-        return name + "(" + (isDistinct ? "distinct " : "") + params + ")";
+        return getName() + "(" + (isDistinct ? "distinct " : "") + params + ")";
     }
 
     @Override
     public String toString() {
         String params = Joiner.on(", ").join(children);
-        return "'" + name + "(" + (isDistinct ? "distinct " : "") + params + ")";
+        return "'" + getName() + "(" + (isDistinct ? "distinct " : "") + params + ")";
     }
 
     @Override
@@ -99,7 +135,15 @@ public class UnboundFunction extends Function implements Unbound, PropagateNulla
 
     @Override
     public UnboundFunction withChildren(List<Expression> children) {
-        return new UnboundFunction(dbName, name, isDistinct, children);
+        return new UnboundFunction(dbName, getName(), isDistinct, children, functionIndexInSql, indexInSqlString);
+    }
+
+    public Optional<FunctionIndexInSql> getFunctionIndexInSql() {
+        return functionIndexInSql;
+    }
+
+    public UnboundFunction withIndexInSqlString(Optional<FunctionIndexInSql> functionIndexInSql) {
+        return new UnboundFunction(dbName, getName(), isDistinct, children, functionIndexInSql, indexInSqlString);
     }
 
     @Override
@@ -114,11 +158,20 @@ public class UnboundFunction extends Function implements Unbound, PropagateNulla
             return false;
         }
         UnboundFunction that = (UnboundFunction) o;
-        return isDistinct == that.isDistinct && name.equals(that.name);
+        return isDistinct == that.isDistinct && getName().equals(that.getName());
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(name, isDistinct);
+        return Objects.hash(getName(), isDistinct);
+    }
+
+    public UnboundFunction withIndexInSql(Pair<Integer, Integer> index) {
+        return new UnboundFunction(dbName, getName(), isDistinct, children, functionIndexInSql,
+                Optional.ofNullable(index));
+    }
+
+    public Optional<Pair<Integer, Integer>> getIndexInSqlString() {
+        return indexInSqlString;
     }
 }

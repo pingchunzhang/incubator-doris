@@ -17,11 +17,14 @@
 
 package org.apache.doris.nereids.trees.plans.commands;
 
+import org.apache.doris.common.Config;
+import org.apache.doris.common.DdlException;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.AbstractPlan;
+import org.apache.doris.nereids.trees.plans.BlockFuncDepsPropagation;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
@@ -32,19 +35,18 @@ import com.google.common.collect.ImmutableList;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * All DDL and DML commands' super class.
  */
-public abstract class Command extends AbstractPlan implements LogicalPlan {
+public abstract class Command extends AbstractPlan implements LogicalPlan, BlockFuncDepsPropagation {
 
     protected Command(PlanType type) {
-        super(type, ImmutableList.of());
+        super(type, Optional.empty(), Optional.empty(), null, ImmutableList.of());
     }
 
-    public void run(ConnectContext ctx, StmtExecutor executor) throws Exception {
-        // all command should impl this interface.
-    }
+    public abstract void run(ConnectContext ctx, StmtExecutor executor) throws Exception;
 
     @Override
     public Optional<GroupExpression> getGroupExpression() {
@@ -103,6 +105,11 @@ public abstract class Command extends AbstractPlan implements LogicalPlan {
     }
 
     @Override
+    public Set<Slot> getOutputSet() {
+        throw new RuntimeException("Command do not implement getOutputSet");
+    }
+
+    @Override
     public String treeString() {
         throw new RuntimeException("Command do not implement treeString");
     }
@@ -111,4 +118,16 @@ public abstract class Command extends AbstractPlan implements LogicalPlan {
     public Plan withGroupExpression(Optional<GroupExpression> groupExpression) {
         throw new RuntimeException("Command do not implement withGroupExpression");
     }
+
+    public void verifyCommandSupported() throws DdlException {
+        // check command has been supported in cloud mode
+        if (Config.isCloudMode()) {
+            checkSupportedInCloudMode();
+        }
+    }
+
+    // check if the command is supported in cloud mode
+    // see checkStmtSupported() in fe/fe-core/src/main/java/org/apache/doris/qe/ShowExecutor.java
+    // override this method if the command is not supported in cloud mode
+    protected void checkSupportedInCloudMode() throws DdlException {}
 }

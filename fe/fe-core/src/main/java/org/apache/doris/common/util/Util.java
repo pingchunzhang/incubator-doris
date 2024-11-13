@@ -19,8 +19,8 @@ package org.apache.doris.common.util;
 
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.PrimitiveType;
+import org.apache.doris.cloud.security.SecurityChecker;
 import org.apache.doris.common.AnalysisException;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.qe.ConnectContext;
@@ -45,6 +45,9 @@ import java.io.PrintWriter;
 import java.io.StringWriter;
 import java.net.URL;
 import java.net.URLConnection;
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -87,6 +90,7 @@ public class Util {
         TYPE_STRING_MAP.put(PrimitiveType.DECIMAL32, "decimal(%d, %d)");
         TYPE_STRING_MAP.put(PrimitiveType.DECIMAL64, "decimal(%d, %d)");
         TYPE_STRING_MAP.put(PrimitiveType.DECIMAL128, "decimal(%d, %d)");
+        TYPE_STRING_MAP.put(PrimitiveType.DECIMAL256, "decimal(%d, %d)");
         TYPE_STRING_MAP.put(PrimitiveType.HLL, "varchar(%d)");
         TYPE_STRING_MAP.put(PrimitiveType.BOOLEAN, "bool");
         TYPE_STRING_MAP.put(PrimitiveType.BITMAP, "bitmap");
@@ -323,6 +327,7 @@ public class Util {
         StringBuilder sb = new StringBuilder();
         InputStream stream = null;
         try {
+            SecurityChecker.getInstance().startSSRFChecking(urlStr);
             URL url = new URL(urlStr);
             URLConnection conn = url.openConnection();
             if (encodedAuthInfo != null) {
@@ -350,8 +355,11 @@ public class Util {
                     return null;
                 }
             }
+            SecurityChecker.getInstance().stopSSRFChecking();
         }
-        LOG.debug("get result from url {}: {}", urlStr, sb.toString());
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("get result from url {}: {}", urlStr, sb.toString());
+        }
         return sb.toString();
     }
 
@@ -416,10 +424,6 @@ public class Util {
         }
     }
 
-    public static void stdoutWithTime(String msg) {
-        System.out.println("[" + TimeUtils.longToTimeString(System.currentTimeMillis()) + "] " + msg);
-    }
-
     // not support encode negative value now
     public static void encodeVarint64(long source, DataOutput out) throws IOException {
         assert source >= 0;
@@ -469,14 +473,26 @@ public class Util {
     // If no auth info, pass a null.
     public static InputStream getInputStreamFromUrl(String urlStr, String encodedAuthInfo, int connectTimeoutMs,
             int readTimeoutMs) throws IOException {
-        URL url = new URL(urlStr);
-        URLConnection conn = url.openConnection();
-        if (encodedAuthInfo != null) {
-            conn.setRequestProperty("Authorization", "Basic " + encodedAuthInfo);
+        boolean needSecurityCheck = !(urlStr.startsWith("/") || urlStr.startsWith("file://"));
+        try {
+            if (needSecurityCheck) {
+                SecurityChecker.getInstance().startSSRFChecking(urlStr);
+            }
+            URL url = new URL(urlStr);
+            URLConnection conn = url.openConnection();
+            if (encodedAuthInfo != null) {
+                conn.setRequestProperty("Authorization", "Basic " + encodedAuthInfo);
+            }
+            conn.setConnectTimeout(connectTimeoutMs);
+            conn.setReadTimeout(readTimeoutMs);
+            return conn.getInputStream();
+        } catch (Exception e) {
+            throw new IOException(e);
+        } finally {
+            if (needSecurityCheck) {
+                SecurityChecker.getInstance().stopSSRFChecking();
+            }
         }
-        conn.setConnectTimeout(connectTimeoutMs);
-        conn.setReadTimeout(readTimeoutMs);
-        return conn.getInputStream();
     }
 
     public static boolean showHiddenColumns() {
@@ -510,15 +526,6 @@ public class Util {
         if (!Strings.isNullOrEmpty(catalog) && !catalog.equals(InternalCatalog.INTERNAL_CATALOG_NAME)) {
             throw new AnalysisException(String.format("External catalog '%s' is not allowed in '%s'", catalog, msg));
         }
-    }
-
-    public static boolean isS3CompatibleStorageSchema(String schema) {
-        for (String objectStorage : Config.s3_compatible_object_storages.split(",")) {
-            if (objectStorage.equalsIgnoreCase(schema)) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static final char[] HEX_ARRAY = "0123456789ABCDEF".toCharArray();
@@ -563,8 +570,10 @@ public class Util {
                 // TODO: Add TEXTFILE to TFileFormatType to Support hive text file format.
                 || lowerFileFormat.equals(FileFormatConstants.FORMAT_HIVE_TEXT)) {
             return TFileFormatType.FORMAT_CSV_PLAIN;
-        } else if (lowerFileFormat.equals("wal")) {
+        } else if (lowerFileFormat.equals(FileFormatConstants.FORMAT_WAL)) {
             return TFileFormatType.FORMAT_WAL;
+        } else if (lowerFileFormat.equals(FileFormatConstants.FORMAT_ARROW)) {
+            return TFileFormatType.FORMAT_ARROW;
         } else {
             return TFileFormatType.FORMAT_UNKNOWN;
         }
@@ -575,6 +584,7 @@ public class Util {
      *
      * @param path of file to be inferred.
      */
+
     @NotNull
     public static TFileCompressType inferFileCompressTypeByPath(String path) {
         String lowerCasePath = path.toLowerCase();
@@ -592,6 +602,8 @@ public class Util {
             return TFileCompressType.DEFLATE;
         } else if (lowerCasePath.endsWith(".snappy")) {
             return TFileCompressType.SNAPPYBLOCK;
+        } else if (lowerCasePath.endsWith(".zst") || lowerCasePath.endsWith(".zstd")) {
+            return TFileCompressType.ZSTD;
         } else {
             return TFileCompressType.PLAIN;
         }
@@ -635,7 +647,12 @@ public class Util {
         String rootCause = "unknown";
         Throwable p = t;
         while (p != null) {
-            rootCause = p.getClass().getName() + ": " + p.getMessage();
+            String message = p.getMessage();
+            if (message == null) {
+                rootCause = p.getClass().getName();
+            } else {
+                rootCause = p.getClass().getName() + ": " + p.getMessage();
+            }
             p = p.getCause();
         }
         return rootCause;
@@ -655,5 +672,22 @@ public class Util {
         PrintWriter pw = new PrintWriter(sw);
         p.printStackTrace(pw);
         return sw.toString();
+    }
+
+    public static long sha256long(String str) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance("SHA-256");
+            byte[] hash = digest.digest(str.getBytes());
+            ByteBuffer buffer = ByteBuffer.wrap(hash);
+            return buffer.getLong();
+        } catch (NoSuchAlgorithmException e) {
+            return str.hashCode();
+        }
+    }
+
+    // Only used for external db/table's id generation
+    // And the db/table's id must >=0, see DescriptorTable.toThrift()
+    public static long genIdByName(String... names) {
+        return Math.abs(sha256long(String.join(".", names)));
     }
 }

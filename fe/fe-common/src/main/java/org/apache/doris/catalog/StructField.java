@@ -23,7 +23,6 @@ import org.apache.doris.thrift.TTypeNode;
 
 import com.google.common.base.Strings;
 import com.google.gson.annotations.SerializedName;
-import org.apache.commons.lang3.StringUtils;
 
 public class StructField {
     @SerializedName(value = "name")
@@ -41,7 +40,7 @@ public class StructField {
     @SerializedName(value = "containsNull")
     private final boolean containsNull; // Now always true (nullable field)
 
-    private static final String DEFAULT_FIELD_NAME = "col";
+    public static final String DEFAULT_FIELD_NAME = "col";
 
     public StructField(String name, Type type, String comment, boolean containsNull) {
         this.name = name.toLowerCase();
@@ -89,7 +88,7 @@ public class StructField {
     public String toSql(int depth) {
         String typeSql;
         if (depth < Type.MAX_NESTING_DEPTH) {
-            typeSql = !containsNull ? "not_null(" + type.toSql(depth) + ")" : type.toSql(depth);
+            typeSql = type.toSql(depth + 1) + (!containsNull ? " not null" : "");
         } else {
             typeSql = "...";
         }
@@ -97,8 +96,8 @@ public class StructField {
         if (type != null) {
             sb.append(":").append(typeSql);
         }
-        if (StringUtils.isNotBlank(comment)) {
-            sb.append(String.format(" COMMENT '%s'", comment));
+        if (!Strings.isNullOrEmpty(comment)) {
+            sb.append(String.format(" comment '%s'", comment));
         }
         return sb.toString();
     }
@@ -117,7 +116,7 @@ public class StructField {
             typeStr = typeStr.substring(lpad);
             sb.append(":").append(typeStr);
         }
-        if (StringUtils.isNotBlank(comment)) {
+        if (!Strings.isNullOrEmpty(comment)) {
             sb.append(String.format(" COMMENT '%s'", comment));
         }
         return sb.toString();
@@ -165,7 +164,7 @@ public class StructField {
         if (type != null) {
             sb.append(":").append(type);
         }
-        if (StringUtils.isNotBlank(comment)) {
+        if (!Strings.isNullOrEmpty(comment)) {
             sb.append(String.format(" COMMENT '%s'", comment));
         }
         return sb.toString();

@@ -30,6 +30,7 @@
 #include "serde/data_type_bitmap_serde.h"
 #include "util/bitmap_value.h"
 #include "vec/columns/column_complex.h"
+#include "vec/columns/column_const.h"
 #include "vec/core/field.h"
 #include "vec/core/types.h"
 #include "vec/data_types/data_type.h"
@@ -60,15 +61,16 @@ public:
     TypeDescriptor get_type_as_type_descriptor() const override {
         return TypeDescriptor(TYPE_OBJECT);
     }
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
-        return TPrimitiveType::OBJECT;
+
+    doris::FieldType get_storage_field_type() const override {
+        return doris::FieldType::OLAP_FIELD_TYPE_OBJECT;
     }
 
     int64_t get_uncompressed_serialized_bytes(const IColumn& column,
                                               int be_exec_version) const override;
     char* serialize(const IColumn& column, char* buf, int be_exec_version) const override;
-    const char* deserialize(const char* buf, IColumn* column, int be_exec_version) const override;
-
+    const char* deserialize(const char* buf, MutableColumnPtr* column,
+                            int be_exec_version) const override;
     MutableColumnPtr create_column() const override;
 
     bool get_is_parametric() const override { return false; }
@@ -83,16 +85,18 @@ public:
     bool is_value_unambiguously_represented_in_contiguous_memory_region() const override {
         return true;
     }
-    bool have_maximum_size_of_value() const override { return false; }
-
-    bool can_be_inside_nullable() const override { return true; }
 
     bool equals(const IDataType& rhs) const override { return typeid(rhs) == typeid(*this); }
 
     bool can_be_inside_low_cardinality() const override { return false; }
 
     std::string to_string(const IColumn& column, size_t row_num) const override {
-        return "BitMap()";
+        auto result = check_column_const_set_readability(column, row_num);
+        ColumnPtr ptr = result.first;
+        row_num = result.second;
+
+        const auto& data = assert_cast<const ColumnBitmap&>(*ptr).get_element(row_num);
+        return data.to_string();
     }
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
@@ -100,15 +104,17 @@ public:
     Field get_default() const override { return BitmapValue::empty_bitmap(); }
 
     [[noreturn]] Field get_field(const TExprNode& node) const override {
-        LOG(FATAL) << "Unimplemented get_field for BitMap";
+        throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,
+                               "Unimplemented get_field for BitMap");
+        __builtin_unreachable();
     }
 
     static void serialize_as_stream(const BitmapValue& value, BufferWritable& buf);
 
     static void deserialize_as_stream(BitmapValue& value, BufferReadable& buf);
 
-    DataTypeSerDeSPtr get_serde() const override {
-        return std::make_shared<DataTypeBitMapSerDe>();
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
+        return std::make_shared<DataTypeBitMapSerDe>(nesting_level);
     };
 };
 

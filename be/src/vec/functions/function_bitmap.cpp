@@ -31,7 +31,6 @@
 #include <utility>
 #include <vector>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/status.h"
 #include "gutil/strings/numbers.h"
@@ -133,7 +132,9 @@ struct ToBitmap {
                         continue;
                     }
                 }
-                res_data[i].add(col->get_data()[i]);
+                if (auto value = col->get_data()[i]; value >= 0) {
+                    res_data[i].add(value);
+                }
             }
         }
     }
@@ -174,15 +175,12 @@ struct ToBitmapWithCheck {
                     if (LIKELY(parse_result == StringParser::PARSE_SUCCESS)) {
                         res_data[i].add(int_value);
                     } else {
-                        std::stringstream ss;
-                        ss << "The input: " << std::string(raw_str, str_size)
-                           << " is not valid, to_bitmap only support bigint value from 0 to "
-                              "18446744073709551615 currently, cannot create MV with to_bitmap on "
-                              "column with negative values or cannot load negative values to "
-                              "column "
-                              "with to_bitmap MV on it.";
-                        LOG(WARNING) << ss.str();
-                        return Status::InternalError(ss.str());
+                        return Status::InvalidArgument(
+                                "The input: {} is not valid, to_bitmap only support bigint value "
+                                "from 0 to 18446744073709551615 currently, cannot create MV with "
+                                "to_bitmap on column with negative values or cannot load negative "
+                                "values to column with to_bitmap MV on it.",
+                                std::string(raw_str, str_size));
                     }
                 }
             }
@@ -199,20 +197,17 @@ struct ToBitmapWithCheck {
                     if (LIKELY(int_value >= 0)) {
                         res_data[i].add(int_value);
                     } else {
-                        std::stringstream ss;
-                        ss << "The input: " << int_value
-                           << " is not valid, to_bitmap only support bigint value from 0 to "
-                              "18446744073709551615 currently, cannot create MV with to_bitmap on "
-                              "column with negative values or cannot load negative values to "
-                              "column "
-                              "with to_bitmap MV on it.";
-                        LOG(WARNING) << ss.str();
-                        return Status::InternalError(ss.str());
+                        return Status::InvalidArgument(
+                                "The input: {} is not valid, to_bitmap only support bigint value "
+                                "from 0 to 18446744073709551615 currently, cannot create MV with "
+                                "to_bitmap on column with negative values or cannot load negative "
+                                "values to column with to_bitmap MV on it.",
+                                int_value);
                     }
                 }
             }
         } else {
-            return Status::InternalError("not support type");
+            return Status::InvalidArgument("not support type");
         }
         return Status::OK();
     }
@@ -287,7 +282,7 @@ struct BitmapFromBase64 {
                 decode_buff.resize(curr_decode_buff_len);
                 last_decode_buff_len = curr_decode_buff_len;
             }
-            int outlen = base64_decode(src_str, src_size, decode_buff.data());
+            auto outlen = base64_decode(src_str, src_size, decode_buff.data());
             if (outlen < 0) {
                 res.emplace_back();
                 null_map[i] = 1;
@@ -354,10 +349,8 @@ public:
 
     size_t get_number_of_arguments() const override { return 1; }
 
-    bool use_default_implementation_for_nulls() const override { return true; }
-
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto res_null_map = ColumnUInt8::create(input_rows_count, 0);
         auto res_data_column = ColumnBitmap::create();
         auto& null_map = res_null_map->get_data();
@@ -368,7 +361,7 @@ public:
             const auto& str_column = static_cast<const ColumnString&>(*argument_column);
             const ColumnString::Chars& data = str_column.get_chars();
             const ColumnString::Offsets& offsets = str_column.get_offsets();
-            static_cast<void>(Impl::vector(data, offsets, res, null_map, input_rows_count));
+            RETURN_IF_ERROR(Impl::vector(data, offsets, res, null_map, input_rows_count));
         } else if constexpr (std::is_same_v<typename Impl::ArgumentType, DataTypeArray>) {
             auto argument_type = remove_nullable(
                     assert_cast<const DataTypeArray&>(*block.get_by_position(arguments[0]).type)
@@ -379,20 +372,22 @@ public:
                     static_cast<const ColumnNullable&>(array_column.get_data());
             const auto& nested_column = nested_nullable_column.get_nested_column();
             const auto& nested_null_map = nested_nullable_column.get_null_map_column().get_data();
-            if (check_column<ColumnInt8>(nested_column)) {
-                static_cast<void>(Impl::template vector<ColumnInt8>(
+
+            WhichDataType which_type(argument_type);
+            if (which_type.is_int8()) {
+                RETURN_IF_ERROR(Impl::template vector<ColumnInt8>(offset_column_data, nested_column,
+                                                                  nested_null_map, res, null_map));
+            } else if (which_type.is_uint8()) {
+                RETURN_IF_ERROR(Impl::template vector<ColumnUInt8>(
                         offset_column_data, nested_column, nested_null_map, res, null_map));
-            } else if (check_column<ColumnUInt8>(nested_column)) {
-                static_cast<void>(Impl::template vector<ColumnUInt8>(
+            } else if (which_type.is_int16()) {
+                RETURN_IF_ERROR(Impl::template vector<ColumnInt16>(
                         offset_column_data, nested_column, nested_null_map, res, null_map));
-            } else if (check_column<ColumnInt16>(nested_column)) {
-                static_cast<void>(Impl::template vector<ColumnInt16>(
+            } else if (which_type.is_int32()) {
+                RETURN_IF_ERROR(Impl::template vector<ColumnInt32>(
                         offset_column_data, nested_column, nested_null_map, res, null_map));
-            } else if (check_column<ColumnInt32>(nested_column)) {
-                static_cast<void>(Impl::template vector<ColumnInt32>(
-                        offset_column_data, nested_column, nested_null_map, res, null_map));
-            } else if (check_column<ColumnInt64>(nested_column)) {
-                static_cast<void>(Impl::template vector<ColumnInt64>(
+            } else if (which_type.is_int64()) {
+                RETURN_IF_ERROR(Impl::template vector<ColumnInt64>(
                         offset_column_data, nested_column, nested_null_map, res, null_map));
             } else {
                 return Status::RuntimeError("Illegal column {} of argument of function {}",
@@ -502,7 +497,7 @@ public:
     bool use_default_implementation_for_nulls() const override { return false; }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto res_data_column = ColumnInt64::create();
         auto& res = res_data_column->get_data();
         auto data_null_map = ColumnUInt8::create(input_rows_count, 0);
@@ -582,7 +577,7 @@ struct BitmapAndNot {
             mid_data &= rvec[i];
             res[i] = lvec[i];
             res[i] -= mid_data;
-            mid_data.clear();
+            mid_data.reset();
         }
     }
     static void vector_scalar(const TData& lvec, const BitmapValue& rval, TData& res) {
@@ -593,7 +588,7 @@ struct BitmapAndNot {
             mid_data &= rval;
             res[i] = lvec[i];
             res[i] -= mid_data;
-            mid_data.clear();
+            mid_data.reset();
         }
     }
     static void scalar_vector(const BitmapValue& lval, const TData& rvec, TData& res) {
@@ -604,7 +599,7 @@ struct BitmapAndNot {
             mid_data &= rvec[i];
             res[i] = lval;
             res[i] -= mid_data;
-            mid_data.clear();
+            mid_data.reset();
         }
     }
 };
@@ -628,7 +623,7 @@ struct BitmapAndNotCount {
             mid_data = lvec[i];
             mid_data &= rvec[i];
             res[i] = lvec[i].andnot_cardinality(mid_data);
-            mid_data.clear();
+            mid_data.reset();
         }
     }
     static void scalar_vector(const BitmapValue& lval, const TData& rvec, ResTData* res) {
@@ -638,7 +633,7 @@ struct BitmapAndNotCount {
             mid_data = lval;
             mid_data &= rvec[i];
             res[i] = lval.andnot_cardinality(mid_data);
-            mid_data.clear();
+            mid_data.reset();
         }
     }
     static void vector_scalar(const TData& lvec, const BitmapValue& rval, ResTData* res) {
@@ -648,7 +643,7 @@ struct BitmapAndNotCount {
             mid_data = lvec[i];
             mid_data &= rval;
             res[i] = lvec[i].andnot_cardinality(mid_data);
-            mid_data.clear();
+            mid_data.reset();
         }
     }
 };
@@ -665,7 +660,7 @@ void update_bitmap_op_count(int64_t* __restrict count, const NullMap& null_map) 
 // for bitmap_and_count, bitmap_xor_count and bitmap_and_not_count,
 // result is 0 for rows that if any column is null value
 ColumnPtr handle_bitmap_op_count_null_value(ColumnPtr& src, const Block& block,
-                                            const ColumnNumbers& args, size_t result,
+                                            const ColumnNumbers& args, uint32_t result,
                                             size_t input_rows_count) {
     auto* nullable = assert_cast<const ColumnNullable*>(src.get());
     ColumnPtr src_not_nullable = nullable->get_nested_column_ptr();
@@ -701,16 +696,11 @@ ColumnPtr handle_bitmap_op_count_null_value(ColumnPtr& src, const Block& block,
 }
 
 Status execute_bitmap_op_count_null_to_zero(
-        FunctionContext* context, Block& block, const ColumnNumbers& arguments, size_t result,
+        FunctionContext* context, Block& block, const ColumnNumbers& arguments, uint32_t result,
         size_t input_rows_count,
         const std::function<Status(FunctionContext*, Block&, const ColumnNumbers&, size_t, size_t)>&
                 exec_impl_func) {
-    NullPresence null_presence = get_null_presence(block, arguments);
-
-    if (null_presence.has_null_constant) {
-        block.get_by_position(result).column =
-                block.get_by_position(result).type->create_column_const(input_rows_count, 0);
-    } else if (null_presence.has_nullable) {
+    if (have_null_column(block, arguments)) {
         auto [temporary_block, new_args, new_result] =
                 create_block_with_nested_columns(block, arguments, result);
         RETURN_IF_ERROR(exec_impl_func(context, temporary_block, new_args, new_result,
@@ -755,10 +745,10 @@ public:
     }
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         DCHECK_EQ(arguments.size(), 2);
         auto impl_func = [&](FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                             size_t result, size_t input_rows_count) {
+                             uint32_t result, size_t input_rows_count) {
             return execute_impl_internal(context, block, arguments, result, input_rows_count);
         };
         return execute_bitmap_op_count_null_to_zero(context, block, arguments, result,
@@ -766,7 +756,7 @@ public:
     }
 
     Status execute_impl_internal(FunctionContext* context, Block& block,
-                                 const ColumnNumbers& arguments, size_t result,
+                                 const ColumnNumbers& arguments, uint32_t result,
                                  size_t input_rows_count) const {
         using ResultType = typename ResultDataType::FieldType;
         using ColVecResult = ColumnVector<ResultType>;
@@ -1001,7 +991,7 @@ struct BitmapToBase64 {
         for (size_t i = 0; i < size; ++i) {
             BitmapValue& bitmap_val = const_cast<BitmapValue&>(data[i]);
             auto ser_size = bitmap_val.getSizeInBytes();
-            output_char_size += ser_size * (int)(4.0 * ceil((double)ser_size / 3.0));
+            output_char_size += (int)(4.0 * ceil((double)ser_size / 3.0));
         }
         ColumnString::check_chars_length(output_char_size, size);
         chars.resize(output_char_size);
@@ -1020,8 +1010,8 @@ struct BitmapToBase64 {
             }
             bitmap_val.write_to(ser_buff.data());
 
-            int outlen = base64_encode((const unsigned char*)ser_buff.data(), cur_ser_size,
-                                       chars_data + encoded_offset);
+            auto outlen = base64_encode((const unsigned char*)ser_buff.data(), cur_ser_size,
+                                        chars_data + encoded_offset);
             DCHECK(outlen > 0);
 
             encoded_offset += (int)(4.0 * ceil((double)cur_ser_size / 3.0));
@@ -1156,10 +1146,8 @@ public:
 
     size_t get_number_of_arguments() const override { return 3; }
 
-    bool use_default_implementation_for_nulls() const override { return false; }
-
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         DCHECK_EQ(arguments.size(), 3);
         auto res_null_map = ColumnUInt8::create(input_rows_count, 0);
         auto res_data_column = ColumnBitmap::create(input_rows_count);
@@ -1175,10 +1163,6 @@ public:
                                            : block.get_by_position(arguments[0]).column;
 
         default_preprocess_parameter_columns(argument_columns, col_const, {1, 2}, block, arguments);
-
-        for (int i = 0; i < 3; i++) {
-            check_set_nullable(argument_columns[i], res_null_map, col_const[i]);
-        }
 
         auto bitmap_column = assert_cast<const ColumnBitmap*>(argument_columns[0].get());
         auto offset_column = assert_cast<const ColumnVector<Int64>*>(argument_columns[1].get());
@@ -1215,10 +1199,8 @@ public:
 
     size_t get_number_of_arguments() const override { return 1; }
 
-    bool use_default_implementation_for_nulls() const override { return true; }
-
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         auto return_nested_type = make_nullable(std::make_shared<DataTypeInt64>());
         auto dest_array_column_ptr = ColumnArray::create(return_nested_type->create_column(),
                                                          ColumnArray::ColumnOffsets::create());

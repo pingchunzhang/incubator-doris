@@ -22,7 +22,6 @@ import java.sql.PreparedStatement
 
 suite("insert_group_commit_with_exception") {
     def table = "insert_group_commit_with_exception"
-
     def getRowCount = { expectedRowCount ->
         def retry = 0
         while (retry < 30) {
@@ -37,20 +36,11 @@ suite("insert_group_commit_with_exception") {
     }
 
     def getAlterTableState = {
-        def retry = 0
-        while (true) {
-            sleep(2000)
-            def state = sql "show alter table column where tablename = '${table}' order by CreateTime desc "
-            logger.info("alter table state: ${state}")
-            if (state.size()> 0 && state[0][9] == "FINISHED") {
-                return true
-            }
-            retry++
-            if (retry >= 10) {
-                return false
-            }
+        waitForSchemaChangeDone {
+            sql """ SHOW ALTER TABLE COLUMN WHERE tablename='${table}' ORDER BY createtime DESC LIMIT 1 """
+            time 600
         }
-        return false
+        return true
     }
 
     try {
@@ -58,22 +48,21 @@ suite("insert_group_commit_with_exception") {
         sql """ drop table if exists ${table}; """
 
         sql """
-        CREATE TABLE `${table}` (
-            `id` int(11) NOT NULL,
-            `name` varchar(1100) NULL,
-            `score` int(11) NULL default "-1"
-        ) ENGINE=OLAP
-        DUPLICATE KEY(`id`, `name`)
-        DISTRIBUTED BY HASH(`id`) BUCKETS 1
-        PROPERTIES (
-            "replication_num" = "1"
-        );
-        """
+            CREATE TABLE `${table}` (
+                `id` int(11) NOT NULL,
+                `name` varchar(1100) NULL,
+                `score` int(11) NULL default "-1"
+            ) ENGINE=OLAP
+            DUPLICATE KEY(`id`, `name`)
+            DISTRIBUTED BY HASH(`id`) BUCKETS 1
+            PROPERTIES (
+                "group_commit_interval_ms" = "200",
+                "replication_num" = "1"
+            );
+            """
 
-        sql """ set enable_insert_group_commit = true; """
-        // TODO
-        sql """ set enable_nereids_dml = false; """
-
+        sql """ set group_commit = async_mode; """
+        sql "set enable_server_side_prepared_statement = true"
         // insert into without column
         try {
             def result = sql """ insert into ${table} values(1, 'a', 10, 100)  """
@@ -127,7 +116,8 @@ suite("insert_group_commit_with_exception") {
         try (Connection connection = DriverManager.getConnection(url, context.config.jdbcUser, context.config.jdbcPassword)) {
             Statement statement = connection.createStatement();
             statement.execute("use ${db}");
-            statement.execute("set enable_insert_group_commit = true;");
+            statement.execute("set group_commit = eventual_consistency;");
+            statement.execute("set enable_server_side_prepared_statement = true")
             // without column
             try (PreparedStatement ps = connection.prepareStatement("insert into ${table} values(?, ?, ?, ?)")) {
                 ps.setObject(1, 8);
@@ -250,7 +240,8 @@ suite("insert_group_commit_with_exception") {
                     result = ps.executeBatch()
                     assertTrue(false)
                 } catch (Exception e) {
-                    assertTrue(e.getMessage().contains("Column count doesn't match value count"))
+                    logger.info("exception : " + e)
+                    assertTrue(e.getMessage().contains("insert into cols should be corresponding to the query output"))
                 }
             }
             getRowCount(14)
@@ -279,4 +270,5 @@ suite("insert_group_commit_with_exception") {
     } finally {
         // try_sql("DROP TABLE ${table}")
     }
+
 }

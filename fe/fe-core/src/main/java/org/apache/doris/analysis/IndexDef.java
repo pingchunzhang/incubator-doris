@@ -17,7 +17,6 @@
 
 package org.apache.doris.analysis;
 
-import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.PrimitiveType;
@@ -43,6 +42,7 @@ public class IndexDef {
     private Map<String, String> properties;
     private boolean isBuildDeferred = false;
     private PartitionNames partitionNames;
+    private List<Integer> columnUniqueIds = Lists.newArrayList();
 
     public static final String NGRAM_SIZE_KEY = "gram_size";
     public static final String NGRAM_BF_SIZE_KEY = "bf_size";
@@ -55,7 +55,7 @@ public class IndexDef {
         this.ifNotExists = ifNotExists;
         this.columns = columns;
         if (indexType == null) {
-            this.indexType = IndexType.BITMAP;
+            this.indexType = IndexType.INVERTED;
         } else {
             this.indexType = indexType;
         }
@@ -197,6 +197,10 @@ public class IndexDef {
         return partitionNames == null ? Lists.newArrayList() : partitionNames.getPartitionNames();
     }
 
+    public List<Integer> getColumnUniqueIds() {
+        return columnUniqueIds;
+    }
+
     public enum IndexType {
         BITMAP,
         INVERTED,
@@ -208,31 +212,37 @@ public class IndexDef {
         return (this.indexType == IndexType.INVERTED);
     }
 
-    public void checkColumn(Column column, KeysType keysType, boolean enableUniqueKeyMergeOnWrite)
-            throws AnalysisException {
+    public void checkColumn(Column column, KeysType keysType, boolean enableUniqueKeyMergeOnWrite,
+                boolean disableInvertedIndexV1ForVariant) throws AnalysisException {
         if (indexType == IndexType.BITMAP || indexType == IndexType.INVERTED || indexType == IndexType.BLOOMFILTER
                 || indexType == IndexType.NGRAM_BF) {
             String indexColName = column.getName();
             caseSensitivityColumns.add(indexColName);
             PrimitiveType colType = column.getDataType();
-            if (indexType == IndexType.INVERTED && colType.isArrayType()) {
-                colType = ((ArrayType) column.getType()).getItemType().getPrimitiveType();
-            }
             if (!(colType.isDateType() || colType.isDecimalV2Type() || colType.isDecimalV3Type()
-                    || colType.isFixedPointType() || colType.isStringType() || colType == PrimitiveType.BOOLEAN)) {
+                    || colType.isFixedPointType() || colType.isStringType() || colType == PrimitiveType.BOOLEAN
+                    || colType.isVariantType() || colType.isIPType() || colType.isArrayType())) {
                 throw new AnalysisException(colType + " is not supported in " + indexType.toString() + " index. "
-                        + "invalid column: " + indexColName);
-            } else if (indexType == IndexType.INVERTED
-                    && ((keysType == KeysType.AGG_KEYS && !column.isKey())
-                        || (keysType == KeysType.UNIQUE_KEYS && !enableUniqueKeyMergeOnWrite))) {
-                throw new AnalysisException(indexType.toString()
-                    + " index only used in columns of DUP_KEYS table"
-                    + " or UNIQUE_KEYS table with merge_on_write enabled"
-                    + " or key columns of AGG_KEYS table. invalid column: " + indexColName);
-            } else if (keysType == KeysType.AGG_KEYS && !column.isKey() && indexType != IndexType.INVERTED) {
-                throw new AnalysisException(indexType.toString()
-                    + " index only used in columns of DUP_KEYS/UNIQUE_KEYS table or key columns of"
-                    + " AGG_KEYS table. invalid column: " + indexColName);
+                        + "invalid index: " + indexName);
+            }
+
+            // In inverted index format v1, each subcolumn of a variant has its own index file, leading to high IOPS.
+            // when the subcolumn type changes, it may result in missing files, causing link file failure.
+            if (colType.isVariantType() && disableInvertedIndexV1ForVariant) {
+                throw new AnalysisException(colType + " is not supported in inverted index format V1,"
+                        + "Please set properties(\"inverted_index_storage_format\"= \"v2\"),"
+                        + "or upgrade to a newer version");
+            }
+            if (!column.isKey()) {
+                if (keysType == KeysType.AGG_KEYS) {
+                    throw new AnalysisException("index should only be used in columns of DUP_KEYS/UNIQUE_KEYS table"
+                        + " or key columns of AGG_KEYS table. invalid index: " + indexName);
+                } else if (keysType == KeysType.UNIQUE_KEYS && !enableUniqueKeyMergeOnWrite
+                               && indexType == IndexType.INVERTED && properties != null
+                               && properties.containsKey(InvertedIndexUtil.INVERTED_INDEX_PARSER_KEY)) {
+                    throw new AnalysisException("INVERTED index with parser can NOT be used in value columns of"
+                        + " UNIQUE_KEYS table with merge_on_write disable. invalid index: " + indexName);
+                }
             }
 
             if (indexType == IndexType.INVERTED) {
@@ -242,10 +252,6 @@ public class IndexDef {
                         && colType != PrimitiveType.STRING) {
                     throw new AnalysisException(colType + " is not supported in ngram_bf index. "
                                                     + "invalid column: " + indexColName);
-                } else if ((keysType == KeysType.AGG_KEYS && !column.isKey())) {
-                    throw new AnalysisException(
-                        "ngram_bf index only used in columns of DUP_KEYS/UNIQUE_KEYS table or key columns of"
-                        + " AGG_KEYS table. invalid column: " + indexColName);
                 }
                 if (properties.size() != 2) {
                     throw new AnalysisException("ngram_bf index should have gram_size and bf_size properties");
@@ -256,8 +262,8 @@ public class IndexDef {
                     if (ngramSize > 256 || ngramSize < 1) {
                         throw new AnalysisException("gram_size should be integer and less than 256");
                     }
-                    if (bfSize > 65536 || bfSize < 64) {
-                        throw new AnalysisException("bf_size should be integer and between 64 and 65536");
+                    if (bfSize > 65535 || bfSize < 64) {
+                        throw new AnalysisException("bf_size should be integer and between 64 and 65535");
                     }
                 } catch (NumberFormatException e) {
                     throw new AnalysisException("invalid ngram properties:" + e.getMessage(), e);

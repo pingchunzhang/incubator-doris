@@ -28,11 +28,14 @@
 #include "vec/exprs/vexpr_fwd.h"
 
 namespace doris::vectorized {
+#include "common/compile_check_begin.h"
 
 class VFileFormatTransformer {
 public:
-    VFileFormatTransformer(const VExprContextSPtrs& output_vexpr_ctxs, bool output_object_data)
-            : _output_vexpr_ctxs(output_vexpr_ctxs),
+    VFileFormatTransformer(RuntimeState* state, const VExprContextSPtrs& output_vexpr_ctxs,
+                           bool output_object_data)
+            : _state(state),
+              _output_vexpr_ctxs(output_vexpr_ctxs),
               _cur_written_rows(0),
               _output_object_data(output_object_data) {
         DataTypes data_types;
@@ -51,6 +54,7 @@ public:
     virtual int64_t written_len() = 0;
 
 protected:
+    RuntimeState* _state = nullptr; // not owned, set when init
     const VExprContextSPtrs& _output_vexpr_ctxs;
     int64_t _cur_written_rows;
     bool _output_object_data;
@@ -58,3 +62,5 @@ protected:
     vectorized::DataTypeSerDe::FormatOptions _options;
 };
 } // namespace doris::vectorized
+
+#include "common/compile_check_end.h"

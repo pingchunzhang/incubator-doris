@@ -36,7 +36,7 @@ import org.apache.commons.lang3.StringUtils;
  * syntax:
  * SHOW ROW POLICY [FOR user｜ROLE role]
  **/
-public class ShowPolicyStmt extends ShowStmt {
+public class ShowPolicyStmt extends ShowStmt implements NotFallbackInParser {
 
     @Getter
     private final PolicyTypeEnum type;
@@ -57,7 +57,7 @@ public class ShowPolicyStmt extends ShowStmt {
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
         if (user != null) {
-            user.analyze(analyzer.getClusterName());
+            user.analyze();
         }
         // check auth
         if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {

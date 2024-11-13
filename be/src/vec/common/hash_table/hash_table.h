@@ -268,7 +268,8 @@ struct HashTableGrower {
 
     /// Set the buffer size by the number of elements in the hash table. Used when deserializing a hash table.
     void set(size_t num_elems) {
-        size_t fill_capacity = static_cast<size_t>(log2(num_elems - 1)) + 1;
+        size_t fill_capacity =
+                (num_elems <= 1) ? 1 : (static_cast<size_t>(log2(num_elems - 1)) + 1);
         fill_capacity =
                 fill_capacity < double_grow_degree
                         ? fill_capacity + 1
@@ -353,29 +354,6 @@ public:
     }
 };
 
-static_assert(sizeof(HashTableGrowerWithPrecalculation<>) == 64);
-
-/** When used as a Grower, it turns a hash table into something like a lookup table.
-  * It remains non-optimal - the cells store the keys.
-  * Also, the compiler can not completely remove the code of passing through the collision resolution chain, although it is not needed.
-  * TODO Make a proper lookup table.
-  */
-template <size_t key_bits>
-struct HashTableFixedGrower {
-    size_t buf_size() const { return 1ULL << key_bits; }
-    size_t place(size_t x) const { return x; }
-    /// You could write __builtin_unreachable(), but the compiler does not optimize everything, and it turns out less efficiently.
-    size_t next(size_t pos) const { return pos + 1; }
-    bool overflow(size_t /*elems*/) const { return false; }
-
-    void increase_size() {
-        LOG(FATAL) << "__builtin_unreachable";
-        __builtin_unreachable();
-    }
-    void set(size_t /*num_elems*/) {}
-    void set_buf_size(size_t /*buf_size_*/) {}
-};
-
 /** If you want to store the zero key separately - a place to store it. */
 template <bool need_zero_value_storage, typename Cell>
 struct ZeroValueStorage;
@@ -438,31 +416,14 @@ protected:
     using cell_type = Cell;
 
     size_t m_size = 0;   /// Amount of elements
-    Cell* buf {nullptr}; /// A piece of memory for all elements except the element with zero key.
+    Cell* buf = nullptr; /// A piece of memory for all elements except the element with zero key.
     Grower grower;
     int64_t _resize_timer_ns;
-
-    // the bucket count threshold above which it's converted to partioned hash table
-    // > 0: enable convert dynamically
-    // 0: convert is disabled
-    int _partitioned_threshold = 0;
-    // if need resize and bucket count after resize will be >= _partitioned_threshold,
-    // this flag is set to true, and resize does not actually happen,
-    // PartitionedHashTable will convert this hash table to partitioned hash table
-    bool _need_partition = false;
 
     //factor that will trigger growing the hash table on insert.
     static constexpr float MAX_BUCKET_OCCUPANCY_FRACTION = 0.5f;
 
     mutable size_t collisions = 0;
-
-    void set_partitioned_threshold(int threshold) { _partitioned_threshold = threshold; }
-
-    bool check_if_need_partition(size_t bucket_count) {
-        return _partitioned_threshold > 0 && bucket_count >= _partitioned_threshold;
-    }
-
-    bool need_partition() { return _need_partition; }
 
     /// Find a cell with the same key or an empty cell, starting from the specified position and further along the collision resolution chain.
     size_t ALWAYS_INLINE find_cell(const Key& x, size_t hash_value, size_t place_value) const {
@@ -542,8 +503,8 @@ protected:
         using Container = std::conditional_t<is_const, const Self, Self>;
         using cell_type = std::conditional_t<is_const, const Cell, Cell>;
 
-        Container* container;
-        cell_type* ptr;
+        Container* container = nullptr;
+        cell_type* ptr = nullptr;
 
         friend class HashTable;
 
@@ -573,11 +534,6 @@ protected:
 
         auto get_ptr() const { return ptr; }
         size_t get_hash() const { return ptr->get_hash(*container); }
-
-        size_t get_collision_chain_length() const {
-            return container->grower.place((ptr - container->buf) -
-                                           container->grower.place(get_hash()));
-        }
 
         /**
           * A hack for HashedDictionary.
@@ -637,13 +593,12 @@ public:
         std::swap(buf, rhs.buf);
         std::swap(m_size, rhs.m_size);
         std::swap(grower, rhs.grower);
-        std::swap(_need_partition, rhs._need_partition);
-        std::swap(_partitioned_threshold, rhs._partitioned_threshold);
 
-        Hash::operator=(std::move(rhs));
-        Allocator::operator=(std::move(rhs));
-        Cell::State::operator=(std::move(rhs));
-        ZeroValueStorage<Cell::need_zero_value_storage, Cell>::operator=(std::move(rhs));
+        Hash::operator=(std::move(rhs));        // NOLINT(bugprone-use-after-move)
+        Allocator::operator=(std::move(rhs));   // NOLINT(bugprone-use-after-move)
+        Cell::State::operator=(std::move(rhs)); // NOLINT(bugprone-use-after-move)
+        ZeroValueStorage<Cell::need_zero_value_storage, Cell>::operator=(
+                std::move(rhs)); // NOLINT(bugprone-use-after-move)
 
         return *this;
     }
@@ -767,12 +722,10 @@ protected:
                 throw;
             }
 
-            if (LIKELY(!_need_partition)) {
-                // The hash table was rehashed, so we have to re-find the key.
-                size_t new_place = find_cell(key, hash_value, grower.place(hash_value));
-                assert(!buf[new_place].is_zero(*this));
-                it = &buf[new_place];
-            }
+            // The hash table was rehashed, so we have to re-find the key.
+            size_t new_place = find_cell(key, hash_value, grower.place(hash_value));
+            assert(!buf[new_place].is_zero(*this));
+            it = &buf[new_place];
         }
     }
 
@@ -803,12 +756,10 @@ protected:
                 throw;
             }
 
-            if (LIKELY(!_need_partition)) {
-                // The hash table was rehashed, so we have to re-find the key.
-                size_t new_place = find_cell(key, hash_value, grower.place(hash_value));
-                assert(!buf[new_place].is_zero(*this));
-                it = &buf[new_place];
-            }
+            // The hash table was rehashed, so we have to re-find the key.
+            size_t new_place = find_cell(key, hash_value, grower.place(hash_value));
+            assert(!buf[new_place].is_zero(*this));
+            it = &buf[new_place];
         }
     }
 
@@ -877,7 +828,7 @@ public:
 
     private:
         Constructor(Cell* cell) : _cell(cell) {}
-        Cell* _cell;
+        Cell* _cell = nullptr;
     };
 
     /** Insert the key.
@@ -1086,13 +1037,6 @@ private:
             if (new_grower.buf_size() <= old_size) return;
         } else
             new_grower.increase_size();
-
-        // new bucket count exceed partitioned hash table bucket count threshold,
-        // don't resize and set need partition flag
-        if (check_if_need_partition(new_grower.buf_size())) {
-            _need_partition = true;
-            return;
-        }
 
         /// Expand the space.
         buf = reinterpret_cast<Cell*>(Allocator::realloc(buf, get_buffer_size_in_bytes(),

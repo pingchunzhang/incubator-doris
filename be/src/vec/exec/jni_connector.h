@@ -33,6 +33,7 @@
 #include "runtime/define_primitive_type.h"
 #include "runtime/primitive_type.h"
 #include "runtime/types.h"
+#include "util/profile_collector.h"
 #include "util/runtime_profile.h"
 #include "util/string_util.h"
 #include "vec/aggregate_functions/aggregate_function.h"
@@ -48,8 +49,6 @@ template <typename T>
 class ColumnDecimal;
 template <typename T>
 class ColumnVector;
-template <typename T>
-struct Decimal;
 } // namespace vectorized
 } // namespace doris
 
@@ -58,7 +57,7 @@ namespace doris::vectorized {
 /**
  * Connector to java jni scanner, which should extend org.apache.doris.common.jni.JniScanner
  */
-class JniConnector {
+class JniConnector : public ProfileCollector {
 public:
     class TableMetaAddress {
     private:
@@ -165,6 +164,9 @@ public:
                     char_ptr += s->size;
                 }
             } else {
+                // FIXME: it can not handle decimal type correctly.
+                // but this logic is deprecated and not used.
+                // so may be deleted or fixed later.
                 for (const CppType* v : values) {
                     int type_len = sizeof(CppType);
                     *reinterpret_cast<int*>(char_ptr) = type_len;
@@ -206,8 +208,7 @@ public:
         _is_table_schema = true;
     }
 
-    /// Should release jni resources if other functions are failed.
-    ~JniConnector();
+    ~JniConnector() override = default;
 
     /**
      * Open java scanner, and get the following scanner methods by jni:
@@ -236,7 +237,7 @@ public:
      *                            | data column start address of the variable length column-B |
      *                            | ... |
      */
-    Status get_nex_block(Block* block, size_t* read_rows, bool* eof);
+    Status get_next_block(Block* block, size_t* read_rows, bool* eof);
 
     /**
      * Get performance metrics from java scanner
@@ -275,6 +276,9 @@ public:
 
     static Status fill_block(Block* block, const ColumnNumbers& arguments, long table_address);
 
+protected:
+    void _collect_profile_before_close() override;
+
 private:
     std::string _connector_name;
     std::string _connector_class;
@@ -282,17 +286,17 @@ private:
     std::vector<std::string> _column_names;
     bool _is_table_schema = false;
 
-    RuntimeState* _state;
-    RuntimeProfile* _profile;
-    RuntimeProfile::Counter* _open_scanner_time;
-    RuntimeProfile::Counter* _java_scan_time;
-    RuntimeProfile::Counter* _fill_block_time;
+    RuntimeState* _state = nullptr;
+    RuntimeProfile* _profile = nullptr;
+    RuntimeProfile::Counter* _open_scanner_time = nullptr;
+    RuntimeProfile::Counter* _java_scan_time = nullptr;
+    RuntimeProfile::Counter* _fill_block_time = nullptr;
     std::map<std::string, RuntimeProfile::Counter*> _scanner_profile;
 
     size_t _has_read = 0;
 
     bool _closed = false;
-    bool _scanner_initialized = false;
+    bool _scanner_opened = false;
     jclass _jni_scanner_cls;
     jobject _jni_scanner_obj;
     jmethodID _jni_scanner_open;
@@ -306,7 +310,7 @@ private:
     TableMetaAddress _table_meta;
 
     int _predicates_length = 0;
-    std::unique_ptr<char[]> _predicates = nullptr;
+    std::unique_ptr<char[]> _predicates;
 
     /**
      * Set the address of meta information, which is returned by org.apache.doris.common.jni.JniScanner#getNextBatchMeta

@@ -35,6 +35,7 @@ import org.apache.doris.thrift.TFileFormatType;
 import org.apache.doris.thrift.TFileType;
 import org.apache.doris.thrift.TStreamLoadPutRequest;
 import org.apache.doris.thrift.TUniqueId;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 
 import com.google.common.base.Strings;
 import org.apache.logging.log4j.LogManager;
@@ -83,18 +84,19 @@ public class StreamLoadTask implements LoadTaskInfo {
     private String headerType = "";
     private List<String> hiddenColumns;
     private boolean trimDoubleQuotes = false;
-    private boolean isPartialUpdate = false;
+    private TUniqueKeyUpdateMode uniquekeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
 
     private int skipLines = 0;
     private boolean enableProfile = false;
 
     private boolean memtableOnSinkNode = false;
+    private int streamPerNode = 2;
 
     private byte enclose = 0;
 
     private byte escape = 0;
 
-    private boolean groupCommit = false;
+    private String groupCommit;
 
     public StreamLoadTask(TUniqueId id, long txnId, TFileType fileType, TFileFormatType formatType,
             TFileCompressType compressType) {
@@ -296,8 +298,18 @@ public class StreamLoadTask implements LoadTaskInfo {
     }
 
     @Override
-    public boolean isPartialUpdate() {
-        return isPartialUpdate;
+    public boolean isFixedPartialUpdate() {
+        return uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS;
+    }
+
+    @Override
+    public TUniqueKeyUpdateMode getUniqueKeyUpdateMode() {
+        return uniquekeyUpdateMode;
+    }
+
+    @Override
+    public boolean isFlexiblePartialUpdate() {
+        return uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS;
     }
 
     @Override
@@ -309,12 +321,21 @@ public class StreamLoadTask implements LoadTaskInfo {
         this.memtableOnSinkNode = memtableOnSinkNode;
     }
 
+    @Override
+    public int getStreamPerNode() {
+        return streamPerNode;
+    }
+
+    public void setStreamPerNode(int streamPerNode) {
+        this.streamPerNode = streamPerNode;
+    }
+
     public static StreamLoadTask fromTStreamLoadPutRequest(TStreamLoadPutRequest request) throws UserException {
         StreamLoadTask streamLoadTask = new StreamLoadTask(request.getLoadId(), request.getTxnId(),
                 request.getFileType(), request.getFormatType(),
                 request.getCompressType());
         streamLoadTask.setOptionalFromTSLPutRequest(request);
-        streamLoadTask.setGroupCommit(request.isGroupCommit());
+        streamLoadTask.setGroupCommit(request.getGroupCommitMode());
         if (request.isSetFileSize()) {
             streamLoadTask.fileSize = request.getFileSize();
         }
@@ -441,11 +462,27 @@ public class StreamLoadTask implements LoadTaskInfo {
         if (request.isSetEnableProfile()) {
             enableProfile = request.isEnableProfile();
         }
-        if (request.isSetPartialUpdate()) {
-            isPartialUpdate = request.isPartialUpdate();
+        if (request.isSetUniqueKeyUpdateMode()) {
+            try {
+                uniquekeyUpdateMode = request.getUniqueKeyUpdateMode();
+            } catch (IllegalArgumentException e) {
+                throw new UserException("unknown unique_key_update_mode: "
+                        + request.getUniqueKeyUpdateMode().toString());
+            }
+        } else {
+            if (request.isSetPartialUpdate() && request.isPartialUpdate()) {
+                uniquekeyUpdateMode = TUniqueKeyUpdateMode.UPDATE_FIXED_COLUMNS;
+            } else {
+                uniquekeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
+            }
         }
         if (request.isSetMemtableOnSinkNode()) {
             this.memtableOnSinkNode = request.isMemtableOnSinkNode();
+        } else {
+            this.memtableOnSinkNode = Config.stream_load_default_memtable_on_sink_node;
+        }
+        if (request.isSetStreamPerNode()) {
+            this.streamPerNode = request.getStreamPerNode();
         }
     }
 
@@ -523,12 +560,11 @@ public class StreamLoadTask implements LoadTaskInfo {
         return maxFilterRatio;
     }
 
-    public void setGroupCommit(boolean groupCommit) {
+    public void setGroupCommit(String groupCommit) {
         this.groupCommit = groupCommit;
     }
 
-    public boolean isGroupCommit() {
+    public String getGroupCommit() {
         return groupCommit;
     }
 }
-

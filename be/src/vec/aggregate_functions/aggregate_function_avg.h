@@ -58,6 +58,7 @@ namespace doris::vectorized {
 
 template <typename T>
 struct AggregateFunctionAvgData {
+    using ResultType = T;
     T sum {};
     UInt64 count = 0;
 
@@ -84,10 +85,14 @@ struct AggregateFunctionAvgData {
             DecimalV2Value decimal_val_count(count, 0);
             DecimalV2Value decimal_val_sum(sum);
             DecimalV2Value cal_ret = decimal_val_sum / decimal_val_count;
-            Decimal128 ret(cal_ret.value());
+            Decimal128V2 ret(cal_ret.value());
             return ret;
         } else {
-            return static_cast<ResultT>(sum) / count;
+            if constexpr (IsDecimal256<T>) {
+                return static_cast<ResultT>(sum / T(count));
+            } else {
+                return static_cast<ResultT>(sum) / count;
+            }
         }
     }
 
@@ -107,16 +112,18 @@ template <typename T, typename Data>
 class AggregateFunctionAvg final
         : public IAggregateFunctionDataHelper<Data, AggregateFunctionAvg<T, Data>> {
 public:
-    using ResultType = DisposeDecimal<T, Float64>;
-    using ResultDataType =
-            std::conditional_t<IsDecimalV2<T>, DataTypeDecimal<Decimal128>,
-                               std::conditional_t<IsDecimalNumber<T>, DataTypeDecimal<Decimal128I>,
-                                                  DataTypeNumber<Float64>>>;
+    using ResultType = std::conditional_t<
+            IsDecimalV2<T>, Decimal128V2,
+            std::conditional_t<IsDecimalNumber<T>, typename Data::ResultType, Float64>>;
+    using ResultDataType = std::conditional_t<
+            IsDecimalV2<T>, DataTypeDecimal<Decimal128V2>,
+            std::conditional_t<IsDecimalNumber<T>, DataTypeDecimal<typename Data::ResultType>,
+                               DataTypeNumber<Float64>>>;
     using ColVecType = std::conditional_t<IsDecimalNumber<T>, ColumnDecimal<T>, ColumnVector<T>>;
-    using ColVecResult =
-            std::conditional_t<IsDecimalV2<T>, ColumnDecimal<Decimal128>,
-                               std::conditional_t<IsDecimalNumber<T>, ColumnDecimal<Decimal128I>,
-                                                  ColumnVector<Float64>>>;
+    using ColVecResult = std::conditional_t<
+            IsDecimalV2<T>, ColumnDecimal<Decimal128V2>,
+            std::conditional_t<IsDecimalNumber<T>, ColumnDecimal<typename Data::ResultType>,
+                               ColumnFloat64>>;
 
     /// ctor for native types
     AggregateFunctionAvg(const DataTypes& argument_types_)
@@ -133,12 +140,13 @@ public:
         }
     }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
 #ifdef __clang__
 #pragma clang fp reassociate(on)
 #endif
-        const auto& column = assert_cast<const ColVecType&>(*columns[0]);
+        const auto& column =
+                assert_cast<const ColVecType&, TypeCheckOnRelease::DISABLE>(*columns[0]);
         if constexpr (IsDecimalNumber<T>) {
             this->data(place).sum += column.get_data()[row_num].value;
         } else {
@@ -176,7 +184,7 @@ public:
         column.get_data().push_back(this->data(place).template result<ResultType>());
     }
 
-    void deserialize_from_column(AggregateDataPtr places, const IColumn& column, Arena* arena,
+    void deserialize_from_column(AggregateDataPtr places, const IColumn& column, Arena*,
                                  size_t num_rows) const override {
         auto& col = assert_cast<const ColumnFixedLengthObject&>(column);
         DCHECK(col.size() >= num_rows) << "source column's size should greater than num_rows";
@@ -197,7 +205,7 @@ public:
     }
 
     void streaming_agg_serialize_to_column(const IColumn** columns, MutableColumnPtr& dst,
-                                           const size_t num_rows, Arena* arena) const override {
+                                           const size_t num_rows, Arena*) const override {
         auto* src_data = assert_cast<const ColVecType&>(*columns[0]).get_data().data();
         auto& dst_col = assert_cast<ColumnFixedLengthObject&>(*dst);
         dst_col.set_item_size(sizeof(Data));
@@ -205,13 +213,13 @@ public:
         auto* data = dst_col.get_data().data();
         for (size_t i = 0; i != num_rows; ++i) {
             auto& state = *reinterpret_cast<Data*>(&data[sizeof(Data) * i]);
-            state.sum = src_data[i];
+            state.sum = typename Data::ResultType(src_data[i]);
             state.count = 1;
         }
     }
 
     void deserialize_and_merge_from_column(AggregateDataPtr __restrict place, const IColumn& column,
-                                           Arena* arena) const override {
+                                           Arena*) const override {
         auto& col = assert_cast<const ColumnFixedLengthObject&>(column);
         const size_t num_rows = column.size();
         DCHECK(col.size() >= num_rows) << "source column's size should greater than num_rows";
@@ -225,7 +233,7 @@ public:
 
     void deserialize_and_merge_from_column_range(AggregateDataPtr __restrict place,
                                                  const IColumn& column, size_t begin, size_t end,
-                                                 Arena* arena) const override {
+                                                 Arena*) const override {
         DCHECK(end <= column.size() && begin <= end)
                 << ", begin:" << begin << ", end:" << end << ", column.size():" << column.size();
         auto& col = assert_cast<const ColumnFixedLengthObject&>(column);
@@ -237,19 +245,19 @@ public:
     }
 
     void deserialize_and_merge_vec(const AggregateDataPtr* places, size_t offset,
-                                   AggregateDataPtr rhs, const ColumnString* column, Arena* arena,
+                                   AggregateDataPtr rhs, const IColumn* column, Arena*,
                                    const size_t num_rows) const override {
-        this->deserialize_from_column(rhs, *column, arena, num_rows);
+        this->deserialize_from_column(rhs, *column, nullptr, num_rows);
         DEFER({ this->destroy_vec(rhs, num_rows); });
-        this->merge_vec(places, offset, rhs, arena, num_rows);
+        this->merge_vec(places, offset, rhs, nullptr, num_rows);
     }
 
     void deserialize_and_merge_vec_selected(const AggregateDataPtr* places, size_t offset,
-                                            AggregateDataPtr rhs, const ColumnString* column,
-                                            Arena* arena, const size_t num_rows) const override {
-        this->deserialize_from_column(rhs, *column, arena, num_rows);
+                                            AggregateDataPtr rhs, const IColumn* column, Arena*,
+                                            const size_t num_rows) const override {
+        this->deserialize_from_column(rhs, *column, nullptr, num_rows);
         DEFER({ this->destroy_vec(rhs, num_rows); });
-        this->merge_vec_selected(places, offset, rhs, arena, num_rows);
+        this->merge_vec_selected(places, offset, rhs, nullptr, num_rows);
     }
 
     void serialize_without_key_to_column(ConstAggregateDataPtr __restrict place,

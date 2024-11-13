@@ -105,10 +105,10 @@ TEST(function_arrays_overlap_test, arrays_overlap) {
         static_cast<void>(check_function<DataTypeUInt8, true>(func_name, input_types, data_set));
     }
 
-    // arrays_overlap(Array<Decimal128>, Array<Decimal128>)
+    // arrays_overlap(Array<Decimal128V2>, Array<Decimal128V2>)
     {
-        InputTypeSet input_types = {TypeIndex::Array, TypeIndex::Decimal128, TypeIndex::Array,
-                                    TypeIndex::Decimal128};
+        InputTypeSet input_types = {TypeIndex::Array, TypeIndex::Decimal128V2, TypeIndex::Array,
+                                    TypeIndex::Decimal128V2};
 
         Array vec1 = {ut_type::DECIMALFIELD(17014116.67), ut_type::DECIMALFIELD(-17014116.67),
                       ut_type::DECIMALFIELD(0.0)};
@@ -124,9 +124,9 @@ TEST(function_arrays_overlap_test, arrays_overlap) {
         InputTypeSet input_types = {TypeIndex::Array, TypeIndex::String, TypeIndex::Array,
                                     TypeIndex::String};
 
-        Array vec1 = {Field("abc", 3), Field("", 0), Field("def", 3)};
-        Array vec2 = {Field("abc", 3)};
-        Array vec3 = {Field("", 0)};
+        Array vec1 = {Field(String("abc", 3)), Field(String("", 0)), Field(String("def", 3))};
+        Array vec2 = {Field(String("abc", 3))};
+        Array vec3 = {Field(String("", 0))};
         DataSet data_set = {{{vec1, vec2}, UInt8(1)},
                             {{vec1, vec3}, UInt8(1)},
                             {{Null(), vec1}, Null()},

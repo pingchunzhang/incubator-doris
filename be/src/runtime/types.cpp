@@ -46,11 +46,17 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx)
             DCHECK(scalar_type.__isset.len);
             len = scalar_type.len;
         } else if (type == TYPE_DECIMALV2 || type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 ||
-                   type == TYPE_DECIMAL128I || type == TYPE_DATETIMEV2 || type == TYPE_TIMEV2) {
+                   type == TYPE_DECIMAL128I || type == TYPE_DECIMAL256 || type == TYPE_DATETIMEV2) {
             DCHECK(scalar_type.__isset.precision);
             DCHECK(scalar_type.__isset.scale);
             precision = scalar_type.precision;
             scale = scalar_type.scale;
+        } else if (type == TYPE_TIMEV2) {
+            if (scalar_type.__isset.scale) {
+                scale = scalar_type.scale;
+            } else {
+                scale = 0;
+            }
         } else if (type == TYPE_STRING) {
             if (scalar_type.__isset.len) {
                 len = scalar_type.len;
@@ -65,7 +71,7 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx)
         DCHECK_LT(*idx, types.size() - 1);
         type = TYPE_ARRAY;
         contains_nulls.reserve(1);
-        // here should compatible with fe 1.2, because use contains_null in contains_nulls
+        // here should compatible with fe 1.2, because use contain_null in contains_nulls
         if (node.__isset.contains_nulls) {
             DCHECK_EQ(node.contains_nulls.size(), 1);
             contains_nulls.push_back(node.contains_nulls[0]);
@@ -93,7 +99,7 @@ TypeDescriptor::TypeDescriptor(const std::vector<TTypeNode>& types, int* idx)
         break;
     }
     case TTypeNodeType::MAP: {
-        //TODO(xy): handle contains_null[0] for key and [1] for value
+        //TODO(xy): handle contain_null[0] for key and [1] for value
         DCHECK(!node.__isset.scalar_type);
         DCHECK_LT(*idx, types.size() - 2);
         DCHECK_EQ(node.contains_nulls.size(), 2);
@@ -151,7 +157,7 @@ void TypeDescriptor::to_thrift(TTypeDesc* thrift_type) const {
             // DCHECK_NE(len, -1);
             scalar_type.__set_len(len);
         } else if (type == TYPE_DECIMALV2 || type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 ||
-                   type == TYPE_DECIMAL128I || type == TYPE_DATETIMEV2) {
+                   type == TYPE_DECIMAL128I || type == TYPE_DECIMAL256 || type == TYPE_DATETIMEV2) {
             DCHECK_NE(precision, -1);
             DCHECK_NE(scale, -1);
             scalar_type.__set_precision(precision);
@@ -168,7 +174,7 @@ void TypeDescriptor::to_protobuf(PTypeDesc* ptype) const {
     if (type == TYPE_CHAR || type == TYPE_VARCHAR || type == TYPE_HLL || type == TYPE_STRING) {
         scalar_type->set_len(len);
     } else if (type == TYPE_DECIMALV2 || type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 ||
-               type == TYPE_DECIMAL128I || type == TYPE_DATETIMEV2) {
+               type == TYPE_DECIMAL128I || type == TYPE_DECIMAL256 || type == TYPE_DATETIMEV2) {
         DCHECK_NE(precision, -1);
         DCHECK_NE(scale, -1);
         scalar_type->set_precision(precision);
@@ -218,7 +224,7 @@ TypeDescriptor::TypeDescriptor(const google::protobuf::RepeatedPtrField<PTypeNod
             DCHECK(scalar_type.has_len());
             len = scalar_type.len();
         } else if (type == TYPE_DECIMALV2 || type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 ||
-                   type == TYPE_DECIMAL128I || type == TYPE_DATETIMEV2) {
+                   type == TYPE_DECIMAL128I || type == TYPE_DECIMAL256 || type == TYPE_DATETIMEV2) {
             DCHECK(scalar_type.has_precision());
             DCHECK(scalar_type.has_scale());
             precision = scalar_type.precision();
@@ -306,6 +312,9 @@ std::string TypeDescriptor::debug_string() const {
         return ss.str();
     case TYPE_DECIMAL128I:
         ss << "DECIMAL128(" << precision << ", " << scale << ")";
+        return ss.str();
+    case TYPE_DECIMAL256:
+        ss << "DECIMAL256(" << precision << ", " << scale << ")";
         return ss.str();
     case TYPE_ARRAY: {
         ss << "ARRAY<" << children[0].debug_string() << ">";

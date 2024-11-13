@@ -17,7 +17,10 @@
 
 #include "olap/memtable_memory_limiter.h"
 
+#include <bvar/bvar.h>
+
 #include "common/config.h"
+#include "olap/memtable.h"
 #include "olap/memtable_writer.h"
 #include "util/doris_metrics.h"
 #include "util/mem_info.h"
@@ -27,6 +30,15 @@ namespace doris {
 DEFINE_GAUGE_METRIC_PROTOTYPE_5ARG(memtable_memory_limiter_mem_consumption, MetricUnit::BYTES, "",
                                    memtable_memory_limiter_mem_consumption,
                                    Labels({{"type", "load"}}));
+
+bvar::LatencyRecorder g_memtable_memory_limit_latency_ms("mm_limiter_limit_time_ms");
+bvar::Adder<int> g_memtable_memory_limit_waiting_threads("mm_limiter_waiting_threads");
+bvar::Status<int64_t> g_memtable_active_memory("mm_limiter_mem_active", 0);
+bvar::Status<int64_t> g_memtable_write_memory("mm_limiter_mem_write", 0);
+bvar::Status<int64_t> g_memtable_flush_memory("mm_limiter_mem_flush", 0);
+bvar::Status<int64_t> g_memtable_load_memory("mm_limiter_mem_load", 0);
+bvar::Status<int64_t> g_load_hard_mem_limit("mm_limiter_limit_hard", 0);
+bvar::Status<int64_t> g_load_soft_mem_limit("mm_limiter_limit_soft", 0);
 
 // Calculate the total memory limit of all load tasks on this BE
 static int64_t calc_process_max_load_memory(int64_t process_mem_limit) {
@@ -47,10 +59,14 @@ MemTableMemoryLimiter::~MemTableMemoryLimiter() {
 Status MemTableMemoryLimiter::init(int64_t process_mem_limit) {
     _load_hard_mem_limit = calc_process_max_load_memory(process_mem_limit);
     _load_soft_mem_limit = _load_hard_mem_limit * config::load_process_soft_mem_limit_percent / 100;
-    _mem_tracker = std::make_unique<MemTrackerLimiter>(MemTrackerLimiter::Type::LOAD,
-                                                       "MemTableMemoryLimiter");
+    _load_safe_mem_permit =
+            _load_hard_mem_limit * config::load_process_safe_mem_permit_percent / 100;
+    g_load_hard_mem_limit.set_value(_load_hard_mem_limit);
+    g_load_soft_mem_limit.set_value(_load_soft_mem_limit);
+    _mem_tracker = std::make_unique<MemTracker>("AllMemTableMemory");
     REGISTER_HOOK_METRIC(memtable_memory_limiter_mem_consumption,
                          [this]() { return _mem_tracker->consumption(); });
+    _log_timer.start();
     return Status::OK();
 }
 
@@ -59,174 +75,192 @@ void MemTableMemoryLimiter::register_writer(std::weak_ptr<MemTableWriter> writer
     _writers.push_back(writer);
 }
 
+int64_t MemTableMemoryLimiter::_sys_avail_mem_less_than_warning_water_mark() {
+    // reserve a small amount of memory so we do not trigger MinorGC
+    return doris::MemInfo::sys_mem_available_warning_water_mark() -
+           doris::GlobalMemoryArbitrator::sys_mem_available() +
+           config::memtable_limiter_reserved_memory_bytes;
+}
+
+int64_t MemTableMemoryLimiter::_process_used_mem_more_than_soft_mem_limit() {
+    // reserve a small amount of memory so we do not trigger MinorGC
+    return GlobalMemoryArbitrator::process_memory_usage() - MemInfo::soft_mem_limit() +
+           config::memtable_limiter_reserved_memory_bytes;
+}
+
+bool MemTableMemoryLimiter::_soft_limit_reached() {
+    return _mem_tracker->consumption() > _load_soft_mem_limit || _hard_limit_reached();
+}
+
+bool MemTableMemoryLimiter::_hard_limit_reached() {
+    return _mem_tracker->consumption() > _load_hard_mem_limit ||
+           _sys_avail_mem_less_than_warning_water_mark() > 0 ||
+           _process_used_mem_more_than_soft_mem_limit() > 0;
+}
+
+bool MemTableMemoryLimiter::_load_usage_low() {
+    return _mem_tracker->consumption() <= _load_safe_mem_permit;
+}
+
+int64_t MemTableMemoryLimiter::_need_flush() {
+    int64_t limit1 = _mem_tracker->consumption() - _load_soft_mem_limit;
+    int64_t limit2 = _sys_avail_mem_less_than_warning_water_mark();
+    int64_t limit3 = _process_used_mem_more_than_soft_mem_limit();
+    int64_t need_flush = std::max(limit1, std::max(limit2, limit3));
+    return need_flush - _queue_mem_usage;
+}
+
 void MemTableMemoryLimiter::handle_memtable_flush() {
     // Check the soft limit.
     DCHECK(_load_soft_mem_limit > 0);
-    // Record current memory status.
-    int64_t process_soft_mem_limit = MemInfo::soft_mem_limit();
-    int64_t proc_mem_no_allocator_cache = MemInfo::proc_mem_no_allocator_cache();
-#ifndef BE_TEST
-    // If process memory is almost full but data load don't consume more than 5% (50% * 10%) of
-    // total memory, we don't need to flush memtable.
-    bool reduce_on_process_soft_mem_limit =
-            proc_mem_no_allocator_cache >= process_soft_mem_limit &&
-            _mem_tracker->consumption() >= _load_hard_mem_limit / 10;
-    if (_mem_tracker->consumption() < _load_soft_mem_limit && !reduce_on_process_soft_mem_limit) {
+    if (!_soft_limit_reached() || _load_usage_low()) {
         return;
     }
-#endif
-    // Indicate whether current thread is reducing mem on hard limit.
-    bool reducing_mem_on_hard_limit = false;
-    Status st;
-    std::vector<WriterMemItem> writers_to_reduce_mem;
-    {
-        MonotonicStopWatch timer;
-        timer.start();
-        std::unique_lock<std::mutex> l(_lock);
-        while (_should_wait_flush) {
-            _wait_flush_cond.wait(l);
+    MonotonicStopWatch timer;
+    timer.start();
+    std::unique_lock<std::mutex> l(_lock);
+    g_memtable_memory_limit_waiting_threads << 1;
+    bool first = true;
+    do {
+        if (!first) {
+            auto st = _hard_limit_end_cond.wait_for(l, std::chrono::milliseconds(1000));
+            if (st == std::cv_status::timeout) {
+                LOG(INFO) << "timeout when waiting for memory hard limit end, try again";
+            }
         }
-        LOG(INFO) << "Reached the one tenth of load hard limit " << _load_hard_mem_limit / 10
-                  << "and process remaining allocator cache " << proc_mem_no_allocator_cache
-                  << "reached process soft memory limit " << process_soft_mem_limit
-                  << ", waited for flush, time_ns:" << timer.elapsed_time();
-#ifndef BE_TEST
-        bool hard_limit_reached = _mem_tracker->consumption() >= _load_hard_mem_limit ||
-                                  proc_mem_no_allocator_cache >= process_soft_mem_limit;
-        // Some other thread is flushing data, and not reached hard limit now,
-        // we don't need to handle mem limit in current thread.
-        if (_soft_reduce_mem_in_progress && !hard_limit_reached) {
-            return;
+        first = false;
+        int64_t need_flush = _need_flush();
+        if (need_flush > 0) {
+            auto limit = _hard_limit_reached() ? Limit::HARD : Limit::SOFT;
+            LOG(INFO) << "reached memtable memory " << (limit == Limit::HARD ? "hard" : "soft")
+                      << ", " << GlobalMemoryArbitrator::process_memory_used_details_str()
+                      << ", load mem: " << PrettyPrinter::print_bytes(_mem_tracker->consumption())
+                      << ", memtable writers num: " << _writers.size()
+                      << ", active: " << PrettyPrinter::print_bytes(_active_mem_usage)
+                      << ", queue: " << PrettyPrinter::print_bytes(_queue_mem_usage)
+                      << ", flush: " << PrettyPrinter::print_bytes(_flush_mem_usage);
+            _flush_active_memtables(need_flush);
         }
-#endif
+    } while (_hard_limit_reached());
+    g_memtable_memory_limit_waiting_threads << -1;
+    timer.stop();
+    int64_t time_ms = timer.elapsed_time() / 1000 / 1000;
+    g_memtable_memory_limit_latency_ms << time_ms;
+    LOG(INFO) << "waited " << time_ms << " ms for memtable memory limit";
+}
 
-        auto cmp = [](WriterMemItem& lhs, WriterMemItem& rhs) {
-            return lhs.mem_size < rhs.mem_size;
-        };
-        std::priority_queue<WriterMemItem, std::vector<WriterMemItem>, decltype(cmp)> mem_heap(cmp);
-
-        for (auto it = _writers.begin(); it != _writers.end();) {
-            if (auto writer = it->lock()) {
-                int64_t active_memtable_mem = writer->active_memtable_mem_consumption();
-                mem_heap.emplace(writer, active_memtable_mem);
-                ++it;
-            } else {
-                *it = std::move(_writers.back());
-                _writers.pop_back();
-            }
-        }
-        int64_t mem_to_flushed = _mem_tracker->consumption() / 10;
-        int64_t mem_consumption_in_picked_writer = 0;
-        while (!mem_heap.empty()) {
-            WriterMemItem mem_item = mem_heap.top();
-            mem_heap.pop();
-            auto writer = mem_item.writer.lock();
-            if (!writer) {
-                continue;
-            }
-            int64_t mem_size = mem_item.mem_size;
-            writers_to_reduce_mem.emplace_back(writer, mem_size);
-            st = writer->flush_async();
-            if (!st.ok()) {
-                auto err_msg = fmt::format(
-                        "tablet writer failed to reduce mem consumption by flushing memtable, "
-                        "tablet_id={}, err={}",
-                        writer->tablet_id(), st.to_string());
-                LOG(WARNING) << err_msg;
-                static_cast<void>(writer->cancel_with_status(st));
-            }
-            mem_consumption_in_picked_writer += mem_size;
-            if (mem_consumption_in_picked_writer > mem_to_flushed) {
-                break;
-            }
-        }
-        if (writers_to_reduce_mem.empty()) {
-            // should not happen, add log to observe
-            LOG(WARNING) << "failed to find suitable writers to reduce memory"
-                         << " when total load mem limit exceed";
-            return;
-        }
-
-        std::ostringstream oss;
-        oss << "reducing memory of " << writers_to_reduce_mem.size()
-            << " memtable writers (total mem: "
-            << PrettyPrinter::print_bytes(mem_consumption_in_picked_writer)
-            << ", max mem: " << PrettyPrinter::print_bytes(writers_to_reduce_mem.front().mem_size)
-            << ", min mem:" << PrettyPrinter::print_bytes(writers_to_reduce_mem.back().mem_size)
-            << "), ";
-        if (proc_mem_no_allocator_cache < process_soft_mem_limit) {
-            oss << "because total load mem consumption "
-                << PrettyPrinter::print_bytes(_mem_tracker->consumption()) << " has exceeded";
-            if (_mem_tracker->consumption() > _load_hard_mem_limit) {
-                _should_wait_flush = true;
-                reducing_mem_on_hard_limit = true;
-                oss << " hard limit: " << PrettyPrinter::print_bytes(_load_hard_mem_limit);
-            } else {
-                _soft_reduce_mem_in_progress = true;
-                oss << " soft limit: " << PrettyPrinter::print_bytes(_load_soft_mem_limit);
-            }
-        } else {
-            _should_wait_flush = true;
-            reducing_mem_on_hard_limit = true;
-            oss << "because proc_mem_no_allocator_cache consumption "
-                << PrettyPrinter::print_bytes(proc_mem_no_allocator_cache)
-                << ", has exceeded process soft limit "
-                << PrettyPrinter::print_bytes(process_soft_mem_limit)
-                << ", total load mem consumption: "
-                << PrettyPrinter::print_bytes(_mem_tracker->consumption())
-                << ", vm_rss: " << PerfCounters::get_vm_rss_str();
-        }
-        LOG(INFO) << oss.str();
+void MemTableMemoryLimiter::_flush_active_memtables(int64_t need_flush) {
+    if (need_flush <= 0) {
+        return;
     }
 
-    // wait all writers flush without lock
-    for (auto item : writers_to_reduce_mem) {
-        VLOG_NOTICE << "reducing memory, wait flush mem_size: "
-                    << PrettyPrinter::print_bytes(item.mem_size);
-        auto writer = item.writer.lock();
-        if (!writer) {
+    _refresh_mem_tracker();
+    if (_active_writers.size() == 0) {
+        return;
+    }
+
+    using WriterMem = std::pair<std::weak_ptr<MemTableWriter>, int64_t>;
+    auto cmp = [](WriterMem left, WriterMem right) { return left.second < right.second; };
+    std::priority_queue<WriterMem, std::vector<WriterMem>, decltype(cmp)> heap(cmp);
+
+    for (auto writer : _active_writers) {
+        auto w = writer.lock();
+        if (w == nullptr) {
             continue;
         }
-        st = writer->wait_flush();
+        heap.emplace(w, w->active_memtable_mem_consumption());
+    }
+
+    int64_t mem_flushed = 0;
+    int64_t num_flushed = 0;
+
+    while (mem_flushed < need_flush && !heap.empty()) {
+        auto [writer, sort_mem] = heap.top();
+        heap.pop();
+        auto w = writer.lock();
+        if (w == nullptr) {
+            continue;
+        }
+        int64_t mem = w->active_memtable_mem_consumption();
+        if (mem < sort_mem * 0.9) {
+            // if the memtable writer just got flushed, don't flush it again
+            continue;
+        }
+        Status st = w->flush_async();
         if (!st.ok()) {
             auto err_msg = fmt::format(
                     "tablet writer failed to reduce mem consumption by flushing memtable, "
                     "tablet_id={}, err={}",
-                    writer->tablet_id(), st.to_string());
+                    w->tablet_id(), st.to_string());
             LOG(WARNING) << err_msg;
-            static_cast<void>(writer->cancel_with_status(st));
+            static_cast<void>(w->cancel_with_status(st));
         }
+        mem_flushed += mem;
+        num_flushed += (mem > 0);
     }
-
-    {
-        std::lock_guard<std::mutex> l(_lock);
-        // If a thread have finished the memtable flush for soft limit, and now
-        // the hard limit is already reached, it should not update these variables.
-        if (reducing_mem_on_hard_limit && _should_wait_flush) {
-            _should_wait_flush = false;
-            _wait_flush_cond.notify_all();
-        }
-        if (_soft_reduce_mem_in_progress) {
-            _soft_reduce_mem_in_progress = false;
-        }
-        // refresh mem tacker to avoid duplicate reduce
-        _refresh_mem_tracker_without_lock();
-    }
+    LOG(INFO) << "flushed " << num_flushed << " out of " << _active_writers.size()
+              << " active writers, flushed size: " << PrettyPrinter::print_bytes(mem_flushed);
 }
 
-void MemTableMemoryLimiter::_refresh_mem_tracker_without_lock() {
-    _mem_usage = 0;
+void MemTableMemoryLimiter::refresh_mem_tracker() {
+    std::lock_guard<std::mutex> l(_lock);
+    _refresh_mem_tracker();
+    std::stringstream ss;
+    Limit limit = Limit::NONE;
+    if (_soft_limit_reached()) {
+        limit = _hard_limit_reached() ? Limit::HARD : Limit::SOFT;
+        ss << "reached " << (limit == Limit::HARD ? "hard" : "soft") << " limit";
+    } else if (_last_limit == Limit::NONE) {
+        return;
+    } else {
+        ss << "ended " << (_last_limit == Limit::HARD ? "hard" : "soft") << " limit";
+    }
+
+    if (_last_limit == limit && _log_timer.elapsed_time() < LOG_INTERVAL) {
+        return;
+    }
+
+    _last_limit = limit;
+    _log_timer.reset();
+    LOG(INFO) << ss.str() << ", " << GlobalMemoryArbitrator::process_memory_used_details_str()
+              << ", load mem: " << PrettyPrinter::print_bytes(_mem_tracker->consumption())
+              << ", memtable writers num: " << _writers.size()
+              << ", active: " << PrettyPrinter::print_bytes(_active_mem_usage)
+              << ", queue: " << PrettyPrinter::print_bytes(_queue_mem_usage)
+              << ", flush: " << PrettyPrinter::print_bytes(_flush_mem_usage);
+}
+
+void MemTableMemoryLimiter::_refresh_mem_tracker() {
+    _flush_mem_usage = 0;
+    _queue_mem_usage = 0;
+    _active_mem_usage = 0;
+    _active_writers.clear();
     for (auto it = _writers.begin(); it != _writers.end();) {
         if (auto writer = it->lock()) {
-            _mem_usage += writer->mem_consumption(MemType::ALL);
+            // The memtable is currently used by writer to insert blocks.
+            auto active_usage = writer->active_memtable_mem_consumption();
+            _active_mem_usage += active_usage;
+            if (active_usage > 0) {
+                _active_writers.push_back(writer);
+            }
+            _flush_mem_usage += writer->mem_consumption(MemType::FLUSH);
+            _queue_mem_usage += writer->mem_consumption(MemType::WRITE_FINISHED);
             ++it;
         } else {
             *it = std::move(_writers.back());
             _writers.pop_back();
         }
     }
+    _mem_usage = _active_mem_usage + _queue_mem_usage + _flush_mem_usage;
+    g_memtable_active_memory.set_value(_active_mem_usage);
+    g_memtable_write_memory.set_value(_queue_mem_usage);
+    g_memtable_flush_memory.set_value(_flush_mem_usage);
+    g_memtable_load_memory.set_value(_mem_usage);
     VLOG_DEBUG << "refreshed mem_tracker, num writers: " << _writers.size();
-    THREAD_MEM_TRACKER_TRANSFER_TO(_mem_usage - _mem_tracker->consumption(), _mem_tracker.get());
+    _mem_tracker->set_consumption(_mem_usage);
+    if (!_hard_limit_reached()) {
+        _hard_limit_end_cond.notify_all();
+    }
 }
 
 } // namespace doris

@@ -32,6 +32,7 @@ import org.apache.doris.common.Pair;
 import org.apache.doris.common.util.FileFormatConstants;
 import org.apache.doris.common.util.SqlParserUtils;
 import org.apache.doris.common.util.Util;
+import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.load.loadv2.LoadTask;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
@@ -39,6 +40,7 @@ import org.apache.doris.task.LoadTaskInfo;
 import org.apache.doris.thrift.TFileCompressType;
 import org.apache.doris.thrift.TFileFormatType;
 import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TUniqueKeyUpdateMode;
 
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
@@ -46,7 +48,6 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.collect.Sets;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -155,12 +156,16 @@ public class DataDescription implements InsertStmt.DataDesc {
     private boolean trimDoubleQuotes = false;
     private boolean isMysqlLoad = false;
     private int skipLines = 0;
+    // use for copy into
+    private boolean ignoreCsvRedundantCol = false;
 
     private boolean isAnalyzed = false;
 
     private byte enclose = 0;
 
     private byte escape = 0;
+
+    TUniqueKeyUpdateMode uniquekeyUpdateMode = TUniqueKeyUpdateMode.UPSERT;
 
     public DataDescription(String tableName,
                            PartitionNames partitionNames,
@@ -330,6 +335,7 @@ public class DataDescription implements InsertStmt.DataDesc {
         this.properties = Maps.newHashMap();
         this.trimDoubleQuotes = taskInfo.getTrimDoubleQuotes();
         this.skipLines = taskInfo.getSkipLines();
+        this.uniquekeyUpdateMode = taskInfo.getUniqueKeyUpdateMode();
         columnsNameToLowerCase(fileFieldNames);
     }
 
@@ -357,6 +363,9 @@ public class DataDescription implements InsertStmt.DataDesc {
                         break;
                     case FORMAT_WAL:
                         this.fileFormat = "wal";
+                        break;
+                    case FORMAT_ARROW:
+                        this.fileFormat = "arrow";
                         break;
                     default:
                         this.fileFormat = "unknown";
@@ -594,6 +603,10 @@ public class DataDescription implements InsertStmt.DataDesc {
         return fileFormat;
     }
 
+    public void setCompressType(TFileCompressType compressType) {
+        this.compressType = compressType;
+    }
+
     public TFileCompressType getCompressType() {
         return compressType;
     }
@@ -634,10 +647,6 @@ public class DataDescription implements InsertStmt.DataDesc {
 
     public Separator getLineDelimiterObj() {
         return lineDelimiter;
-    }
-
-    public void setLineDelimiter(Separator lineDelimiter) {
-        this.lineDelimiter = lineDelimiter;
     }
 
     public byte getEnclose() {
@@ -716,14 +725,6 @@ public class DataDescription implements InsertStmt.DataDesc {
         this.jsonRoot = jsonRoot;
     }
 
-    @Deprecated
-    public void addColumnMapping(String functionName, Pair<String, List<String>> pair) {
-        if (Strings.isNullOrEmpty(functionName) || pair == null) {
-            return;
-        }
-        columnToHadoopFunction.put(functionName, pair);
-    }
-
     public Map<String, Pair<String, List<String>>> getColumnToHadoopFunction() {
         return columnToHadoopFunction;
     }
@@ -766,6 +767,14 @@ public class DataDescription implements InsertStmt.DataDesc {
 
     public int getSkipLines() {
         return skipLines;
+    }
+
+    public boolean getIgnoreCsvRedundantCol() {
+        return ignoreCsvRedundantCol;
+    }
+
+    public void setIgnoreCsvRedundantCol(boolean ignoreCsvRedundantCol) {
+        this.ignoreCsvRedundantCol = ignoreCsvRedundantCol;
     }
 
     /*
@@ -936,6 +945,9 @@ public class DataDescription implements InsertStmt.DataDesc {
         }
         // check olapTable schema and sequenceCol
         if (olapTable.hasSequenceCol() && !hasSequenceCol()) {
+            if (uniquekeyUpdateMode == TUniqueKeyUpdateMode.UPDATE_FLEXIBLE_COLUMNS) {
+                return;
+            }
             throw new AnalysisException("Table " + olapTable.getName()
                     + " has sequence column, need to specify the sequence column");
         }
@@ -1026,8 +1038,9 @@ public class DataDescription implements InsertStmt.DataDesc {
         }
 
         // check auth
-        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), fullDbName, tableName,
-                PrivPredicate.LOAD)) {
+        if (!Env.getCurrentEnv().getAccessManager()
+                .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, fullDbName, tableName,
+                        PrivPredicate.LOAD)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "LOAD",
                     ConnectContext.get().getQualifiedUser(),
                     ConnectContext.get().getRemoteIP(), fullDbName + ": " + tableName);
@@ -1035,8 +1048,9 @@ public class DataDescription implements InsertStmt.DataDesc {
 
         // check hive table auth
         if (isLoadFromTable()) {
-            if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), fullDbName, srcTableName,
-                    PrivPredicate.SELECT)) {
+            if (!Env.getCurrentEnv().getAccessManager()
+                    .checkTblPriv(ConnectContext.get(), InternalCatalog.INTERNAL_CATALOG_NAME, fullDbName, srcTableName,
+                            PrivPredicate.SELECT)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "SELECT",
                         ConnectContext.get().getQualifiedUser(),
                         ConnectContext.get().getRemoteIP(), fullDbName + ": " + srcTableName);
@@ -1061,7 +1075,7 @@ public class DataDescription implements InsertStmt.DataDesc {
             if (Strings.isNullOrEmpty(dbName)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
             }
-            this.dbName = ClusterNamespace.getFullName(analyzer.getClusterName(), dbName);
+            this.dbName = dbName;
             return this.dbName;
         } else {
             this.dbName = labelDbName;
@@ -1137,57 +1151,11 @@ public class DataDescription implements InsertStmt.DataDesc {
                     && !fileFormat.equalsIgnoreCase(FileFormatConstants.FORMAT_ORC)
                     && !fileFormat.equalsIgnoreCase(FileFormatConstants.FORMAT_JSON)
                     && !fileFormat.equalsIgnoreCase(FileFormatConstants.FORMAT_WAL)
+                    && !fileFormat.equalsIgnoreCase(FileFormatConstants.FORMAT_ARROW)
                     && !fileFormat.equalsIgnoreCase(FileFormatConstants.FORMAT_HIVE_TEXT)) {
                 throw new AnalysisException("File Format Type " + fileFormat + " is invalid.");
             }
         }
-    }
-
-    /*
-     * If user does not specify COLUMNS in load stmt, we fill it here.
-     * eg1:
-     *      both COLUMNS and SET clause is empty. after fill:
-     *      (k1,k2,k3)
-     *
-     * eg2:
-     *      COLUMNS is empty, SET is not empty
-     *      SET ( k2 = default_value("2") )
-     *      after fill:
-     *      (k1, k2, k3)
-     *      SET ( k2 = default_value("2") )
-     *
-     * eg3:
-     *      COLUMNS is empty, SET is not empty
-     *      SET (k2 = strftime("%Y-%m-%d %H:%M:%S", k2)
-     *      after fill:
-     *      (k1,k2,k3)
-     *      SET (k2 = strftime("%Y-%m-%d %H:%M:%S", k2)
-     *
-     */
-    public void fillColumnInfoIfNotSpecified(List<Column> baseSchema) {
-        if (fileFieldNames != null && !fileFieldNames.isEmpty()) {
-            return;
-        }
-
-        fileFieldNames = Lists.newArrayList();
-
-        Set<String> mappingColNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
-        for (ImportColumnDesc importColumnDesc : parsedColumnExprList) {
-            mappingColNames.add(importColumnDesc.getColumnName());
-        }
-
-        for (Column column : baseSchema) {
-            if (!mappingColNames.contains(column.getName())) {
-                parsedColumnExprList.add(new ImportColumnDesc(column.getName(), null));
-            }
-            if ("json".equals(this.fileFormat)) {
-                fileFieldNames.add(column.getName());
-            } else {
-                fileFieldNames.add(column.getName().toLowerCase());
-            }
-        }
-
-        LOG.debug("after fill column info. columns: {}, parsed column exprs: {}", fileFieldNames, parsedColumnExprList);
     }
 
     public String toSql() {
@@ -1268,4 +1236,3 @@ public class DataDescription implements InsertStmt.DataDesc {
         return toSql();
     }
 }
-

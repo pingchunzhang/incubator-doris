@@ -29,11 +29,13 @@ import org.apache.doris.analysis.SlotRef;
 import org.apache.doris.analysis.SortInfo;
 import org.apache.doris.common.NotImplementedException;
 import org.apache.doris.common.UserException;
+import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.statistics.StatisticalType;
 import org.apache.doris.statistics.StatsRecursiveDerive;
 import org.apache.doris.thrift.TExplainLevel;
 import org.apache.doris.thrift.TPlanNode;
 import org.apache.doris.thrift.TPlanNodeType;
+import org.apache.doris.thrift.TSortAlgorithm;
 import org.apache.doris.thrift.TSortInfo;
 import org.apache.doris.thrift.TSortNode;
 
@@ -61,12 +63,18 @@ public class SortNode extends PlanNode {
     List<Expr> resolvedTupleExprs;
     private final SortInfo info;
     private final boolean  useTopN;
-    private boolean useTopnOpt;
+    private boolean useTopnOpt = false;
     private boolean useTwoPhaseReadOpt;
+    private boolean hasRuntimePredicate = false;
 
-    private boolean  isDefaultLimit;
+    // If mergeByexchange is set to true, the sort information is pushed to the
+    // exchange node, and the sort node is used for the ORDER BY .
+    private boolean mergeByexchange = false;
+
+    private boolean isDefaultLimit;
     // if true, the output of this node feeds an AnalyticNode
     private boolean isAnalyticSort;
+    private boolean isColocate = false;
     private DataPartition inputPartition;
 
     private boolean isUnusedExprRemoved = false;
@@ -134,6 +142,10 @@ public class SortNode extends PlanNode {
         return info;
     }
 
+    public void setMergeByExchange() {
+        this.mergeByexchange = true;
+    }
+
     public boolean getUseTopnOpt() {
         return useTopnOpt;
     }
@@ -187,6 +199,19 @@ public class SortNode extends PlanNode {
         if (useTwoPhaseReadOpt) {
             output.append(detailPrefix + "OPT TWO PHASE\n");
         }
+
+        output.append(detailPrefix + "algorithm: ");
+        boolean isFixedLength = info.getOrderingExprs().stream().allMatch(e -> !e.getType().isStringType()
+                && !e.getType().isCollectionType());
+        if (limit > 0 && limit + offset < 1024 && (useTwoPhaseReadOpt || hasRuntimePredicate
+                || isFixedLength)) {
+            output.append("heap sort\n");
+        } else if (limit > 0 && !isFixedLength && limit + offset < 256) {
+            output.append("topn sort\n");
+        } else {
+            output.append("full sort\n");
+        }
+
         output.append(detailPrefix).append("offset: ").append(offset).append("\n");
         return output.toString();
     }
@@ -216,7 +241,9 @@ public class SortNode extends PlanNode {
                 cardinality = Math.min(cardinality, limit);
             }
         }
-        LOG.debug("stats Sort: cardinality=" + Double.toString(cardinality));
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("stats Sort: cardinality=" + Double.toString(cardinality));
+        }
     }
 
     public void init(Analyzer analyzer) throws UserException {
@@ -269,6 +296,13 @@ public class SortNode extends PlanNode {
         Expr.getIds(info.getOrderingExprs(), null, ids);
     }
 
+    @Override
+    public void initOutputSlotIds(Set<SlotId> requiredSlotIdSet, Analyzer analyzer) {
+        // need call materializeRequiredSlots again to make sure required slots is materialized by children
+        // requiredSlotIdSet parameter means nothing for sort node, just call materializeRequiredSlots is enough
+        info.materializeRequiredSlots(analyzer, outputSmap);
+    }
+
     private void removeUnusedExprs() {
         if (!isUnusedExprRemoved) {
             if (resolvedTupleExprs != null) {
@@ -302,6 +336,37 @@ public class SortNode extends PlanNode {
         msg.sort_node = sortNode;
         msg.sort_node.setOffset(offset);
         msg.sort_node.setUseTopnOpt(useTopnOpt);
+        msg.sort_node.setMergeByExchange(this.mergeByexchange);
+        msg.sort_node.setIsAnalyticSort(isAnalyticSort);
+        msg.sort_node.setIsColocate(isColocate);
+
+        ConnectContext connectContext = ConnectContext.get();
+        TSortAlgorithm algorithm;
+        if (connectContext != null && !connectContext.getSessionVariable().forceSortAlgorithm.isEmpty()) {
+            String algo = connectContext.getSessionVariable().forceSortAlgorithm;
+            if (algo.equals("heap")) {
+                algorithm = TSortAlgorithm.HEAP_SORT;
+            } else if (algo.equals("topn")) {
+                algorithm = TSortAlgorithm.TOPN_SORT;
+            } else {
+                algorithm = TSortAlgorithm.FULL_SORT;
+            }
+        } else {
+            if (limit <= 0) {
+                algorithm = TSortAlgorithm.FULL_SORT;
+            } else if (hasRuntimePredicate || useTwoPhaseReadOpt) {
+                algorithm = TSortAlgorithm.HEAP_SORT;
+            } else {
+                if (limit + offset < 50000) {
+                    algorithm = TSortAlgorithm.HEAP_SORT;
+                } else if (limit + offset < 20000000) {
+                    algorithm = TSortAlgorithm.FULL_SORT;
+                } else {
+                    algorithm = TSortAlgorithm.TOPN_SORT;
+                }
+            }
+        }
+        msg.sort_node.setAlgorithm(algorithm);
     }
 
     @Override
@@ -322,5 +387,19 @@ public class SortNode extends PlanNode {
         List<SlotId> result = Lists.newArrayList();
         Expr.getIds(materializedTupleExprs, null, result);
         return new HashSet<>(result);
+    }
+
+    // If it's analytic sort or not merged by a followed exchange node, it must output the global ordered data.
+    @Override
+    public boolean isSerialOperator() {
+        return !isAnalyticSort && !mergeByexchange;
+    }
+
+    public void setColocate(boolean colocate) {
+        isColocate = colocate;
+    }
+
+    public void setHasRuntimePredicate() {
+        this.hasRuntimePredicate = true;
     }
 }

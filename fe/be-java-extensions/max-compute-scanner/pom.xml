@@ -43,6 +43,7 @@ under the License.
         <dependency>
             <groupId>com.aliyun.odps</groupId>
             <artifactId>odps-sdk-core</artifactId>
+            <version>${maxcompute.version}</version>
             <exclusions>
                 <exclusion>
                     <groupId>org.codehaus.jackson</groupId>
@@ -53,6 +54,11 @@ under the License.
                     <artifactId>jackson-mapper-asl</artifactId>
                 </exclusion>
             </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>com.aliyun.odps</groupId>
+            <artifactId>odps-sdk-table-api</artifactId>
+            <version>${maxcompute.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.arrow</groupId>
@@ -97,6 +103,15 @@ under the License.
                         </goals>
                     </execution>
                 </executions>
+            </plugin>
+            <plugin>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <configuration>
+                    <forkCount>${fe_ut_parallel}</forkCount>
+                    <reuseForks>false</reuseForks>
+                    <useFile>false</useFile>
+                    <argLine>-javaagent:${settings.localRepository}/org/jmockit/jmockit/${jmockit.version}/jmockit-${jmockit.version}.jar</argLine>
+                </configuration>
             </plugin>
         </plugins>
     </build>

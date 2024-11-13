@@ -39,7 +39,7 @@ import java.util.Set;
 public class DistributionDescriptor {
     private final boolean isHash;
     private final boolean isAutoBucket;
-    private final int bucketNum;
+    private int bucketNum;
     private List<String> cols;
 
     public DistributionDescriptor(boolean isHash, boolean isAutoBucket, int bucketNum, List<String> cols) {
@@ -53,6 +53,10 @@ public class DistributionDescriptor {
         return isHash;
     }
 
+    public boolean isAutoBucket() {
+        return isAutoBucket;
+    }
+
     public void updateCols(String col) {
         Objects.requireNonNull(col, "col should not be null");
         if (CollectionUtils.isEmpty(cols)) {
@@ -60,10 +64,18 @@ public class DistributionDescriptor {
         }
     }
 
+    public void updateBucketNum(int bucketNum) {
+        this.bucketNum = bucketNum;
+    }
+
     /**
      * analyze distribution descriptor
      */
     public void validate(Map<String, ColumnDefinition> columnMap, KeysType keysType) {
+        if (bucketNum <= 0) {
+            throw new AnalysisException(isHash ? "Number of hash distribution should be greater than zero."
+                    : "Number of random distribution should be greater than zero.");
+        }
         if (isHash) {
             Set<String> colSet = Sets.newHashSet(cols);
             if (colSet.size() != cols.size()) {
@@ -71,9 +83,16 @@ public class DistributionDescriptor {
             }
             cols.forEach(c -> {
                 if (!columnMap.containsKey(c)) {
-                    throw new AnalysisException(String.format("column %s is not found in distribution desc", c));
+                    throw new AnalysisException(String.format("Distribution column(%s) doesn't exist", c));
                 }
             });
+            for (String columnName : cols) {
+                ColumnDefinition columnDefinition = columnMap.get(columnName);
+                if (!columnDefinition.isKey()
+                        && (keysType == KeysType.UNIQUE_KEYS || keysType == KeysType.AGG_KEYS)) {
+                    throw new AnalysisException("Distribution column[" + columnName + "] is not key column");
+                }
+            }
         } else {
             if (keysType.equals(KeysType.UNIQUE_KEYS)) {
                 throw new AnalysisException("Create unique keys table should not contain random distribution desc");
@@ -91,5 +110,9 @@ public class DistributionDescriptor {
             return new HashDistributionDesc(bucketNum, isAutoBucket, cols);
         }
         return new RandomDistributionDesc(bucketNum, isAutoBucket);
+    }
+
+    public boolean inDistributionColumns(String columnName) {
+        return cols != null && cols.contains(columnName);
     }
 }

@@ -48,6 +48,14 @@ public class AlterOperations {
         }
     }
 
+    public void checkMTMVAllow(List<AlterClause> alterClauses) throws DdlException {
+        for (AlterClause alterClause : alterClauses) {
+            if (!(alterClause.allowOpMTMV())) {
+                throw new DdlException("Not allowed to perform current operation on async materialized view");
+            }
+        }
+    }
+
     // some operations take up disk space. so we need to check the disk capacity before processing.
     // return true if we see these kind of operations.
     public boolean needCheckCapacity() {

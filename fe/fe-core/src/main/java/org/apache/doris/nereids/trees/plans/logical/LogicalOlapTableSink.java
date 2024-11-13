@@ -22,36 +22,46 @@ import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.nereids.memo.GroupExpression;
 import org.apache.doris.nereids.properties.LogicalProperties;
+import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.PropagateFuncDeps;
 import org.apache.doris.nereids.trees.plans.algebra.Sink;
+import org.apache.doris.nereids.trees.plans.commands.info.DMLCommandType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 
 /**
  * logical olap table sink for insert command
  */
-public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<CHILD_TYPE> implements Sink {
+public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalTableSink<CHILD_TYPE>
+        implements Sink, PropagateFuncDeps {
     // bound data sink
     private final Database database;
     private final OlapTable targetTable;
-    private final List<Column> cols;
     private final List<Long> partitionIds;
     private final boolean isPartialUpdate;
-    private final boolean isFromNativeInsertStmt;
+    private final DMLCommandType dmlCommandType;
+    private final List<Expression> partitionExprList;
+    private final Map<Long, Expression> syncMvWhereClauses;
+    private final List<Slot> targetTableSlots;
 
     public LogicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols, List<Long> partitionIds,
-            List<NamedExpression> outputExprs, boolean isPartialUpdate, boolean isFromNativeInsertStmt,
+            List<NamedExpression> outputExprs, boolean isPartialUpdate, DMLCommandType dmlCommandType,
             CHILD_TYPE child) {
-        this(database, targetTable, cols, partitionIds, outputExprs, isPartialUpdate, isFromNativeInsertStmt,
+        this(database, targetTable, cols, partitionIds, outputExprs, isPartialUpdate, dmlCommandType,
                 Optional.empty(), Optional.empty(), child);
     }
 
@@ -60,30 +70,48 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
      */
     public LogicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols,
             List<Long> partitionIds, List<NamedExpression> outputExprs, boolean isPartialUpdate,
-            boolean isFromNativeInsertStmt, Optional<GroupExpression> groupExpression,
+            DMLCommandType dmlCommandType, Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, CHILD_TYPE child) {
-        super(PlanType.LOGICAL_OLAP_TABLE_SINK, outputExprs, groupExpression, logicalProperties, child);
-        this.database = Objects.requireNonNull(database, "database != null in LogicalOlapTableSink");
-        this.targetTable = Objects.requireNonNull(targetTable, "targetTable != null in LogicalOlapTableSink");
-        this.cols = Utils.copyRequiredList(cols);
-        this.isPartialUpdate = isPartialUpdate;
-        this.isFromNativeInsertStmt = isFromNativeInsertStmt;
-        this.partitionIds = Utils.copyRequiredList(partitionIds);
+        this(database, targetTable, cols, partitionIds, outputExprs, isPartialUpdate,
+                dmlCommandType, new ArrayList<>(), new HashMap<>(), new ArrayList<>(),
+                groupExpression, logicalProperties, child);
     }
 
-    public Plan withChildAndUpdateOutput(Plan child) {
-        List<NamedExpression> output = child.getOutput().stream()
-                .map(NamedExpression.class::cast)
+    private LogicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols,
+            List<Long> partitionIds, List<NamedExpression> outputExprs, boolean isPartialUpdate,
+            DMLCommandType dmlCommandType, List<Expression> partitionExprList,
+            Map<Long, Expression> syncMvWhereClauses, List<Slot> targetTableSlots,
+            Optional<GroupExpression> groupExpression,
+            Optional<LogicalProperties> logicalProperties, CHILD_TYPE child) {
+        super(PlanType.LOGICAL_OLAP_TABLE_SINK, outputExprs, groupExpression, logicalProperties, cols, child);
+        this.database = Objects.requireNonNull(database, "database != null in LogicalOlapTableSink");
+        this.targetTable = Objects.requireNonNull(targetTable, "targetTable != null in LogicalOlapTableSink");
+        this.isPartialUpdate = isPartialUpdate;
+        this.dmlCommandType = dmlCommandType;
+        this.partitionIds = Utils.copyRequiredList(partitionIds);
+        this.partitionExprList = partitionExprList;
+        this.syncMvWhereClauses = syncMvWhereClauses;
+        this.targetTableSlots = targetTableSlots;
+    }
+
+    /**
+     * withChildAndUpdateOutput
+     */
+    public Plan withChildAndUpdateOutput(Plan child, List<Expression> partitionExprList,
+            Map<Long, Expression> syncMvWhereClauses, List<Slot> targetTableSlots) {
+        List<NamedExpression> output = child.getOutput().stream().map(NamedExpression.class::cast)
                 .collect(ImmutableList.toImmutableList());
-        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, output, isPartialUpdate,
-                isFromNativeInsertStmt, Optional.empty(), Optional.empty(), child);
+        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, output,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, Optional.empty(), Optional.empty(), child);
     }
 
     @Override
     public Plan withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1, "LogicalOlapTableSink only accepts one child");
-        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, isPartialUpdate,
-                isFromNativeInsertStmt, Optional.empty(), Optional.empty(), children.get(0));
+        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, Optional.empty(), Optional.empty(), children.get(0));
     }
 
     public Database getDatabase() {
@@ -94,10 +122,6 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
         return targetTable;
     }
 
-    public List<Column> getCols() {
-        return cols;
-    }
-
     public List<Long> getPartitionIds() {
         return partitionIds;
     }
@@ -106,8 +130,26 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
         return isPartialUpdate;
     }
 
-    public boolean isFromNativeInsertStmt() {
-        return isFromNativeInsertStmt;
+    public DMLCommandType getDmlCommandType() {
+        return dmlCommandType;
+    }
+
+    public List<Expression> getPartitionExprList() {
+        return partitionExprList;
+    }
+
+    public Map<Long, Expression> getSyncMvWhereClauses() {
+        return syncMvWhereClauses;
+    }
+
+    public List<Slot> getTargetTableSlots() {
+        return targetTableSlots;
+    }
+
+    public LogicalOlapTableSink<CHILD_TYPE> withOutputExprs(List<NamedExpression> outputExprs) {
+        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, Optional.empty(), Optional.empty(), child());
     }
 
     @Override
@@ -122,7 +164,7 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
             return false;
         }
         LogicalOlapTableSink<?> that = (LogicalOlapTableSink<?>) o;
-        return isPartialUpdate == that.isPartialUpdate && isFromNativeInsertStmt == that.isFromNativeInsertStmt
+        return isPartialUpdate == that.isPartialUpdate && dmlCommandType == that.dmlCommandType
                 && Objects.equals(database, that.database)
                 && Objects.equals(targetTable, that.targetTable) && Objects.equals(cols, that.cols)
                 && Objects.equals(partitionIds, that.partitionIds);
@@ -131,7 +173,7 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
     @Override
     public int hashCode() {
         return Objects.hash(super.hashCode(), database, targetTable, cols, partitionIds,
-                isPartialUpdate, isFromNativeInsertStmt);
+                isPartialUpdate, dmlCommandType);
     }
 
     @Override
@@ -143,7 +185,7 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
                 "cols", cols,
                 "partitionIds", partitionIds,
                 "isPartialUpdate", isPartialUpdate,
-                "isFromNativeInsertStmt", isFromNativeInsertStmt
+                "dmlCommandType", dmlCommandType
         );
     }
 
@@ -154,14 +196,23 @@ public class LogicalOlapTableSink<CHILD_TYPE extends Plan> extends LogicalSink<C
 
     @Override
     public Plan withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, isPartialUpdate,
-                isFromNativeInsertStmt, groupExpression, Optional.of(getLogicalProperties()), child());
+        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, groupExpression, Optional.of(getLogicalProperties()), child());
     }
 
     @Override
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
-        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, isPartialUpdate,
-                isFromNativeInsertStmt, groupExpression, logicalProperties, children.get(0));
+        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, groupExpression, logicalProperties, children.get(0));
+    }
+
+    public Plan withPartitionExprAndMvWhereClause(List<Expression> partitionExprList,
+                                                  Map<Long, Expression> syncMvWhereClauses) {
+        return new LogicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, Optional.empty(), Optional.empty(), child());
     }
 }

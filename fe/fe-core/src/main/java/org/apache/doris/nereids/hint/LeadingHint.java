@@ -17,12 +17,11 @@
 
 package org.apache.doris.nereids.hint;
 
-import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.jobs.joinorder.hypergraph.bitmap.LongBitmap;
 import org.apache.doris.nereids.trees.expressions.ExprId;
 import org.apache.doris.nereids.trees.expressions.Expression;
-import org.apache.doris.nereids.trees.plans.JoinHint;
+import org.apache.doris.nereids.trees.plans.DistributeType;
 import org.apache.doris.nereids.trees.plans.JoinType;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.RelationId;
@@ -31,12 +30,15 @@ import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
 import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.logical.LogicalRelation;
+import org.apache.doris.nereids.trees.plans.logical.LogicalSubQueryAlias;
 import org.apache.doris.nereids.util.JoinUtils;
+import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -50,8 +52,12 @@ import java.util.Stack;
  */
 public class LeadingHint extends Hint {
     private String originalString = "";
+
+    private List<String> addJoinParameters;
+    private List<String> normalizedParameters;
     private final List<String> tablelist = new ArrayList<>();
-    private final List<Integer> levellist = new ArrayList<>();
+
+    private final Map<Integer, DistributeHint> distributeHints = new HashMap<>();
 
     private final Map<RelationId, LogicalPlan> relationIdToScanMap = Maps.newLinkedHashMap();
 
@@ -61,9 +67,13 @@ public class LeadingHint extends Hint {
 
     private final List<Pair<Long, Expression>> filters = new ArrayList<>();
 
+    private final Map<Expression, JoinType> conditionJoinType = Maps.newLinkedHashMap();
+
     private final List<JoinConstraint> joinConstraintList = new ArrayList<>();
 
     private Long innerJoinBitmap = 0L;
+
+    private Long totalBitmap = 0L;
 
     public LeadingHint(String hintName) {
         super(hintName);
@@ -77,25 +87,81 @@ public class LeadingHint extends Hint {
     public LeadingHint(String hintName, List<String> parameters, String originalString) {
         super(hintName);
         this.originalString = originalString;
-        int level = 0;
-        for (String parameter : parameters) {
-            if (parameter.equals("{")) {
-                ++level;
-            } else if (parameter.equals("}")) {
-                level--;
+        addJoinParameters = insertJoinIntoParameters(parameters);
+        normalizedParameters = parseIntoReversePolishNotation(addJoinParameters);
+    }
+
+    /**
+     * insert join string into leading string
+     * @param list of sql input leading string
+     * @return list of string adding joins into tables
+     */
+    public static List<String> insertJoinIntoParameters(List<String> list) {
+        List<String> output = new ArrayList<>();
+
+        for (String item : list) {
+            if (item.equals("shuffle") || item.equals("broadcast")) {
+                output.remove(output.size() - 1);
+                output.add(item);
+                continue;
+            } else if (item.equals("{")) {
+                output.add(item);
+                continue;
+            } else if (item.equals("}")) {
+                output.remove(output.size() - 1);
+                output.add(item);
             } else {
-                tablelist.add(parameter);
-                levellist.add(level);
+                output.add(item);
+            }
+            output.add("join");
+        }
+        output.remove(output.size() - 1);
+        return output;
+    }
+
+    /**
+     * parse list string of original leading string with join string to Reverse Polish notation
+     * @param list of leading with join string
+     * @return Reverse Polish notation which can be used directly changed into logical join
+     */
+    public List<String> parseIntoReversePolishNotation(List<String> list) {
+        Stack<String> s1 = new Stack<>();
+        List<String> s2 = new ArrayList<>();
+
+        for (String item : list) {
+            if (!(item.equals("shuffle") || item.equals("broadcast") || item.equals("{")
+                    || item.equals("}") || item.equals("join"))) {
+                tablelist.add(item);
+                s2.add(item);
+            } else if (item.equals("{")) {
+                s1.push(item);
+            } else if (item.equals("}")) {
+                while (!s1.peek().equals("{")) {
+                    String pop = s1.pop();
+                    s2.add(pop);
+                }
+                s1.pop();
+            } else {
+                if (item.equals("shuffle")) {
+                    distributeHints.put(item.hashCode(), new DistributeHint(DistributeType.SHUFFLE_RIGHT));
+                } else if (item.equals("broadcast")) {
+                    distributeHints.put(item.hashCode(), new DistributeHint(DistributeType.BROADCAST_RIGHT));
+                }
+
+                while (s1.size() != 0 && !s1.peek().equals("{")) {
+                    s2.add(s1.pop());
+                }
+                s1.push(item);
             }
         }
+        while (s1.size() > 0) {
+            s2.add(s1.pop());
+        }
+        return s2;
     }
 
     public List<String> getTablelist() {
         return tablelist;
-    }
-
-    public List<Integer> getLevellist() {
-        return levellist;
     }
 
     public Map<RelationId, LogicalPlan> getRelationIdToScanMap() {
@@ -104,9 +170,25 @@ public class LeadingHint extends Hint {
 
     @Override
     public String getExplainString() {
+        if (!this.isSuccess()) {
+            return originalString;
+        }
         StringBuilder out = new StringBuilder();
-        out.append(originalString);
-        return out.toString();
+        for (String parameter : addJoinParameters) {
+            if (parameter.equals("{") || parameter.equals("}") || parameter.equals("[") || parameter.equals("]")) {
+                out.append(parameter + " ");
+            } else if (parameter.equals("shuffle") || parameter.equals("broadcast")) {
+                DistributeHint distributeHint = distributeHints.get(parameter.hashCode());
+                if (distributeHint.isSuccess()) {
+                    out.append(parameter + " ");
+                }
+            } else if (parameter.equals("join")) {
+                continue;
+            } else {
+                out.append(parameter + " ");
+            }
+        }
+        return "leading(" + out.toString() + ")";
     }
 
     /**
@@ -134,6 +216,10 @@ public class LeadingHint extends Hint {
         for (Pair<RelationId, String> pair : relationIdAndTableName) {
             if (pair.first.equals(relationIdTableNamePair.first)) {
                 pair.second = relationIdTableNamePair.second;
+                isUpdate = true;
+            }
+            if (pair.second.equals(relationIdTableNamePair.second)) {
+                pair.first = relationIdTableNamePair.first;
                 isUpdate = true;
             }
         }
@@ -173,14 +259,14 @@ public class LeadingHint extends Hint {
         return null;
     }
 
-    private boolean hasSameName() {
+    private Optional<String> hasSameName() {
         Set<String> tableSet = Sets.newHashSet();
         for (String table : tablelist) {
             if (!tableSet.add(table)) {
-                return true;
+                return Optional.of(table);
             }
         }
-        return false;
+        return Optional.empty();
     }
 
     public Map<ExprId, String> getExprIdToTableNameMap() {
@@ -189,6 +275,30 @@ public class LeadingHint extends Hint {
 
     public List<Pair<Long, Expression>> getFilters() {
         return filters;
+    }
+
+    public void putConditionJoinType(Expression filter, JoinType joinType) {
+        conditionJoinType.put(filter, joinType);
+    }
+
+    /**
+     * find out whether conditions can match original joinType
+     * @param conditions conditions needs to put on this join
+     * @param joinType join type computed by join constraint
+     * @return can conditions matched
+     */
+    public boolean isConditionJoinTypeMatched(List<Expression> conditions, JoinType joinType) {
+        for (Expression condition : conditions) {
+            JoinType originalJoinType = conditionJoinType.get(condition);
+            if (originalJoinType.equals(joinType)
+                    || originalJoinType.isOneSideOuterJoin() && joinType.isOneSideOuterJoin()
+                    || originalJoinType.isSemiJoin() && joinType.isSemiJoin()
+                    || originalJoinType.isAntiJoin() && joinType.isAntiJoin()) {
+                continue;
+            }
+            return false;
+        }
+        return true;
     }
 
     public List<JoinConstraint> getJoinConstraintList() {
@@ -201,6 +311,54 @@ public class LeadingHint extends Hint {
 
     public void setInnerJoinBitmap(Long innerJoinBitmap) {
         this.innerJoinBitmap = innerJoinBitmap;
+    }
+
+    public Long getTotalBitmap() {
+        return totalBitmap;
+    }
+
+    /**
+     * set total bitmap used in leading before we get into leading join
+     */
+    public void setTotalBitmap(Set<RelationId> inputRelationSets) {
+        Long totalBitmap = 0L;
+        Optional<String> duplicateTableName = hasSameName();
+        if (duplicateTableName.isPresent()) {
+            this.setStatus(HintStatus.SYNTAX_ERROR);
+            this.setErrorMessage("duplicated table:" + duplicateTableName.get());
+        }
+        Set<RelationId> existRelationSets = new HashSet<>();
+        for (int index = 0; index < getTablelist().size(); index++) {
+            RelationId id = findRelationIdAndTableName(getTablelist().get(index));
+            if (id == null) {
+                this.setStatus(HintStatus.SYNTAX_ERROR);
+                this.setErrorMessage("can not find table: " + getTablelist().get(index));
+                return;
+            }
+            existRelationSets.add(id);
+            totalBitmap = LongBitmap.set(totalBitmap, id.asInt());
+        }
+        if (getTablelist().size() < inputRelationSets.size()) {
+            Set<RelationId> missRelationIds = new HashSet<>();
+            missRelationIds.addAll(inputRelationSets);
+            missRelationIds.removeAll(existRelationSets);
+            String missingTablenames = getMissingTableNames(missRelationIds);
+            this.setStatus(HintStatus.SYNTAX_ERROR);
+            this.setErrorMessage("leading should have all tables in query block, missing tables: " + missingTablenames);
+        }
+        this.totalBitmap = totalBitmap;
+    }
+
+    private String getMissingTableNames(Set<RelationId> missRelationIds) {
+        String missTableNames = "";
+        for (RelationId id : missRelationIds) {
+            for (Pair<RelationId, String> pair : relationIdAndTableName) {
+                if (pair.first.equals(id)) {
+                    missTableNames += pair.second + " ";
+                }
+            }
+        }
+        return missTableNames;
     }
 
     /**
@@ -218,6 +376,22 @@ public class LeadingHint extends Hint {
         JoinConstraint matchedJoinConstraint = null;
 
         for (JoinConstraint joinConstraint : joinConstraintList) {
+            if (joinConstraint.getJoinType().isFullOuterJoin()) {
+                if (leftTableBitmap.equals(joinConstraint.getLeftHand())
+                        && rightTableBitmap.equals(joinConstraint.getRightHand())
+                        || rightTableBitmap.equals(joinConstraint.getLeftHand())
+                        && leftTableBitmap.equals(joinConstraint.getRightHand())) {
+                    if (matchedJoinConstraint != null) {
+                        return Pair.of(null, false);
+                    }
+                    matchedJoinConstraint = joinConstraint;
+                    reversed = false;
+                    break;
+                } else {
+                    continue;
+                }
+            }
+
             if (!LongBitmap.isOverlap(joinConstraint.getMinRightHand(), joinTableBitmap)) {
                 continue;
             }
@@ -332,90 +506,89 @@ public class LeadingHint extends Hint {
         return JoinType.INNER_JOIN;
     }
 
+    private DistributeHint getDistributeJoinHint(String distributeJoinType) {
+        DistributeHint distributeHint = null;
+        if (distributeJoinType.equals("join")) {
+            distributeHint = new DistributeHint(DistributeType.NONE);
+        } else if (distributeJoinType.equals("shuffle") || distributeJoinType.equals("broadcast")) {
+            distributeHint = distributeHints.get(distributeJoinType.hashCode());
+        }
+        distributeHint.setSuccessInLeading(true);
+        if (!ConnectContext.get().getStatementContext().getHints().contains(distributeHint)) {
+            ConnectContext.get().getStatementContext().addHint(distributeHint);
+        }
+        distributeHints.put(0, distributeHint);
+        return distributeHint;
+    }
+
+    private LogicalPlan makeJoinPlan(LogicalPlan leftChild, LogicalPlan rightChild, String distributeJoinType) {
+        List<Expression> conditions = getJoinConditions(
+                getFilters(), leftChild, rightChild);
+        Pair<List<Expression>, List<Expression>> pair = JoinUtils.extractExpressionForHashTable(
+                leftChild.getOutput(), rightChild.getOutput(), conditions);
+        // leading hint would set status inside if not success
+        JoinType joinType = computeJoinType(getBitmap(leftChild),
+                getBitmap(rightChild), conditions);
+        if (joinType == null) {
+            this.setStatus(HintStatus.SYNTAX_ERROR);
+            this.setErrorMessage("JoinType can not be null");
+        } else if (!isConditionJoinTypeMatched(conditions, joinType)) {
+            this.setStatus(HintStatus.UNUSED);
+            this.setErrorMessage("condition does not matched joinType");
+        }
+        if (!this.isSuccess()) {
+            return null;
+        }
+        // get joinType
+        DistributeHint distributeHint = getDistributeJoinHint(distributeJoinType);
+        LogicalJoin logicalJoin = new LogicalJoin<>(joinType, pair.first,
+                pair.second,
+                distributeHint,
+                Optional.empty(),
+                leftChild,
+                rightChild, null);
+        logicalJoin.getJoinReorderContext().setLeadingJoin(true);
+        logicalJoin.setBitmap(LongBitmap.or(getBitmap(leftChild), getBitmap(rightChild)));
+        return logicalJoin;
+    }
+
     /**
      * using leading to generate plan, it could be failed, if failed set leading status to unused or syntax error
      * @return plan
      */
     public Plan generateLeadingJoinPlan() {
-        this.setStatus(HintStatus.SUCCESS);
-        Stack<Pair<Integer, LogicalPlan>> stack = new Stack<>();
-        int index = 0;
-        LogicalPlan logicalPlan = getLogicalPlanByName(getTablelist().get(index));
-        if (logicalPlan == null) {
-            return null;
-        }
-        logicalPlan = makeFilterPlanIfExist(getFilters(), logicalPlan);
-        assert (logicalPlan != null);
-        stack.push(Pair.of(getLevellist().get(index), logicalPlan));
-        int stackTopLevel = getLevellist().get(index++);
-        while (index < getTablelist().size()) {
-            int currentLevel = getLevellist().get(index);
-            if (currentLevel == stackTopLevel) {
-                // should return error if can not found table
-                logicalPlan = getLogicalPlanByName(getTablelist().get(index++));
-                if (logicalPlan == null) {
+        Stack<LogicalPlan> stack = new Stack<>();
+        for (String item : normalizedParameters) {
+            if (item.equals("join") || item.equals("shuffle") || item.equals("broadcast")) {
+                LogicalPlan rightChild = stack.pop();
+                LogicalPlan leftChild = stack.pop();
+                LogicalPlan joinPlan = makeJoinPlan(leftChild, rightChild, item);
+                if (joinPlan == null) {
                     return null;
                 }
-                logicalPlan = makeFilterPlanIfExist(getFilters(), logicalPlan);
-                Pair<Integer, LogicalPlan> newStackTop = stack.peek();
-                while (!(stack.isEmpty() || stackTopLevel != newStackTop.first)) {
-                    // check join is legal and get join type
-                    newStackTop = stack.pop();
-                    List<Expression> conditions = getJoinConditions(
-                            getFilters(), newStackTop.second, logicalPlan);
-                    Pair<List<Expression>, List<Expression>> pair = JoinUtils.extractExpressionForHashTable(
-                            newStackTop.second.getOutput(), logicalPlan.getOutput(), conditions);
-                    JoinType joinType = computeJoinType(getBitmap(newStackTop.second),
-                            getBitmap(logicalPlan), conditions);
-                    if (!this.isSuccess()) {
-                        return null;
-                    }
-                    // get joinType
-                    LogicalJoin logicalJoin = new LogicalJoin<>(joinType, pair.first,
-                            pair.second,
-                            JoinHint.NONE,
-                            Optional.empty(),
-                            newStackTop.second,
-                            logicalPlan);
-                    logicalJoin.setBitmap(LongBitmap.or(getBitmap(newStackTop.second), getBitmap(logicalPlan)));
-                    if (stackTopLevel > 0) {
-                        stackTopLevel--;
-                    }
-                    if (!stack.isEmpty()) {
-                        newStackTop = stack.peek();
-                    }
-                    logicalPlan = logicalJoin;
-                }
-                stack.push(Pair.of(stackTopLevel, logicalPlan));
+                stack.push(joinPlan);
             } else {
-                // push
-                logicalPlan = getLogicalPlanByName(getTablelist().get(index++));
-                if (logicalPlan == null) {
-                    return null;
-                }
+                LogicalPlan logicalPlan = getLogicalPlanByName(item);
                 logicalPlan = makeFilterPlanIfExist(getFilters(), logicalPlan);
-                stack.push(Pair.of(currentLevel, logicalPlan));
-                stackTopLevel = currentLevel;
+                stack.push(logicalPlan);
             }
         }
 
-        LogicalJoin finalJoin = (LogicalJoin) stack.pop().second;
+        LogicalJoin finalJoin = (LogicalJoin) stack.pop();
         // we want all filters been remove
-        if (!getFilters().isEmpty()) {
-            List<Expression> conditions = getLastConditions(getFilters());
-            Pair<List<Expression>, List<Expression>> pair = JoinUtils.extractExpressionForHashTable(
-                    finalJoin.left().getOutput(), finalJoin.right().getOutput(), conditions);
-            finalJoin = new LogicalJoin<>(finalJoin.getJoinType(), pair.first,
-                pair.second,
-                JoinHint.NONE,
-                Optional.empty(),
-                finalJoin.left(),
-                finalJoin.right());
-        }
+        assert (filters.isEmpty());
         if (finalJoin != null) {
             this.setStatus(HintStatus.SUCCESS);
         }
         return finalJoin;
+    }
+
+    private DistributeHint getJoinHint(Integer index) {
+        if (distributeHints.get(index) == null) {
+            return new DistributeHint(DistributeType.NONE);
+        }
+        distributeHints.get(index).setSuccessInLeading(true);
+        return distributeHints.get(index);
     }
 
     private List<Expression> getJoinConditions(List<Pair<Long, Expression>> filters,
@@ -468,36 +641,10 @@ public class LeadingHint extends Hint {
             return getBitmap((LogicalPlan) root.child(0));
         } else if (root instanceof LogicalProject) {
             return getBitmap((LogicalPlan) root.child(0));
+        } else if (root instanceof LogicalSubQueryAlias) {
+            return LongBitmap.set(0L, (((LogicalSubQueryAlias) root).getRelationId().asInt()));
         } else {
             return null;
         }
-    }
-
-    /**
-     * get leading containing tables which means leading wants to combine tables into joins
-     * @return long value represent tables we included
-     */
-    public Long getLeadingTableBitmap(List<TableIf> tables) {
-        Long totalBitmap = 0L;
-        if (hasSameName()) {
-            this.setStatus(HintStatus.SYNTAX_ERROR);
-            this.setErrorMessage("duplicated table");
-            return totalBitmap;
-        }
-        if (getTablelist().size() != tables.size()) {
-            this.setStatus(HintStatus.SYNTAX_ERROR);
-            this.setErrorMessage("tables should be same as join tables");
-            return totalBitmap;
-        }
-        for (int index = 0; index < getTablelist().size(); index++) {
-            RelationId id = findRelationIdAndTableName(getTablelist().get(index));
-            if (id == null) {
-                this.setStatus(HintStatus.SYNTAX_ERROR);
-                this.setErrorMessage("can not find table: " + getTablelist().get(index));
-                return totalBitmap;
-            }
-            totalBitmap = LongBitmap.set(totalBitmap, id.asInt());
-        }
-        return totalBitmap;
     }
 }

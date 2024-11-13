@@ -89,16 +89,9 @@ public:
                             io::IOContext* io_ctx);
     ~TransactionalHiveReader() override = default;
 
-    Status init_row_filters(const TFileRangeDesc& range) override;
+    Status init_row_filters(const TFileRangeDesc& range, io::IOContext* io_ctx) override;
 
     Status get_next_block(Block* block, size_t* read_rows, bool* eof) override;
-
-    Status set_fill_columns(
-            const std::unordered_map<std::string, std::tuple<std::string, const SlotDescriptor*>>&
-                    partition_columns,
-            const std::unordered_map<std::string, VExprContextSPtr>& missing_columns) override;
-
-    bool fill_all_columns() const override;
 
     Status get_columns(std::unordered_map<std::string, TypeDescriptor>* name_to_type,
                        std::unordered_set<std::string>* missing_cols) override;
@@ -113,21 +106,21 @@ public:
 
 private:
     struct TransactionalHiveProfile {
-        RuntimeProfile::Counter* num_delete_files;
-        RuntimeProfile::Counter* num_delete_rows;
-        RuntimeProfile::Counter* delete_files_read_time;
+        RuntimeProfile::Counter* num_delete_files = nullptr;
+        RuntimeProfile::Counter* num_delete_rows = nullptr;
+        RuntimeProfile::Counter* delete_files_read_time = nullptr;
     };
 
-    RuntimeProfile* _profile;
-    RuntimeState* _state;
+    RuntimeProfile* _profile = nullptr;
+    RuntimeState* _state = nullptr;
     const TFileScanRangeParams& _params;
     const TFileRangeDesc& _range;
     TransactionalHiveProfile _transactional_orc_profile;
     AcidRowIDSet _delete_rows;
-    std::unique_ptr<IColumn::Filter> _delete_rows_filter_ptr = nullptr;
+    std::unique_ptr<IColumn::Filter> _delete_rows_filter_ptr;
     std::vector<std::string> _col_names;
 
-    io::IOContext* _io_ctx;
+    io::IOContext* _io_ctx = nullptr;
 };
 
 inline bool operator<(const TransactionalHiveReader::AcidRowID& lhs,

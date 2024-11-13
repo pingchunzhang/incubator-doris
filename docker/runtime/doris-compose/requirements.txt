@@ -17,6 +17,10 @@
 
 docker
 docker-compose
+filelock
 jsonpickle
 prettytable
 pymysql
+python-dateutil
+#pyyaml==5.4.1
+requests<=2.31.0

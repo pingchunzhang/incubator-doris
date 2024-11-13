@@ -29,10 +29,10 @@
 #include "common/factory_creator.h"
 #include "common/status.h"
 #include "olap/data_dir.h"
-#include "olap/reader.h"
 #include "olap/rowset/rowset_meta.h"
 #include "olap/rowset/rowset_reader.h"
 #include "olap/tablet.h"
+#include "olap/tablet_reader.h"
 #include "olap/tablet_schema.h"
 #include "vec/exec/scan/vscanner.h"
 
@@ -43,33 +43,31 @@ class FunctionFilter;
 class RuntimeProfile;
 class RuntimeState;
 class TPaloScanRange;
+namespace pipeline {
+class ScanLocalStateBase;
+struct FilterPredicates;
+} // namespace pipeline
 
 namespace vectorized {
 
-class NewOlapScanNode;
-struct FilterPredicates;
 class Block;
 
 class NewOlapScanner : public VScanner {
     ENABLE_FACTORY_CREATOR(NewOlapScanner);
 
 public:
-    NewOlapScanner(RuntimeState* state, NewOlapScanNode* parent, int64_t limit, bool aggregation,
-                   const TPaloScanRange& scan_range, const std::vector<OlapScanRange*>& key_ranges,
-                   RuntimeProfile* profile);
+    struct Params {
+        RuntimeState* state = nullptr;
+        RuntimeProfile* profile = nullptr;
+        std::vector<OlapScanRange*> key_ranges;
+        BaseTabletSPtr tablet;
+        int64_t version;
+        TabletReader::ReadSource read_source;
+        int64_t limit;
+        bool aggregation;
+    };
 
-    NewOlapScanner(RuntimeState* state, NewOlapScanNode* parent, int64_t limit, bool aggregation,
-                   const TPaloScanRange& scan_range, const std::vector<OlapScanRange*>& key_ranges,
-                   TabletReader::ReadSource read_source, RuntimeProfile* profile);
-
-    NewOlapScanner(RuntimeState* state, pipeline::ScanLocalStateBase* parent, int64_t limit,
-                   bool aggregation, const TPaloScanRange& scan_range,
-                   const std::vector<OlapScanRange*>& key_ranges, RuntimeProfile* profile);
-
-    NewOlapScanner(RuntimeState* state, pipeline::ScanLocalStateBase* parent, int64_t limit,
-                   bool aggregation, const TPaloScanRange& scan_range,
-                   const std::vector<OlapScanRange*>& key_ranges,
-                   TabletReader::ReadSource read_source, RuntimeProfile* profile);
+    NewOlapScanner(pipeline::ScanLocalStateBase* parent, Params&& params);
 
     Status init() override;
 
@@ -77,32 +75,23 @@ public:
 
     Status close(RuntimeState* state) override;
 
-    Status prepare(RuntimeState* state, const VExprContextSPtrs& conjuncts);
-
-    void set_compound_filters(const std::vector<TCondition>& compound_filters);
-
     doris::TabletStorageType get_storage_type() override;
 
 protected:
     Status _get_block_impl(RuntimeState* state, Block* block, bool* eos) override;
-    void _update_counters_before_close() override;
+    void _collect_profile_before_close() override;
 
 private:
     void _update_realtime_counters();
 
     Status _init_tablet_reader_params(const std::vector<OlapScanRange*>& key_ranges,
                                       const std::vector<TCondition>& filters,
-                                      const FilterPredicates& filter_predicates,
+                                      const pipeline::FilterPredicates& filter_predicates,
                                       const std::vector<FunctionFilter>& function_filters);
 
     [[nodiscard]] Status _init_return_columns();
+    [[nodiscard]] Status _init_variant_columns();
 
-    bool _aggregation;
-
-    TabletSchemaSPtr _tablet_schema;
-    BaseTabletSPtr _tablet;
-    int64_t _version;
-    const TPaloScanRange& _scan_range;
     std::vector<OlapScanRange*> _key_ranges;
 
     TabletReader::ReaderParams _tablet_reader_params;
@@ -110,11 +99,8 @@ private:
 
     std::vector<uint32_t> _return_columns;
     std::unordered_set<uint32_t> _tablet_columns_convert_to_null_set;
-    std::vector<TCondition> _compound_filters;
 
     // ========= profiles ==========
-    int64_t _compressed_bytes_read = 0;
-    int64_t _raw_rows_read = 0;
     bool _profile_updated = false;
 };
 } // namespace vectorized

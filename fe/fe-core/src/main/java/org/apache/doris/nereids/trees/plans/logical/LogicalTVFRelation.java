@@ -22,6 +22,7 @@ import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.expressions.functions.table.TableValuedFunction;
+import org.apache.doris.nereids.trees.plans.BlockFuncDepsPropagation;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
@@ -37,7 +38,7 @@ import java.util.Objects;
 import java.util.Optional;
 
 /** LogicalTableValuedFunctionRelation */
-public class LogicalTVFRelation extends LogicalRelation implements TVFRelation {
+public class LogicalTVFRelation extends LogicalRelation implements TVFRelation, BlockFuncDepsPropagation {
 
     private final TableValuedFunction function;
     private final ImmutableList<String> qualifier;
@@ -64,6 +65,11 @@ public class LogicalTVFRelation extends LogicalRelation implements TVFRelation {
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         return new LogicalTVFRelation(relationId, function, groupExpression, logicalProperties);
+    }
+
+    @Override
+    public LogicalTVFRelation withRelationId(RelationId relationId) {
+        return new LogicalTVFRelation(relationId, function, Optional.empty(), Optional.empty());
     }
 
     @Override
@@ -98,7 +104,7 @@ public class LogicalTVFRelation extends LogicalRelation implements TVFRelation {
     public List<Slot> computeOutput() {
         return function.getTable().getBaseSchema()
                 .stream()
-                .map(col -> SlotReference.fromColumn(col, qualifier))
+                .map(col -> SlotReference.fromColumn(function.getTable(), col, qualifier))
                 .collect(ImmutableList.toImmutableList());
     }
 

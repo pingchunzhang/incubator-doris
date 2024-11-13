@@ -22,19 +22,23 @@
 
 #include <typeinfo>
 
+#include "vec/columns/column_nothing.h"
+
 namespace doris::vectorized {
 
 MutableColumnPtr DataTypeNothing::create_column() const {
-    LOG(FATAL) << "not support";
+    return ColumnNothing::create(0);
 }
 
 char* DataTypeNothing::serialize(const IColumn& column, char* buf, int be_exec_version) const {
-    LOG(FATAL) << "not support";
+    throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR, "serialize not support");
+    __builtin_unreachable();
 }
 
-const char* DataTypeNothing::deserialize(const char* buf, IColumn* column,
+const char* DataTypeNothing::deserialize(const char* buf, MutableColumnPtr* column,
                                          int be_exec_version) const {
-    LOG(FATAL) << "not support";
+    throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR, "deserialize not support");
+    __builtin_unreachable();
 }
 
 bool DataTypeNothing::equals(const IDataType& rhs) const {

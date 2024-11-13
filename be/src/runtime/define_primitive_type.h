@@ -49,7 +49,8 @@ enum PrimitiveType : PrimitiveNative {
     TYPE_HLL,       /* 19 */
     TYPE_DECIMALV2, /* 20 */
 
-    TYPE_TIME,            /* 21 */
+    TYPE_TIME [[deprecated]], /*TYPE_TIMEV2*/
+
     TYPE_OBJECT,          /* 22 */
     TYPE_STRING,          /* 23 */
     TYPE_QUANTILE_STATE,  /* 24 */
@@ -63,8 +64,11 @@ enum PrimitiveType : PrimitiveNative {
     TYPE_VARIANT,         /* 32 */
     TYPE_LAMBDA_FUNCTION, /* 33 */
     TYPE_AGG_STATE,       /* 34 */
+    TYPE_DECIMAL256,      /* 35 */
+    TYPE_IPV4,            /* 36 */
+    TYPE_IPV6             /* 37 */
 };
 
 constexpr PrimitiveNative BEGIN_OF_PRIMITIVE_TYPE = INVALID_TYPE;
-constexpr PrimitiveNative END_OF_PRIMITIVE_TYPE = TYPE_AGG_STATE;
+constexpr PrimitiveNative END_OF_PRIMITIVE_TYPE = TYPE_DECIMAL256;
 } // namespace doris

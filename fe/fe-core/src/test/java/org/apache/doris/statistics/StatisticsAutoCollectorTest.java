@@ -17,200 +17,155 @@
 
 package org.apache.doris.statistics;
 
+import org.apache.doris.analysis.TableName;
 import org.apache.doris.catalog.Column;
-import org.apache.doris.catalog.Database;
-import org.apache.doris.catalog.DatabaseIf;
+import org.apache.doris.catalog.Env;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.PrimitiveType;
-import org.apache.doris.catalog.Table;
-import org.apache.doris.catalog.TableIf;
-import org.apache.doris.catalog.Type;
-import org.apache.doris.catalog.View;
-import org.apache.doris.cluster.ClusterNamespace;
-import org.apache.doris.common.DdlException;
-import org.apache.doris.common.FeConstants;
-import org.apache.doris.datasource.CatalogIf;
-import org.apache.doris.statistics.AnalysisInfo.AnalysisMethod;
-import org.apache.doris.statistics.AnalysisInfo.AnalysisType;
-import org.apache.doris.statistics.AnalysisInfo.JobType;
-import org.apache.doris.statistics.util.StatisticsUtil;
-import org.apache.doris.system.SystemInfoService;
+import org.apache.doris.common.Pair;
+import org.apache.doris.datasource.ExternalTable;
+import org.apache.doris.datasource.hive.HMSExternalTable;
+import org.apache.doris.datasource.hive.HMSExternalTable.DLAType;
+import org.apache.doris.datasource.jdbc.JdbcExternalTable;
 
-import mockit.Expectations;
-import mockit.Injectable;
 import mockit.Mock;
 import mockit.MockUp;
-import org.apache.hadoop.util.Lists;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Set;
 
 public class StatisticsAutoCollectorTest {
 
     @Test
-    public void testAnalyzeAll(@Injectable AnalysisInfo analysisInfo) {
-        new MockUp<CatalogIf>() {
+    public void testFetchJob() {
+        AnalysisManager manager = new AnalysisManager();
+        TableName high1 = new TableName("catalog", "db", "high1");
+        TableName high2 = new TableName("catalog", "db", "high2");
+        TableName mid1 = new TableName("catalog", "db", "mid1");
+        TableName mid2 = new TableName("catalog", "db", "mid2");
+        TableName low1 = new TableName("catalog", "db", "low1");
+
+        manager.highPriorityJobs.put(high1, new HashSet<>());
+        manager.highPriorityJobs.get(high1).add(Pair.of("index1", "col1"));
+        manager.highPriorityJobs.get(high1).add(Pair.of("index1", "col2"));
+        manager.highPriorityJobs.put(high2, new HashSet<>());
+        manager.highPriorityJobs.get(high2).add(Pair.of("index1", "col3"));
+        manager.midPriorityJobs.put(mid1, new HashSet<>());
+        manager.midPriorityJobs.get(mid1).add(Pair.of("index1", "col4"));
+        manager.midPriorityJobs.put(mid2, new HashSet<>());
+        manager.midPriorityJobs.get(mid2).add(Pair.of("index1", "col5"));
+        manager.lowPriorityJobs.put(low1, new HashSet<>());
+        manager.lowPriorityJobs.get(low1).add(Pair.of("index1", "col6"));
+        manager.lowPriorityJobs.get(low1).add(Pair.of("index1", "col7"));
+
+
+        new MockUp<Env>() {
             @Mock
-            public Collection<DatabaseIf> getAllDbs() {
-                Database db1 = new Database(1, SystemInfoService.DEFAULT_CLUSTER
-                        + ClusterNamespace.CLUSTER_DELIMITER + FeConstants.INTERNAL_DB_NAME);
-                Database db2 = new Database(2, "anyDB");
-                List<DatabaseIf> databaseIfs = new ArrayList<>();
-                databaseIfs.add(db1);
-                databaseIfs.add(db2);
-                return databaseIfs;
+            public AnalysisManager getAnalysisManager() {
+                return manager;
             }
         };
-        new MockUp<StatisticsAutoCollector>() {
-            @Mock
-            public List<AnalysisInfo> constructAnalysisInfo(DatabaseIf<TableIf> db) {
-                return Arrays.asList(analysisInfo, analysisInfo);
-            }
+        StatisticsAutoCollector collector = new StatisticsAutoCollector();
+        Pair<Entry<TableName, Set<Pair<String, String>>>, JobPriority> job = collector.getJob();
+        Assertions.assertEquals(high1, job.first.getKey());
+        Assertions.assertEquals(2, job.first.getValue().size());
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col1")));
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col2")));
+        Assertions.assertEquals(JobPriority.HIGH, job.second);
 
-            int count = 0;
+        job = collector.getJob();
+        Assertions.assertEquals(high2, job.first.getKey());
+        Assertions.assertEquals(1, job.first.getValue().size());
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col3")));
+        Assertions.assertEquals(JobPriority.HIGH, job.second);
 
-            @Mock
-            public AnalysisInfo getReAnalyzeRequiredPart(AnalysisInfo jobInfo) {
-                return count++ == 0 ? null : jobInfo;
-            }
+        job = collector.getJob();
+        Assertions.assertEquals(mid1, job.first.getKey());
+        Assertions.assertEquals(1, job.first.getValue().size());
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col4")));
+        Assertions.assertEquals(JobPriority.MID, job.second);
 
-            @Mock
-            public void createSystemAnalysisJob(AnalysisInfo jobInfo)
-                    throws DdlException {
+        job = collector.getJob();
+        Assertions.assertEquals(mid2, job.first.getKey());
+        Assertions.assertEquals(1, job.first.getValue().size());
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col5")));
+        Assertions.assertEquals(JobPriority.MID, job.second);
 
-            }
-        };
+        job = collector.getJob();
+        Assertions.assertEquals(low1, job.first.getKey());
+        Assertions.assertEquals(2, job.first.getValue().size());
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col6")));
+        Assertions.assertTrue(job.first.getValue().contains(Pair.of("index1", "col7")));
+        Assertions.assertEquals(JobPriority.LOW, job.second);
 
-        StatisticsAutoCollector saa = new StatisticsAutoCollector();
-        saa.runAfterCatalogReady();
-        new Expectations() {
-            {
-                try {
-                    saa.createSystemAnalysisJob((AnalysisInfo) any);
-                    times = 1;
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
-                }
-            }
-        };
+        job = collector.getJob();
+        Assertions.assertNull(job);
     }
 
     @Test
-    public void testConstructAnalysisInfo(
-            @Injectable OlapTable o2, @Injectable View v) {
-        new MockUp<Database>() {
-            @Mock
-            public List<Table> getTables() {
-                List<Table> tableIfs = new ArrayList<>();
-                tableIfs.add(o2);
-                tableIfs.add(v);
-                return tableIfs;
-            }
+    public void testSupportAutoAnalyze() {
+        StatisticsAutoCollector collector = new StatisticsAutoCollector();
+        Assertions.assertFalse(collector.supportAutoAnalyze(null));
+        Column column1 = new Column("placeholder", PrimitiveType.INT);
+        List<Column> schema = new ArrayList<>();
+        schema.add(column1);
+        OlapTable table1 = new OlapTable(200, "testTable", schema, null, null, null);
+        Assertions.assertTrue(collector.supportAutoAnalyze(table1));
 
+        ExternalTable externalTable = new JdbcExternalTable(1, "jdbctable", "jdbcdb", null);
+        Assertions.assertFalse(collector.supportAutoAnalyze(externalTable));
+
+        new MockUp<HMSExternalTable>() {
             @Mock
-            public String getFullName() {
-                return "anyDb";
+            public DLAType getDlaType() {
+                return DLAType.ICEBERG;
             }
         };
+        ExternalTable icebergExternalTable = new HMSExternalTable(1, "hmsTable", "hmsDb", null);
+        Assertions.assertFalse(collector.supportAutoAnalyze(icebergExternalTable));
 
-        new MockUp<OlapTable>() {
+        new MockUp<HMSExternalTable>() {
             @Mock
-            public String getName() {
-                return "anytable";
-            }
-
-            @Mock
-            public List<Column> getBaseSchema() {
-                List<Column> columns = new ArrayList<>();
-                columns.add(new Column("c1", PrimitiveType.INT));
-                columns.add(new Column("c2", PrimitiveType.HLL));
-                return columns;
+            public DLAType getDlaType() {
+                return DLAType.HIVE;
             }
         };
-        StatisticsAutoCollector saa = new StatisticsAutoCollector();
-        List<AnalysisInfo> analysisInfos =
-                saa.constructAnalysisInfo(new Database(1, "anydb"));
-        Assertions.assertEquals(1, analysisInfos.size());
-        Assertions.assertEquals("c1", analysisInfos.get(0).colName.split(",")[0]);
+        ExternalTable hiveExternalTable = new HMSExternalTable(1, "hmsTable", "hmsDb", null);
+        Assertions.assertTrue(collector.supportAutoAnalyze(hiveExternalTable));
     }
 
     @Test
-    public void testGetReAnalyzeRequiredPart0() {
-
-        TableIf tableIf = new OlapTable();
-
+    public void testCreateAnalyzeJobForTbl() {
+        StatisticsAutoCollector collector = new StatisticsAutoCollector();
+        OlapTable table = new OlapTable();
         new MockUp<OlapTable>() {
             @Mock
-            protected Map<String, Set<String>> findReAnalyzeNeededPartitions() {
-                Set<String> partitionNames = new HashSet<>();
-                partitionNames.add("p1");
-                partitionNames.add("p2");
-                Map<String, Set<String>> map = new HashMap<>();
-                map.put("col1", partitionNames);
-                return map;
-            }
-
-            @Mock
-            public long getRowCount() {
+            public long getDataSize(boolean singleReplica) {
                 return 100;
             }
 
             @Mock
-            public List<Column> getBaseSchema() {
-                return Lists.newArrayList(new Column("col1", Type.INT), new Column("col2", Type.INT));
-            }
-        };
-
-        new MockUp<StatisticsUtil>() {
-            @Mock
-            public TableIf findTable(long catalogName, long dbName, long tblName) {
-                return tableIf;
-            }
-        };
-        AnalysisInfo analysisInfo = new AnalysisInfoBuilder().setAnalysisMethod(AnalysisMethod.FULL).setAnalysisType(
-                AnalysisType.FUNDAMENTALS).setColName("col1").setJobType(JobType.SYSTEM).build();
-        new MockUp<AnalysisManager>() {
-
-            int count = 0;
-
-            TableStatsMeta[] tableStatsArr =
-                    new TableStatsMeta[] {new TableStatsMeta(0, 0, analysisInfo),
-                            new TableStatsMeta(0, 0, analysisInfo), null};
-
-            {
-                tableStatsArr[0].updatedRows.addAndGet(100);
-                tableStatsArr[1].updatedRows.addAndGet(0);
+            public long getRowCountForIndex(long indexId, boolean strict) {
+                return -1;
             }
 
             @Mock
-            public TableStatsMeta findTableStatsStatus(long tblId) {
-                return tableStatsArr[count++];
+            public boolean isPartitionedTable() {
+                return false;
             }
         };
-
-        new MockUp<StatisticsAutoCollector>() {
+        Assertions.assertNull(collector.createAnalyzeJobForTbl(table, null, null));
+        new MockUp<OlapTable>() {
             @Mock
-            public AnalysisInfo getAnalysisJobInfo(AnalysisInfo jobInfo, TableIf table,
-                    Set<String> needRunPartitions) {
-                return new AnalysisInfoBuilder().build();
+            public long getRowCountForIndex(long indexId, boolean strict) {
+                return 100;
             }
         };
-        StatisticsAutoCollector statisticsAutoCollector = new StatisticsAutoCollector();
-        AnalysisInfo analysisInfo2 = new AnalysisInfoBuilder()
-                .setCatalogId(0)
-                .setDBId(0)
-                .setTblId(0).build();
-        Assertions.assertNotNull(statisticsAutoCollector.getReAnalyzeRequiredPart(analysisInfo2));
-        // uncomment it when updatedRows gets ready
-        // Assertions.assertNull(statisticsAutoCollector.getReAnalyzeRequiredPart(analysisInfo2));
-        Assertions.assertNotNull(statisticsAutoCollector.getReAnalyzeRequiredPart(analysisInfo2));
+        Assertions.assertThrows(NullPointerException.class, () -> collector.createAnalyzeJobForTbl(table, null, null));
     }
 }

@@ -18,10 +18,8 @@
 package org.apache.doris.statistics;
 
 import org.apache.doris.analysis.LiteralExpr;
-import org.apache.doris.catalog.PartitionInfo;
-
-import java.util.HashMap;
-import java.util.Map;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.types.coercion.CharacterType;
 
 public class ColumnStatisticBuilder {
     private double count;
@@ -29,33 +27,18 @@ public class ColumnStatisticBuilder {
     private double avgSizeByte;
     private double numNulls;
     private double dataSize;
-    private double minValue;
-    private double maxValue;
+    private double minValue = Double.NEGATIVE_INFINITY;
+    private double maxValue = Double.POSITIVE_INFINITY;
     private LiteralExpr minExpr;
     private LiteralExpr maxExpr;
 
     private boolean isUnknown;
 
-    private Histogram histogram;
-
     private ColumnStatistic original;
-
-    private Map<String, ColumnStatistic> partitionIdToColStats = new HashMap<>();
 
     private String updatedTime;
 
-    private PartitionInfo partitionInfo;
-
     public ColumnStatisticBuilder() {
-    }
-
-    public PartitionInfo getPartitionInfo() {
-        return partitionInfo;
-    }
-
-    public ColumnStatisticBuilder setPartitionInfo(PartitionInfo partitionInfo) {
-        this.partitionInfo = partitionInfo;
-        return this;
     }
 
     public ColumnStatisticBuilder(ColumnStatistic columnStatistic) {
@@ -69,16 +52,28 @@ public class ColumnStatisticBuilder {
         this.minExpr = columnStatistic.minExpr;
         this.maxExpr = columnStatistic.maxExpr;
         this.isUnknown = columnStatistic.isUnKnown;
-        this.histogram = columnStatistic.histogram;
         this.original = columnStatistic.original;
-        this.partitionIdToColStats.putAll(columnStatistic.partitionIdToColStats);
         this.updatedTime = columnStatistic.updatedTime;
-        this.partitionInfo = columnStatistic.partitionInfo;
     }
 
-    public ColumnStatisticBuilder setCount(double count) {
+    // ATTENTION: DON'T USE FOLLOWING TWO DURING STATS DERIVING EXCEPT FOR INITIALIZATION
+    public ColumnStatisticBuilder(double count) {
         this.count = count;
-        return this;
+    }
+
+    public ColumnStatisticBuilder(ColumnStatistic columnStatistic, double count) {
+        this.count = count;
+        this.ndv = columnStatistic.ndv;
+        this.avgSizeByte = columnStatistic.avgSizeByte;
+        this.numNulls = columnStatistic.numNulls;
+        this.dataSize = columnStatistic.dataSize;
+        this.minValue = columnStatistic.minValue;
+        this.maxValue = columnStatistic.maxValue;
+        this.minExpr = columnStatistic.minExpr;
+        this.maxExpr = columnStatistic.maxExpr;
+        this.isUnknown = columnStatistic.isUnKnown;
+        this.original = columnStatistic.original;
+        this.updatedTime = columnStatistic.updatedTime;
     }
 
     public ColumnStatisticBuilder setNdv(double ndv) {
@@ -171,15 +166,6 @@ public class ColumnStatisticBuilder {
         return isUnknown;
     }
 
-    public Histogram getHistogram() {
-        return histogram;
-    }
-
-    public ColumnStatisticBuilder setHistogram(Histogram histogram) {
-        this.histogram = histogram;
-        return this;
-    }
-
     public String getUpdatedTime() {
         return updatedTime;
     }
@@ -194,13 +180,26 @@ public class ColumnStatisticBuilder {
         if (original == null && !isUnknown) {
             original = new ColumnStatistic(count, ndv, null, avgSizeByte, numNulls,
                     dataSize, minValue, maxValue, minExpr, maxExpr,
-                    isUnknown, histogram, updatedTime, partitionInfo);
-            original.partitionIdToColStats.putAll(partitionIdToColStats);
+                    isUnknown, updatedTime);
         }
         ColumnStatistic colStats = new ColumnStatistic(count, ndv, original, avgSizeByte, numNulls,
                 dataSize, minValue, maxValue, minExpr, maxExpr,
-                isUnknown, histogram, updatedTime, partitionInfo);
-        colStats.partitionIdToColStats.putAll(partitionIdToColStats);
+                isUnknown, updatedTime);
         return colStats;
+    }
+
+    public void normalizeAvgSizeByte(SlotReference slot) {
+        if (isUnknown) {
+            return;
+        }
+        if (avgSizeByte > 0) {
+            return;
+        }
+        avgSizeByte = slot.getDataType().toCatalogDataType().getSlotSize();
+        // When defining SQL schemas, users often tend to set the length of string \
+        // fields much longer than actually needed for storage.
+        if (slot.getDataType() instanceof CharacterType) {
+            avgSizeByte = Math.min(avgSizeByte, CharacterType.DEFAULT_WIDTH);
+        }
     }
 }

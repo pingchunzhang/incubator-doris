@@ -20,6 +20,8 @@
 
 #pragma once
 
+#include "common/exception.h"
+#include "common/status.h"
 #include "vec/common/demangle.h"
 #include "vec/core/accurate_comparison.h"
 #include "vec/core/field.h"
@@ -55,16 +57,24 @@ typename std::decay_t<Visitor>::ResultType apply_visitor(Visitor&& visitor, F&& 
         return visitor(field.template get<Array>());
     case Field::Types::Tuple:
         return visitor(field.template get<Tuple>());
+    case Field::Types::VariantMap:
+        return visitor(field.template get<VariantMap>());
     case Field::Types::Decimal32:
         return visitor(field.template get<DecimalField<Decimal32>>());
     case Field::Types::Decimal64:
         return visitor(field.template get<DecimalField<Decimal64>>());
-    case Field::Types::Decimal128:
-        return visitor(field.template get<DecimalField<Decimal128>>());
-    case Field::Types::Decimal128I:
-        return visitor(field.template get<DecimalField<Decimal128I>>());
+    case Field::Types::Decimal128V2:
+        return visitor(field.template get<DecimalField<Decimal128V2>>());
+    case Field::Types::Decimal128V3:
+        return visitor(field.template get<DecimalField<Decimal128V3>>());
+    case Field::Types::Decimal256:
+        return visitor(field.template get<DecimalField<Decimal256>>());
+    case Field::Types::JSONB:
+        return visitor(field.template get<JsonbField>());
     default:
-        LOG(FATAL) << "Bad type of Field";
+        throw doris::Exception(ErrorCode::INTERNAL_ERROR, "Bad type of Field {}",
+                               static_cast<int>(field.get_type()));
+        __builtin_unreachable();
         return {};
     }
 }

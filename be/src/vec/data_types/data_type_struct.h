@@ -82,13 +82,13 @@ public:
         }
         return desc;
     }
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
-        return TPrimitiveType::STRUCT;
+
+    doris::FieldType get_storage_field_type() const override {
+        return doris::FieldType::OLAP_FIELD_TYPE_STRUCT;
     }
     std::string do_get_name() const override;
     const char* get_family_name() const override { return "Struct"; }
 
-    bool can_be_inside_nullable() const override { return true; }
     bool supports_sparse_serialization() const { return true; }
 
     MutableColumnPtr create_column() const override;
@@ -96,10 +96,10 @@ public:
     Field get_default() const override;
 
     Field get_field(const TExprNode& node) const override {
-        LOG(FATAL) << "Unimplemented get_field for struct";
+        throw doris::Exception(ErrorCode::NOT_IMPLEMENTED_ERROR,
+                               "Unimplemented get_field for struct");
+        __builtin_unreachable();
     }
-
-    void insert_default_into(IColumn& column) const override;
 
     bool equals(const IDataType& rhs) const override;
 
@@ -113,6 +113,7 @@ public:
 
     const DataTypePtr& get_element(size_t i) const { return elems[i]; }
     const DataTypes& get_elements() const { return elems; }
+    const String& get_element_name(size_t i) const { return names[i]; }
     const Strings& get_element_names() const { return names; }
 
     size_t get_position_by_name(const String& name) const;
@@ -122,19 +123,20 @@ public:
     int64_t get_uncompressed_serialized_bytes(const IColumn& column,
                                               int be_exec_version) const override;
     char* serialize(const IColumn& column, char* buf, int be_exec_version) const override;
-    const char* deserialize(const char* buf, IColumn* column, int be_exec_version) const override;
+    const char* deserialize(const char* buf, MutableColumnPtr* column,
+                            int be_exec_version) const override;
     void to_pb_column_meta(PColumnMeta* col_meta) const override;
 
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
     std::string to_string(const IColumn& column, size_t row_num) const override;
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
     bool get_have_explicit_names() const { return have_explicit_names; }
-    DataTypeSerDeSPtr get_serde() const override {
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
         DataTypeSerDeSPtrs ptrs;
         for (auto iter = elems.begin(); iter < elems.end(); ++iter) {
-            ptrs.push_back((*iter)->get_serde());
+            ptrs.push_back((*iter)->get_serde(nesting_level + 1));
         }
-        return std::make_shared<DataTypeStructSerDe>(ptrs, names);
+        return std::make_shared<DataTypeStructSerDe>(ptrs, names, nesting_level);
     };
 };
 

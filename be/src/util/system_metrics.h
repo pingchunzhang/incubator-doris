@@ -57,6 +57,8 @@ public:
                              const std::map<std::string, int64_t>& lst_rcv_map,
                              int64_t interval_sec, int64_t* send_rate, int64_t* rcv_rate);
 
+    double get_load_average_1_min();
+
     void update_max_disk_io_util_percent(const std::map<std::string, int64_t>& lst_value,
                                          int64_t interval_sec);
     void update_max_network_send_bytes_rate(int64_t max_send_bytes_rate);
@@ -110,11 +112,11 @@ private:
     char* _line_ptr = nullptr;
     size_t _line_buf_size = 0;
     MetricRegistry* _registry = nullptr;
-    std::shared_ptr<MetricEntity> _server_entity = nullptr;
+    std::shared_ptr<MetricEntity> _server_entity;
 
-    IntGauge* max_disk_io_util_percent;
-    IntGauge* max_network_send_bytes_rate;
-    IntGauge* max_network_receive_bytes_rate;
+    IntGauge* max_disk_io_util_percent = nullptr;
+    IntGauge* max_network_send_bytes_rate = nullptr;
+    IntGauge* max_network_receive_bytes_rate = nullptr;
 };
 
 } // namespace doris

@@ -18,21 +18,29 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
+import org.apache.doris.nereids.trees.plans.RelationId;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import org.apache.commons.lang3.StringUtils;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 
 /**
  * The node of logical plan for sub query and alias
@@ -41,6 +49,7 @@ import java.util.Optional;
  */
 public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TYPE> {
 
+    protected RelationId relationId;
     private final List<String> qualifier;
     private final Optional<List<String>> columnAliases;
 
@@ -81,8 +90,19 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
             } else {
                 columnAlias = originSlot.getName();
             }
+            List<String> originQualifier = originSlot.getQualifier();
+
+            ArrayList<String> newQualifier = Lists.newArrayList(originQualifier);
+            if (newQualifier.size() >= qualifier.size()) {
+                for (int j = 0; j < qualifier.size(); j++) {
+                    newQualifier.set(newQualifier.size() - qualifier.size() + j, qualifier.get(j));
+                }
+            } else if (newQualifier.isEmpty()) {
+                newQualifier.addAll(qualifier);
+            }
+
             Slot qualified = originSlot
-                    .withQualifier(qualifier)
+                    .withQualifier(newQualifier)
                     .withName(columnAlias);
             currentOutput.add(qualified);
         }
@@ -152,5 +172,68 @@ public class LogicalSubQueryAlias<CHILD_TYPE extends Plan> extends LogicalUnary<
         Preconditions.checkArgument(children.size() == 1);
         return new LogicalSubQueryAlias<>(qualifier, columnAliases, groupExpression, logicalProperties,
                 children.get(0));
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        builder.addUniqueSlot(child(0).getLogicalProperties().getTrait());
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        List<Slot> outputs = getOutput();
+        for (int i = 0; i < outputs.size(); i++) {
+            replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
+        }
+        builder.replaceUniqueBy(replaceMap);
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        List<Slot> outputs = getOutput();
+        for (int i = 0; i < outputs.size(); i++) {
+            replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
+        }
+        builder.replaceUniformBy(replaceMap);
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child(0).getLogicalProperties().getTrait());
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        List<Slot> outputs = getOutput();
+        for (int i = 0; i < outputs.size(); i++) {
+            replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
+        }
+        builder.replaceEqualSetBy(replaceMap);
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        List<Slot> outputs = getOutput();
+        for (int i = 0; i < outputs.size(); i++) {
+            replaceMap.put(child(0).getOutput().get(i), outputs.get(i));
+        }
+        builder.replaceFuncDepsBy(replaceMap);
+    }
+
+    public void setRelationId(RelationId relationId) {
+        this.relationId = relationId;
+    }
+
+    public RelationId getRelationId() {
+        return relationId;
+    }
+
+    public List<String> getQualifier() {
+        return qualifier;
+    }
+
+    @Override
+    public Set<RelationId> getInputRelations() {
+        Set<RelationId> relationIdSet = Sets.newHashSet();
+        relationIdSet.add(relationId);
+        return relationIdSet;
     }
 }

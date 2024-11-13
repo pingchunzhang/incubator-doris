@@ -25,6 +25,7 @@ import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Properties;
 import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.functions.table.TableValuedFunction;
+import org.apache.doris.nereids.trees.plans.BlockFuncDepsPropagation;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.RelationId;
@@ -38,7 +39,8 @@ import java.util.Objects;
 import java.util.Optional;
 
 /** UnboundTVFRelation */
-public class UnboundTVFRelation extends LogicalRelation implements TVFRelation, Unbound {
+public class UnboundTVFRelation extends LogicalRelation implements TVFRelation, Unbound,
+        BlockFuncDepsPropagation {
 
     private final String functionName;
     private final Properties properties;
@@ -97,6 +99,11 @@ public class UnboundTVFRelation extends LogicalRelation implements TVFRelation, 
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
         return new UnboundTVFRelation(relationId, functionName, properties, groupExpression, logicalProperties);
+    }
+
+    @Override
+    public UnboundTVFRelation withRelationId(RelationId relationId) {
+        throw new UnboundException("should not call UnboundTVFRelation's withRelationId method");
     }
 
     @Override

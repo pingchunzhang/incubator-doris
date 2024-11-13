@@ -29,9 +29,11 @@
 #include "orc/Type.hh"
 #include "orc/Writer.hh"
 #include "vec/core/block.h"
+#include "vec/exec/format/table/iceberg/schema.h"
 #include "vec/runtime/vparquet_transformer.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 namespace io {
 class FileWriter;
 } // namespace io
@@ -42,6 +44,9 @@ class VExprContext;
 namespace orc {
 struct ColumnVectorBatch;
 } // namespace orc
+namespace iceberg {
+class NestedField;
+} // namespace iceberg
 
 namespace doris::vectorized {
 
@@ -64,8 +69,8 @@ public:
     void set_written_len(int64_t written_len);
 
 private:
-    doris::io::FileWriter* _file_writer; // not owned
-    int64_t _cur_pos = 0;                // current write position
+    doris::io::FileWriter* _file_writer = nullptr; // not owned
+    int64_t _cur_pos = 0;                          // current write position
     bool _is_closed = false;
     int64_t _written_len = 0;
     const std::string _name;
@@ -74,8 +79,11 @@ private:
 // a wrapper of parquet output stream
 class VOrcTransformer final : public VFileFormatTransformer {
 public:
-    VOrcTransformer(doris::io::FileWriter* file_writer, const VExprContextSPtrs& output_vexpr_ctxs,
-                    const std::string& schema, bool output_object_data);
+    VOrcTransformer(RuntimeState* state, doris::io::FileWriter* file_writer,
+                    const VExprContextSPtrs& output_vexpr_ctxs, std::string schema,
+                    std::vector<std::string> column_names, bool output_object_data,
+                    TFileCompressType::type compression,
+                    const iceberg::Schema* iceberg_schema = nullptr);
 
     ~VOrcTransformer() = default;
 
@@ -88,14 +96,26 @@ public:
     int64_t written_len() override;
 
 private:
-    std::unique_ptr<orc::ColumnVectorBatch> _create_row_batch(size_t sz);
+    void set_compression_type(const TFileCompressType::type& compress_type);
+    std::unique_ptr<orc::Type> _build_orc_type(const TypeDescriptor& type_descriptor,
+                                               const iceberg::NestedField* nested_field);
 
-    doris::io::FileWriter* _file_writer;
+    std::unique_ptr<orc::ColumnVectorBatch> _create_row_batch(size_t sz);
+    // The size of subtypes of a complex type may be different from
+    // the size of the complex type itself,
+    // so we need to resize the subtype of a complex type
+    Status _resize_row_batch(const DataTypePtr& type, const IColumn& column,
+                             orc::ColumnVectorBatch* orc_col_batch);
+
+    doris::io::FileWriter* _file_writer = nullptr;
+    std::vector<std::string> _column_names;
     std::unique_ptr<orc::OutputStream> _output_stream;
     std::unique_ptr<orc::WriterOptions> _write_options;
-    const std::string& _schema_str;
+    std::string _schema_str;
     std::unique_ptr<orc::Type> _schema;
     std::unique_ptr<orc::Writer> _writer;
+
+    const iceberg::Schema* _iceberg_schema;
 
     // Buffer used by date/datetime/datev2/datetimev2/largeint type
     // date/datetime/datev2/datetimev2/largeint type will be converted to string bytes to store in Buffer
@@ -105,6 +125,12 @@ private:
     static constexpr size_t BUFFER_UNIT_SIZE = 4064 * 40;
     // buffer reserves 40 bytes. The reserved space is just to prevent Headp-Buffer-Overflow
     static constexpr size_t BUFFER_RESERVED_SIZE = 40;
+
+    static constexpr const char* ORC_ICEBERG_ID_KEY = "iceberg.id";
+    static constexpr const char* ORC_ICEBERG_REQUIRED_KEY = "iceberg.required";
+    static constexpr const char* ICEBERG_LONG_TYPE = "iceberg.long-type";
 };
 
 } // namespace doris::vectorized
+
+#include "common/compile_check_end.h"

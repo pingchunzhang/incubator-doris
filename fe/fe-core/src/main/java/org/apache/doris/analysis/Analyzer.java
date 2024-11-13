@@ -32,27 +32,33 @@ import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.TableIf.TableType;
 import org.apache.doris.catalog.Type;
 import org.apache.doris.catalog.View;
-import org.apache.doris.catalog.external.HMSExternalTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.common.Pair;
+import org.apache.doris.common.UserException;
 import org.apache.doris.common.util.TimeUtils;
+import org.apache.doris.datasource.hive.HMSExternalTable;
+import org.apache.doris.nereids.exceptions.NotSupportedException;
 import org.apache.doris.planner.AggregationNode;
 import org.apache.doris.planner.AnalyticEvalNode;
 import org.apache.doris.planner.PlanNode;
 import org.apache.doris.planner.RuntimeFilter;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.rewrite.BetweenToCompoundRule;
+import org.apache.doris.rewrite.CaseWhenToIf;
 import org.apache.doris.rewrite.CompoundPredicateWriteRule;
+import org.apache.doris.rewrite.ElementAtToSlotRefRule;
 import org.apache.doris.rewrite.EliminateUnnecessaryFunctions;
 import org.apache.doris.rewrite.EraseRedundantCastExpr;
 import org.apache.doris.rewrite.ExprRewriteRule;
 import org.apache.doris.rewrite.ExprRewriter;
 import org.apache.doris.rewrite.ExtractCommonFactorsRule;
 import org.apache.doris.rewrite.FoldConstantsRule;
+import org.apache.doris.rewrite.FunctionAlias;
 import org.apache.doris.rewrite.InferFiltersRule;
 import org.apache.doris.rewrite.MatchPredicateRule;
 import org.apache.doris.rewrite.NormalizeBinaryPredicatesRule;
@@ -90,6 +96,7 @@ import java.util.ArrayList;
 import java.util.Calendar;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
@@ -123,6 +130,11 @@ public class Analyzer {
     // map from lowercase qualified column name ("alias.col") to descriptor
     private final Map<String, SlotDescriptor>  slotRefMap = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
 
+    // Notice: it's case sensitive
+    // Variant column name -> Paths of sub columns
+    private final Map<String, Map<List<String>, SlotDescriptor>> subColumnSlotRefMap
+                                           = Maps.newTreeMap(String.CASE_INSENSITIVE_ORDER);
+
     // map from tuple id to list of conjuncts referencing tuple
     private final Map<TupleId, List<ExprId>> tuplePredicates = Maps.newHashMap();
     // map from slot id to list of conjuncts referencing slot
@@ -142,9 +154,11 @@ public class Analyzer {
     // map from tuple id to the current output column index
     private final Map<TupleId, Integer> currentOutputColumn = Maps.newHashMap();
     // used for Information Schema Table Scan
-    private String schemaDb;
+    // This 3 fields is used for optimize the data fetching from FE,
+    // for stmt such as `show columns like`, `show databases like`, `show tables like`
+    // if can pre-filter the data in FrontendServiceImpl to reduce the data fetching from FE.
     private String schemaCatalog;
-    private String schemaWild;
+    private String schemaDb;
     private String schemaTable; // table used in DESCRIBE Table
 
     // Current depth of nested analyze() calls. Used for enforcing a
@@ -178,6 +192,8 @@ public class Analyzer {
     private final List<RuntimeFilter> assignedRuntimeFilters = new ArrayList<>();
 
     private boolean isReAnalyze = false;
+
+    private boolean isReplay = false;
 
     public void setIsSubquery() {
         isSubquery = true;
@@ -251,6 +267,14 @@ public class Analyzer {
 
     public long getAutoBroadcastJoinThreshold() {
         return globalState.autoBroadcastJoinThreshold;
+    }
+
+    public void setReplay() {
+        isReplay = true;
+    }
+
+    public boolean isReplay() {
+        return isReplay;
     }
 
     private static class InferPredicateState {
@@ -446,6 +470,9 @@ public class Analyzer {
             rules.add(RewriteIsNullIsNotNullRule.INSTANCE);
             rules.add(MatchPredicateRule.INSTANCE);
             rules.add(EliminateUnnecessaryFunctions.INSTANCE);
+            rules.add(ElementAtToSlotRefRule.INSTANCE);
+            rules.add(FunctionAlias.INSTANCE);
+            rules.add(CaseWhenToIf.INSTANCE);
             List<ExprRewriteRule> onceRules = Lists.newArrayList();
             onceRules.add(ExtractCommonFactorsRule.INSTANCE);
             onceRules.add(InferFiltersRule.INSTANCE);
@@ -481,9 +508,6 @@ public class Analyzer {
     }
 
     private final GlobalState globalState;
-
-    // Attached PrepareStmt
-    public PrepareStmt prepareStmt;
 
     private final InferPredicateState inferPredicateState;
 
@@ -604,14 +628,6 @@ public class Analyzer {
         explicitViewAlias = alias;
     }
 
-    public void setPrepareStmt(PrepareStmt stmt) {
-        prepareStmt = stmt;
-    }
-
-    public PrepareStmt getPrepareStmt() {
-        return prepareStmt;
-    }
-
     public String getExplicitViewAlias() {
         return explicitViewAlias;
     }
@@ -647,7 +663,7 @@ public class Analyzer {
         Calendar currentDate = Calendar.getInstance();
         LocalDateTime localDateTime = LocalDateTime.ofInstant(currentDate.toInstant(),
                 currentDate.getTimeZone().toZoneId());
-        String nowStr = localDateTime.format(TimeUtils.DATETIME_NS_FORMAT);
+        String nowStr = localDateTime.format(TimeUtils.getDatetimeNsFormatWithTimeZone());
         queryGlobals.setNowString(nowStr);
         queryGlobals.setNanoSeconds(LocalDateTime.now().getNano());
         return queryGlobals;
@@ -815,13 +831,11 @@ public class Analyzer {
                 .getDbOrAnalysisException(tableName.getDb());
         TableIf table = database.getTableOrAnalysisException(tableName.getTbl());
 
-        if (table.getType() == TableType.OLAP && (((OlapTable) table).getState() == OlapTableState.RESTORE
+        if (table.isManagedTable() && (((OlapTable) table).getState() == OlapTableState.RESTORE
                 || ((OlapTable) table).getState() == OlapTableState.RESTORE_WITH_LOAD)) {
-            Boolean isNotRestoring = ((OlapTable) table).getPartitions().stream()
-                    .filter(partition -> partition.getState() == PartitionState.RESTORE).collect(Collectors.toList())
-                    .isEmpty();
-
-            if (!isNotRestoring) {
+            Boolean isAnyPartitionRestoring = ((OlapTable) table).getPartitions().stream()
+                    .anyMatch(partition -> partition.getState() == PartitionState.RESTORE);
+            if (isAnyPartitionRestoring) {
                 // if doing restore with partitions, the status check push down to OlapScanNode::computePartitionInfo to
                 // support query that partitions is not restoring.
             } else {
@@ -833,11 +847,14 @@ public class Analyzer {
         // Now hms table only support a bit of table kinds in the whole hive system.
         // So Add this strong checker here to avoid some undefine behaviour in doris.
         if (table.getType() == TableType.HMS_EXTERNAL_TABLE) {
-            if (!((HMSExternalTable) table).isSupportedHmsTable()) {
+            try {
+                ((HMSExternalTable) table).isSupportedHmsTable();
+            } catch (NotSupportedException e) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_NONSUPPORT_HMS_TABLE,
                         table.getName(),
                         ((HMSExternalTable) table).getDbName(),
-                        tableName.getCtl());
+                        tableName.getCtl(),
+                        e.getMessage());
             }
             if (Config.enable_query_hive_views) {
                 if (((HMSExternalTable) table).isView()
@@ -845,6 +862,13 @@ public class Analyzer {
                     View hmsView = new View(table.getId(), table.getName(), table.getFullSchema());
                     hmsView.setInlineViewDefWithSqlMode(((HMSExternalTable) table).getViewText(),
                             ConnectContext.get().getSessionVariable().getSqlMode());
+                    // for user experience consideration, parse hive view ddl first to avoid NPE
+                    // if legacy parser can not parse hive view ddl properly
+                    try {
+                        hmsView.init();
+                    } catch (UserException e) {
+                        throw new AnalysisException(e.getMessage(), e);
+                    }
                     InlineViewRef inlineViewRef = new InlineViewRef(hmsView, tableRef);
                     if (StringUtils.isNotEmpty(tableName.getCtl())) {
                         inlineViewRef.setExternalCtl(tableName.getCtl());
@@ -921,7 +945,8 @@ public class Analyzer {
      * @param colName
      * @throws AnalysisException
      */
-    public SlotDescriptor registerColumnRef(TableName tblName, String colName) throws AnalysisException {
+    public SlotDescriptor registerColumnRef(TableName tblName, String colName, List<String> subColNames)
+                throws AnalysisException {
         TupleDescriptor d;
         TableName newTblName = tblName;
         if (newTblName == null) {
@@ -1003,11 +1028,64 @@ public class Analyzer {
                                                 newTblName == null ? d.getTable().getName() : newTblName.toString());
         }
 
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("register column ref table {}, colName {}, col {}", tblName, colName, col.toSql());
+        }
+        if (col.getType().isVariantType() || (subColNames != null && !subColNames.isEmpty())) {
+            if (getContext() != null && !getContext().getSessionVariable().enableVariantAccessInOriginalPlanner
+                    && (subColNames != null && !subColNames.isEmpty())) {
+                ErrorReport.reportAnalysisException("Variant sub-column access is disabled in original planner,"
+                        + "set enable_variant_access_in_original_planner = true in session variable");
+            }
+            if (!col.getType().isVariantType()) {
+                ErrorReport.reportAnalysisException(ErrorCode.ERR_ILLEGAL_COLUMN_REFERENCE_ERROR,
+                        Joiner.on(".").join(tblName.getTbl(), colName));
+            }
+            if (subColNames == null) {
+                // Root
+                subColNames = new ArrayList<String>();
+            }
+            String key = d.getAlias() + "." + col.getName();
+            if (subColumnSlotRefMap.get(key) == null) {
+                subColumnSlotRefMap.put(key, Maps.newTreeMap(
+                    new Comparator<List<String>>() {
+                        public int compare(List<String> lst1, List<String> lst2) {
+                            Iterator<String> it1 = lst1.iterator();
+                            Iterator<String> it2 = lst2.iterator();
+                            while (it1.hasNext() && it2.hasNext()) {
+                                int result = it1.next().compareTo(it2.next());
+                                if (result != 0) {
+                                    return result;
+                                }
+                            }
+                            return Integer.compare(lst1.size(), lst2.size());
+                        }
+                    }));
+            }
+            SlotDescriptor result = subColumnSlotRefMap.get(key).get(subColNames);
+            if (result != null) {
+                // avoid duplicate slots
+                return result;
+            }
+            result = globalState.descTbl.addSlotDescriptor(d);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("register slot descriptor {}", result);
+            }
+            result.setSubColLables(subColNames);
+            result.setColumn(col);
+            if (!subColNames.isEmpty()) {
+                result.setMaterializedColumnName(col.getName() + "." + String.join(".", subColNames));
+            }
+            result.setIsMaterialized(true);
+            result.setIsNullable(col.isAllowNull());
+            subColumnSlotRefMap.get(key).put(subColNames, result);
+            return result;
+        }
+
         // Make column name case insensitive
         String key = d.getAlias() + "." + col.getName();
         SlotDescriptor result = slotRefMap.get(key);
         if (result != null) {
-            result.setMultiRef(true);
             return result;
         }
         result = globalState.descTbl.addSlotDescriptor(d);
@@ -1031,7 +1109,6 @@ public class Analyzer {
         String key = colName;
         SlotDescriptor result = slotRefMap.get(key);
         if (result != null) {
-            result.setMultiRef(true);
             return result;
         }
         result = addSlotDescriptor(tupleDescriptor);
@@ -1109,6 +1186,7 @@ public class Analyzer {
         result.setStats(srcSlotDesc.getStats());
         result.setType(srcSlotDesc.getType());
         result.setIsNullable(srcSlotDesc.getIsNullable());
+        result.setSubColLables(srcSlotDesc.getSubColLables());
         if (srcSlotDesc.getColumn() != null) {
             result.setColumn(srcSlotDesc.getColumn());
         }
@@ -1275,6 +1353,14 @@ public class Analyzer {
     public void registerConjuncts(Expr e, boolean fromHavingClause, List<TupleId> ids) throws AnalysisException {
         for (Expr conjunct : e.getConjuncts()) {
             registerConjunct(conjunct);
+            if (!conjunct.isConstant()) {
+                ArrayList<TupleId> tupleIds = Lists.newArrayList();
+                ArrayList<SlotId> slotIds = Lists.newArrayList();
+                conjunct.getIds(tupleIds, slotIds);
+                if (tupleIds.isEmpty() && slotIds.isEmpty()) {
+                    conjunct.setBoundTupleIds(ids);
+                }
+            }
             if (ids != null) {
                 for (TupleId id : ids) {
                     registerConstantConjunct(id, conjunct);
@@ -2155,7 +2241,8 @@ public class Analyzer {
         if (lastCompatibleType == null) {
             newCompatibleType = expr.getType();
         } else {
-            newCompatibleType = Type.getAssignmentCompatibleType(lastCompatibleType, expr.getType(), false);
+            newCompatibleType = Type.getAssignmentCompatibleType(
+                lastCompatibleType, expr.getType(), false, SessionVariable.getEnableDecimal256());
         }
         if (!newCompatibleType.isValid()) {
             throw new AnalysisException(String.format(
@@ -2177,15 +2264,16 @@ public class Analyzer {
         Type compatibleType = exprs.get(0).getType();
         for (int i = 1; i < exprs.size(); ++i) {
             exprs.get(i).analyze(this);
+            boolean enableDecimal256 = SessionVariable.getEnableDecimal256();
             if (compatibleType.isDateV2() && exprs.get(i) instanceof StringLiteral
                     && ((StringLiteral) exprs.get(i)).canConvertToDateType(compatibleType)) {
                 // If string literal can be converted to dateV2, we use datev2 as the compatible type
                 // instead of datetimev2.
             } else if (exprs.get(i).isConstantImpl()) {
                 exprs.get(i).compactForLiteral(compatibleType);
-                compatibleType = Type.getCmpType(compatibleType, exprs.get(i).getType());
+                compatibleType = Type.getCmpType(compatibleType, exprs.get(i).getType(), enableDecimal256);
             } else {
-                compatibleType = Type.getCmpType(compatibleType, exprs.get(i).getType());
+                compatibleType = Type.getCmpType(compatibleType, exprs.get(i).getType(), enableDecimal256);
             }
         }
         if (compatibleType.equals(Type.VARCHAR)) {
@@ -2230,6 +2318,9 @@ public class Analyzer {
                         lastCompatibleExpr, exprLists.get(j).get(i));
                 lastCompatibleExpr = exprLists.get(j).get(i);
             }
+            if (compatibleType.isDecimalV3()) {
+                compatibleType = adjustDecimalV3PrecisionAndScale((ScalarType) compatibleType);
+            }
             // Now that we've found a compatible type, add implicit casts if necessary.
             for (int j = 0; j < exprLists.size(); ++j) {
                 if (!exprLists.get(j).get(i).getType().equals(compatibleType)) {
@@ -2238,6 +2329,21 @@ public class Analyzer {
                 }
             }
         }
+    }
+
+    private ScalarType adjustDecimalV3PrecisionAndScale(ScalarType decimalV3Type) {
+        ScalarType resultType = decimalV3Type;
+        int oldPrecision = decimalV3Type.getPrecision();
+        int oldScale = decimalV3Type.getDecimalDigits();
+        int integerPart = oldPrecision - oldScale;
+        int maxPrecision =
+                SessionVariable.getEnableDecimal256() ? ScalarType.MAX_DECIMAL256_PRECISION
+                        : ScalarType.MAX_DECIMAL128_PRECISION;
+        if (oldPrecision > maxPrecision) {
+            int newScale = maxPrecision - integerPart;
+            resultType = ScalarType.createDecimalType(maxPrecision, newScale < 0 ? 0 : newScale);
+        }
+        return resultType;
     }
 
     public long getConnectId() {
@@ -2250,10 +2356,6 @@ public class Analyzer {
 
     public String getDefaultDb() {
         return globalState.context.getDatabase();
-    }
-
-    public String getClusterName() {
-        return globalState.context.getClusterName();
     }
 
     public String getQualifiedUser() {
@@ -2286,19 +2388,14 @@ public class Analyzer {
         return globalState.context;
     }
 
-    public String getSchemaWild() {
-        return schemaWild;
-    }
-
     public TQueryGlobals getQueryGlobals() {
         return new TQueryGlobals();
     }
 
     // for Schema Table Schema like SHOW TABLES LIKE "abc%"
-    public void setSchemaInfo(String db, String table, String wild, String catalog) {
+    public void setSchemaInfo(String db, String table, String catalog) {
         schemaDb = db;
         schemaTable = table;
-        schemaWild = wild;
         schemaCatalog = catalog;
     }
 

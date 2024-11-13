@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.Slot;
@@ -139,5 +140,33 @@ public class LogicalLimit<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_TY
     public LogicalLimit<Plan> withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1);
         return new LogicalLimit<>(limit, offset, phase, children.get(0));
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        if (getLimit() == 1) {
+            getOutput().forEach(builder::addUniqueSlot);
+        } else {
+            builder.addUniqueSlot(child(0).getLogicalProperties().getTrait());
+        }
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        if (getLimit() == 1) {
+            getOutput().forEach(builder::addUniformSlot);
+        } else {
+            builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+        }
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

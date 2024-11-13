@@ -94,7 +94,10 @@ enum TPrimitiveType {
   UNSUPPORTED,
   VARIANT,
   LAMBDA_FUNCTION,
-  AGG_STATE
+  AGG_STATE,
+  DECIMAL256,
+  IPV4,
+  IPV6
 }
 
 enum TTypeNodeType {
@@ -111,7 +114,17 @@ enum TStorageBackendType {
     HDFS,
     JFS,
     LOCAL,
-    OFS
+    OFS,
+    AZURE
+}
+
+// Enumerates the storage formats for inverted indexes in src_backends.
+// This enum is used to distinguish between different organizational methods
+// of inverted index data, affecting how the index is stored and accessed.
+enum TInvertedIndexFileStorageFormat {
+    DEFAULT, // Default format, unspecified storage method.
+    V1,      // Index per idx: Each index is stored separately based on its identifier.
+    V2       // Segment id per idx: Indexes are organized based on segment identifiers, grouping indexes by their associated segment.
 }
 
 struct TScalarType {
@@ -164,6 +177,7 @@ struct TTypeDesc {
     4: optional list<TTypeDesc> sub_types
     5: optional bool result_is_nullable
     6: optional string function_name
+    7: optional i32 be_exec_version
 }
 
 enum TAggregationType {
@@ -219,7 +233,13 @@ enum TTaskType {
     PUSH_COOLDOWN_CONF,
     PUSH_STORAGE_POLICY,
     ALTER_INVERTED_INDEX,
-    GC_BINLOG
+    GC_BINLOG,
+    CLEAN_TRASH,
+    UPDATE_VISIBLE_VERSION,
+    CLEAN_UDF_CACHE,
+
+    // CLOUD
+    CALCULATE_DELETE_BITMAP = 1000
 }
 
 enum TStmtType {
@@ -375,6 +395,9 @@ struct TFunction {
   11: optional i64 id
   12: optional string checksum
   13: optional bool vectorized = false
+  14: optional bool is_udtf_function = false
+  15: optional bool is_static_load = false
+  16: optional i64 expiration_time //minutes
 }
 
 enum TJdbcOperation {
@@ -395,7 +418,9 @@ enum TOdbcTableType {
     PRESTO,
     OCEANBASE,
     OCEANBASE_ORACLE,
-    NEBULA
+    NEBULA, // Deprecated
+    DB2,
+    GBASE
 }
 
 struct TJdbcExecutorCtorParams {
@@ -421,6 +446,14 @@ struct TJdbcExecutorCtorParams {
   8: optional string driver_path
 
   9: optional TOdbcTableType table_type
+
+  10: optional i32 connection_pool_min_size
+  11: optional i32 connection_pool_max_size
+  12: optional i32 connection_pool_max_wait_time
+  13: optional i32 connection_pool_max_life_time
+  14: optional i32 connection_pool_cache_clear_time
+  15: optional bool connection_pool_keep_alive
+  16: optional i64 catalog_id
 }
 
 struct TJavaUdfExecutorCtorParams {
@@ -600,6 +633,8 @@ enum TTableType {
     JDBC_TABLE,
     TEST_EXTERNAL_TABLE,
     MAX_COMPUTE_TABLE,
+    LAKESOUL_TABLE,
+    TRINO_CONNECTOR_TABLE
 }
 
 enum TKeysType {
@@ -618,6 +653,9 @@ struct TBackend {
     1: required string host
     2: required TPort be_port
     3: required TPort http_port
+    4: optional TPort brpc_port
+    5: optional bool is_alive
+    6: optional i64 id
 }
 
 struct TReplicaInfo {
@@ -680,6 +718,12 @@ enum TMergeType {
   DELETE
 }
 
+enum TUniqueKeyUpdateMode {
+  UPSERT,
+  UPDATE_FIXED_COLUMNS,
+  UPDATE_FLEXIBLE_COLUMNS
+}
+
 enum TSortType {
     LEXICAL,
     ZORDER,
@@ -688,11 +732,15 @@ enum TSortType {
 enum TMetadataType {
   ICEBERG,
   BACKENDS,
-  WORKLOAD_GROUPS,
   FRONTENDS,
   CATALOGS,
   FRONTENDS_DISKS,
-  QUERIES,
+  MATERIALIZED_VIEWS,
+  JOBS,
+  TASKS,
+  WORKLOAD_SCHED_POLICY,
+  PARTITIONS,
+  PARTITION_VALUES;
 }
 
 enum TIcebergQueryType {

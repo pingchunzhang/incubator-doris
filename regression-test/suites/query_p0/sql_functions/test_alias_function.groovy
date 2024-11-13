@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite('test_alias_function') {
+suite('test_alias_function', "arrow_flight_sql") {
     sql '''
         CREATE ALIAS FUNCTION IF NOT EXISTS f1(DATETIMEV2(3), INT)
             with PARAMETER (datetime1, int1) as date_trunc(days_sub(datetime1, int1), 'day')'''
@@ -31,8 +31,6 @@ suite('test_alias_function') {
         result([['20230327:01']])
     }
 
-    sql "set enable_nereids_planner=false"
-
     sql '''
         DROP FUNCTION IF EXISTS legacy_f4()
     '''
@@ -40,12 +38,6 @@ suite('test_alias_function') {
     sql '''
         CREATE ALIAS FUNCTION legacy_f4() WITH PARAMETER() AS now()
     '''
-
-    sql '''
-        SELECT legacy_f4(), now()
-    '''
-
-    sql "set enable_nereids_planner=true"
 
     sql '''
         SELECT legacy_f4(), now()

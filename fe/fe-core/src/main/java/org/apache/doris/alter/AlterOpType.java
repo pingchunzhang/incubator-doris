@@ -70,5 +70,4 @@ public enum AlterOpType {
     public boolean needCheckCapacity() {
         return this == ADD_ROLLUP || this == SCHEMA_CHANGE || this == ADD_PARTITION || this == ENABLE_FEATURE;
     }
-
 }

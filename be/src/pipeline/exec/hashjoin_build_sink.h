@@ -17,61 +17,30 @@
 
 #pragma once
 
-#include <stdint.h>
-
+#include "exprs/runtime_filter_slots.h"
 #include "join_build_sink_operator.h"
 #include "operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/join/vhash_join_node.h"
 
-namespace doris {
-class ExecNode;
-
-namespace pipeline {
-
-class HashJoinBuildSinkBuilder final : public OperatorBuilder<vectorized::HashJoinNode> {
-public:
-    HashJoinBuildSinkBuilder(int32_t, ExecNode*);
-
-    OperatorPtr build_operator() override;
-    bool is_sink() const override { return true; }
-};
-
-class HashJoinBuildSink final : public StreamingOperator<HashJoinBuildSinkBuilder> {
-public:
-    HashJoinBuildSink(OperatorBuilderBase* operator_builder, ExecNode* node);
-    bool can_write() override { return _node->can_sink_write(); }
-    bool is_pending_finish() const override { return !_node->ready_for_finish(); }
-};
-
+namespace doris::pipeline {
+#include "common/compile_check_begin.h"
 class HashJoinBuildSinkOperatorX;
 
-class SharedHashTableDependency : public WriteDependency {
-public:
-    ENABLE_FACTORY_CREATOR(SharedHashTableDependency);
-    SharedHashTableDependency(int id) : WriteDependency(id, "SharedHashTableDependency") {}
-    ~SharedHashTableDependency() override = default;
-
-    void* shared_state() override { return nullptr; }
-};
-
 class HashJoinBuildSinkLocalState final
-        : public JoinBuildSinkLocalState<HashJoinDependency, HashJoinBuildSinkLocalState> {
+        : public JoinBuildSinkLocalState<HashJoinSharedState, HashJoinBuildSinkLocalState> {
 public:
     ENABLE_FACTORY_CREATOR(HashJoinBuildSinkLocalState);
+    using Base = JoinBuildSinkLocalState<HashJoinSharedState, HashJoinBuildSinkLocalState>;
     using Parent = HashJoinBuildSinkOperatorX;
     HashJoinBuildSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state);
-    ~HashJoinBuildSinkLocalState() = default;
+    ~HashJoinBuildSinkLocalState() override = default;
 
     Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
     Status open(RuntimeState* state) override;
-    Status process_build_block(RuntimeState* state, vectorized::Block& block, uint8_t offset);
+    Status process_build_block(RuntimeState* state, vectorized::Block& block);
 
     void init_short_circuit_for_probe();
-    HashJoinBuildSinkOperatorX* join_build() { return (HashJoinBuildSinkOperatorX*)_parent; }
 
     bool build_unique() const;
-    std::vector<TRuntimeFilterDesc>& runtime_filter_descs() const;
     std::shared_ptr<vectorized::Arena> arena() { return _shared_state->arena; }
 
     void add_hash_buckets_info(const std::string& info) const {
@@ -81,57 +50,63 @@ public:
         _profile->add_info_string("HashTableFilledBuckets", info);
     }
 
+    Dependency* finishdependency() override { return _finish_dependency.get(); }
+
+    Status close(RuntimeState* state, Status exec_status) override;
+
 protected:
-    void _hash_table_init(RuntimeState* state);
-    void _set_build_ignore_flag(vectorized::Block& block, const std::vector<int>& res_col_ids);
+    Status _hash_table_init(RuntimeState* state);
+    void _set_build_side_has_external_nullmap(vectorized::Block& block,
+                                              const std::vector<int>& res_col_ids);
+    Status _do_evaluate(vectorized::Block& block, vectorized::VExprContextSPtrs& exprs,
+                        RuntimeProfile::Counter& expr_call_timer, std::vector<int>& res_col_ids);
+    std::vector<uint16_t> _convert_block_to_null(vectorized::Block& block);
+    Status _extract_join_column(vectorized::Block& block,
+                                vectorized::ColumnUInt8::MutablePtr& null_map,
+                                vectorized::ColumnRawPtrs& raw_ptrs,
+                                const std::vector<int>& res_col_ids);
     friend class HashJoinBuildSinkOperatorX;
-    template <class HashTableContext, typename Parent>
-    friend struct vectorized::ProcessHashTableBuild;
-    friend struct vectorized::ProcessRuntimeFilterBuild;
+    friend class PartitionedHashJoinSinkLocalState;
+    template <class HashTableContext>
+    friend struct ProcessHashTableBuild;
 
     // build expr
     vectorized::VExprContextSPtrs _build_expr_ctxs;
+    std::vector<vectorized::ColumnPtr> _key_columns_holder;
 
-    std::vector<IRuntimeFilter*> _runtime_filters;
     bool _should_build_hash_table = true;
-    uint8_t _build_block_idx = 0;
-    int64_t _build_side_mem_used = 0;
-    int64_t _build_side_last_mem_used = 0;
+
+    size_t _build_side_rows = 0;
+
     vectorized::MutableBlock _build_side_mutable_block;
-    std::shared_ptr<VRuntimeFilterSlots> _runtime_filter_slots = nullptr;
-    bool _has_set_need_null_map_for_build = false;
-    bool _build_side_ignore_null = false;
-    size_t _build_rf_cardinality = 0;
-    std::unordered_map<const vectorized::Block*, std::vector<int>> _inserted_rows;
-    std::shared_ptr<SharedHashTableDependency> _shared_hash_table_dependency;
+    std::shared_ptr<VRuntimeFilterSlots> _runtime_filter_slots;
 
-    RuntimeProfile::Counter* _build_table_timer;
-    RuntimeProfile::Counter* _build_expr_call_timer;
-    RuntimeProfile::Counter* _build_table_insert_timer;
-    RuntimeProfile::Counter* _build_table_expanse_timer;
-    RuntimeProfile::Counter* _build_table_convert_timer;
-    RuntimeProfile::Counter* _build_buckets_counter;
-    RuntimeProfile::Counter* _build_buckets_fill_counter;
+    /*
+     * The comparison result of a null value with any other value is null,
+     * which means that for most join(exclude: null aware join, null equal safe join),
+     * the result of an equality condition involving null should be false,
+     * so null does not need to be added to the hash table.
+     */
+    bool _build_side_has_external_nullmap = false;
+    std::vector<int> _build_col_ids;
+    std::shared_ptr<CountedFinishDependency> _finish_dependency;
 
-    RuntimeProfile::Counter* _build_side_compute_hash_timer;
-    RuntimeProfile::Counter* _build_side_merge_block_timer;
-    RuntimeProfile::Counter* _build_runtime_filter_timer;
+    RuntimeProfile::Counter* _build_table_timer = nullptr;
+    RuntimeProfile::Counter* _build_expr_call_timer = nullptr;
+    RuntimeProfile::Counter* _build_table_insert_timer = nullptr;
+    RuntimeProfile::Counter* _build_side_merge_block_timer = nullptr;
 
-    RuntimeProfile::Counter* _build_collisions_counter;
-
-    RuntimeProfile::Counter* _allocate_resource_timer;
-
-    RuntimeProfile::Counter* _memory_usage_counter;
-    RuntimeProfile::Counter* _build_blocks_memory_usage;
-    RuntimeProfile::Counter* _hash_table_memory_usage;
-    RuntimeProfile::HighWaterMarkCounter* _build_arena_memory_usage;
+    RuntimeProfile::Counter* _build_blocks_memory_usage = nullptr;
+    RuntimeProfile::Counter* _hash_table_memory_usage = nullptr;
+    RuntimeProfile::Counter* _build_arena_memory_usage = nullptr;
+    RuntimeProfile::Counter* _runtime_filter_init_timer = nullptr;
 };
 
 class HashJoinBuildSinkOperatorX final
         : public JoinBuildSinkOperatorX<HashJoinBuildSinkLocalState> {
 public:
-    HashJoinBuildSinkOperatorX(ObjectPool* pool, const TPlanNode& tnode,
-                               const DescriptorTbl& descs);
+    HashJoinBuildSinkOperatorX(ObjectPool* pool, int operator_id, const TPlanNode& tnode,
+                               const DescriptorTbl& descs, bool use_global_rf);
     Status init(const TDataSink& tsink) override {
         return Status::InternalError("{} should not init with TDataSink",
                                      JoinBuildSinkOperatorX<HashJoinBuildSinkLocalState>::_name);
@@ -139,40 +114,127 @@ public:
 
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
 
-    Status prepare(RuntimeState* state) override;
     Status open(RuntimeState* state) override;
 
-    Status sink(RuntimeState* state, vectorized::Block* in_block,
-                SourceState source_state) override;
-
-    WriteDependency* wait_for_dependency(RuntimeState* state) override {
-        CREATE_SINK_LOCAL_STATE_RETURN_NULL_IF_ERROR(local_state);
-        return local_state._shared_hash_table_dependency->write_blocked_by();
-    }
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override;
 
     bool should_dry_run(RuntimeState* state) override {
-        return _is_broadcast_join && !state->get_sink_local_state(id())
+        return _is_broadcast_join && !state->get_sink_local_state()
                                               ->cast<HashJoinBuildSinkLocalState>()
                                               ._should_build_hash_table;
+    }
+
+    DataDistribution required_data_distribution() const override {
+        if (_join_op == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN) {
+            return {ExchangeType::NOOP};
+        } else if (_is_broadcast_join) {
+            return _child->is_serial_operator() ? DataDistribution(ExchangeType::PASS_TO_ONE)
+                                                : DataDistribution(ExchangeType::NOOP);
+        }
+        return _join_distribution == TJoinDistributionType::BUCKET_SHUFFLE ||
+                               _join_distribution == TJoinDistributionType::COLOCATE
+                       ? DataDistribution(ExchangeType::BUCKET_HASH_SHUFFLE, _partition_exprs)
+                       : DataDistribution(ExchangeType::HASH_SHUFFLE, _partition_exprs);
+    }
+
+    bool is_shuffled_operator() const override {
+        return _join_distribution == TJoinDistributionType::PARTITIONED;
+    }
+    bool require_data_distribution() const override {
+        return _join_distribution != TJoinDistributionType::BROADCAST &&
+               _join_distribution != TJoinDistributionType::NONE;
     }
 
 private:
     friend class HashJoinBuildSinkLocalState;
 
+    const TJoinDistributionType::type _join_distribution;
     // build expr
     vectorized::VExprContextSPtrs _build_expr_ctxs;
     // mark the build hash table whether it needs to store null value
-    std::vector<bool> _store_null_in_hash_table;
+    std::vector<bool> _serialize_null_into_key;
 
     // mark the join column whether support null eq
     std::vector<bool> _is_null_safe_eq_join;
 
     bool _is_broadcast_join = false;
-    std::shared_ptr<vectorized::SharedHashTableController> _shared_hashtable_controller = nullptr;
+    std::shared_ptr<vectorized::SharedHashTableController> _shared_hashtable_controller;
 
     vectorized::SharedHashTableContextPtr _shared_hash_table_context = nullptr;
-    std::vector<TRuntimeFilterDesc> _runtime_filter_descs;
+    const std::vector<TExpr> _partition_exprs;
+
+    const bool _need_local_merge;
+
+    std::vector<SlotId> _hash_output_slot_ids;
+    std::vector<bool> _should_keep_column_flags;
+    bool _should_keep_hash_key_column = false;
 };
 
-} // namespace pipeline
-} // namespace doris
+template <class HashTableContext>
+struct ProcessHashTableBuild {
+    ProcessHashTableBuild(size_t rows, vectorized::ColumnRawPtrs& build_raw_ptrs,
+                          HashJoinBuildSinkLocalState* parent, int batch_size, RuntimeState* state)
+            : _rows(rows),
+              _build_raw_ptrs(build_raw_ptrs),
+              _parent(parent),
+              _batch_size(batch_size),
+              _state(state) {}
+
+    template <int JoinOpType, bool short_circuit_for_null, bool with_other_conjuncts>
+    Status run(HashTableContext& hash_table_ctx, vectorized::ConstNullMapPtr null_map,
+               bool* has_null_key) {
+        if (null_map) {
+            // first row is mocked and is null
+            // TODO: Need to test the for loop. break may better
+            for (uint32_t i = 1; i < _rows; i++) {
+                if ((*null_map)[i]) {
+                    *has_null_key = true;
+                }
+            }
+            if (short_circuit_for_null && *has_null_key) {
+                return Status::OK();
+            }
+        }
+
+        SCOPED_TIMER(_parent->_build_table_insert_timer);
+        hash_table_ctx.hash_table->template prepare_build<JoinOpType>(_rows, _batch_size,
+                                                                      *has_null_key);
+
+        hash_table_ctx.init_serialized_keys(_build_raw_ptrs, _rows,
+                                            null_map ? null_map->data() : nullptr, true, true,
+                                            hash_table_ctx.hash_table->get_bucket_size());
+        // only 2 cases need to access the null value in hash table
+        bool keep_null_key = false;
+        if ((JoinOpType == TJoinOp::NULL_AWARE_LEFT_ANTI_JOIN ||
+             JoinOpType == TJoinOp::NULL_AWARE_LEFT_SEMI_JOIN) &&
+            with_other_conjuncts) {
+            //null aware join with other conjuncts
+            keep_null_key = true;
+        } else if (_parent->_shared_state->is_null_safe_eq_join.size() == 1 &&
+                   _parent->_shared_state->is_null_safe_eq_join[0]) {
+            // single null safe eq
+            keep_null_key = true;
+        }
+
+        hash_table_ctx.hash_table->build(hash_table_ctx.keys, hash_table_ctx.bucket_nums.data(),
+                                         _rows, keep_null_key);
+        hash_table_ctx.bucket_nums.resize(_batch_size);
+        hash_table_ctx.bucket_nums.shrink_to_fit();
+
+        COUNTER_SET(_parent->_hash_table_memory_usage,
+                    (int64_t)hash_table_ctx.hash_table->get_byte_size());
+        COUNTER_SET(_parent->_build_arena_memory_usage,
+                    (int64_t)hash_table_ctx.serialized_keys_size(true));
+        return Status::OK();
+    }
+
+private:
+    const size_t _rows;
+    vectorized::ColumnRawPtrs& _build_raw_ptrs;
+    HashJoinBuildSinkLocalState* _parent = nullptr;
+    int _batch_size;
+    RuntimeState* _state = nullptr;
+};
+
+} // namespace doris::pipeline
+#include "common/compile_check_end.h"

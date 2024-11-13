@@ -16,19 +16,26 @@
 // under the License.
 
 suite("test_transactional_hive", "p0,external,hive,external_docker,external_docker_hive") {
+    String skip_checking_acid_version_file = "false"
+
     def q01 = {
+        sql """set skip_checking_acid_version_file=${skip_checking_acid_version_file}"""
         qt_q01 """
         select * from orc_full_acid order by id;
         """
         qt_q02 """
         select value from orc_full_acid order by id;
         """
-        qt_q03 """
-        select * from orc_full_acid where value = 'CC' order by id;
+        qt_q04 """
+        select * from orc_full_acid_empty;
+        """
+        qt_q05 """
+        select count(*) from orc_full_acid_empty;
         """
     }
 
     def q01_par = {
+        sql """set skip_checking_acid_version_file=${skip_checking_acid_version_file}"""
         qt_q01 """
         select * from orc_full_acid_par order by id;
         """
@@ -38,12 +45,23 @@ suite("test_transactional_hive", "p0,external,hive,external_docker,external_dock
         qt_q03 """
         select * from orc_full_acid_par where value = 'BB' order by id;
         """
+        qt_q04 """
+        select * from orc_full_acid_par_empty;
+        """
+        qt_q05 """
+        select count(*) from orc_full_acid_par_empty;
+        """
     }
     String enabled = context.config.otherConfigs.get("enableHiveTest")
-    if (enabled != null && enabled.equalsIgnoreCase("true")) {
+    if (enabled == null || !enabled.equalsIgnoreCase("true")) {
+        logger.info("diable Hive test.")
+        return;
+    }
+
+    for (String hivePrefix : ["hive3"]) {
         try {
-            String hms_port = context.config.otherConfigs.get("hms_port")
-            String catalog_name = "test_transactional_hive"
+            String hms_port = context.config.otherConfigs.get(hivePrefix + "HmsPort")
+            String catalog_name = "test_transactional_${hivePrefix}"
             String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
 
             sql """drop catalog if exists ${catalog_name}"""
@@ -53,6 +71,11 @@ suite("test_transactional_hive", "p0,external,hive,external_docker,external_dock
             );"""
             sql """use `${catalog_name}`.`default`"""
 
+            skip_checking_acid_version_file = "false"
+            q01()
+            q01_par()
+
+            skip_checking_acid_version_file = "true"
             q01()
             q01_par()
 

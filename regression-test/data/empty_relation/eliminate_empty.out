@@ -9,7 +9,7 @@ PhysicalResultSink
 
 -- !explain_union_empty_data --
 PhysicalResultSink
---PhysicalDistribute
+--PhysicalDistribute[DistributionSpecGather]
 ----hashAgg[LOCAL]
 ------PhysicalProject
 --------PhysicalOlapScan[nation]
@@ -36,7 +36,7 @@ PhysicalResultSink
 
 -- !explain_except_data_empty --
 PhysicalResultSink
---PhysicalDistribute
+--PhysicalDistribute[DistributionSpecGather]
 ----PhysicalProject
 ------hashAgg[LOCAL]
 --------PhysicalProject
@@ -44,12 +44,12 @@ PhysicalResultSink
 
 -- !explain_except_data_empty_data --
 PhysicalResultSink
---PhysicalDistribute
+--PhysicalDistribute[DistributionSpecGather]
 ----PhysicalExcept
-------PhysicalDistribute
+------PhysicalDistribute[DistributionSpecHash]
 --------PhysicalProject
 ----------PhysicalOlapScan[nation]
-------PhysicalDistribute
+------PhysicalDistribute[DistributionSpecHash]
 --------PhysicalProject
 ----------filter(( not (n_nationkey = 1)))
 ------------PhysicalOlapScan[nation]
@@ -69,4 +69,84 @@ PhysicalResultSink
 1
 
 -- !except_empty_data --
+
+-- !null_join --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !null_explain_union_empty_data --
+PhysicalResultSink
+--PhysicalDistribute[DistributionSpecGather]
+----hashAgg[LOCAL]
+------PhysicalProject
+--------PhysicalOlapScan[nation]
+
+-- !null_union_empty_data --
+1
+
+-- !null_explain_union_empty_empty --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !null_union_empty_empty --
+
+-- !null_union_emtpy_onerow --
+10
+
+-- !null_explain_intersect_data_empty --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !null_explain_intersect_empty_data --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !null_explain_except_data_empty --
+PhysicalResultSink
+--PhysicalDistribute[DistributionSpecGather]
+----PhysicalProject
+------hashAgg[LOCAL]
+--------PhysicalProject
+----------PhysicalOlapScan[nation]
+
+-- !null_explain_except_data_empty_data --
+PhysicalResultSink
+--PhysicalDistribute[DistributionSpecGather]
+----PhysicalExcept
+------PhysicalDistribute[DistributionSpecHash]
+--------PhysicalProject
+----------PhysicalOlapScan[nation]
+------PhysicalDistribute[DistributionSpecHash]
+--------PhysicalProject
+----------filter(( not (n_nationkey = 1)))
+------------PhysicalOlapScan[nation]
+
+-- !null_except_data_empty_data --
+1
+
+-- !null_explain_except_empty_data --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !null_intersect_data_empty --
+
+-- !null_intersect_empty_data --
+
+-- !null_except_data_empty --
+1
+
+-- !null_except_empty_data --
+
+-- !prune_partition1 --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !prune_partition2 --
+PhysicalResultSink
+--PhysicalEmptyRelation
+
+-- !join_with_empty_child --
+2	8	e	v	3
+4	7		at	2
+9	3		q	0
 

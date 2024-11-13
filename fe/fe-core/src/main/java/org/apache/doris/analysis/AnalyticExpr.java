@@ -30,6 +30,7 @@ import org.apache.doris.catalog.Type;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.TreeNode;
 import org.apache.doris.nereids.util.Utils;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.thrift.TExprNode;
 
 import com.google.common.base.Joiner;
@@ -43,6 +44,7 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 
 /**
  * Representation of an analytic function call with OVER clause.
@@ -146,8 +148,11 @@ public class AnalyticExpr extends Expr {
     }
 
     @Override
-    protected String getExprName() {
-        return Utils.normalizeName(getFnCall().getExprName(), DEFAULT_EXPR_NAME);
+    public String getExprName() {
+        if (!this.exprName.isPresent()) {
+            this.exprName = Optional.of(Utils.normalizeName(getFnCall().getExprName(), DEFAULT_EXPR_NAME));
+        }
+        return this.exprName.get();
     }
 
     @Override
@@ -361,7 +366,8 @@ public class AnalyticExpr extends Expr {
         Expr rangeExpr = boundary.getExpr();
 
         if (!Type.isImplicitlyCastable(
-                    rangeExpr.getType(), orderByElements.get(0).getExpr().getType(), false)) {
+                    rangeExpr.getType(), orderByElements.get(0).getExpr().getType(), false,
+                    SessionVariable.getEnableDecimal256())) {
             throw new AnalysisException(
                 "The value expression of a PRECEDING/FOLLOWING clause of a RANGE window must "
                 + "be implicitly convertible to the ORDER BY expression's type: "
@@ -469,22 +475,8 @@ public class AnalyticExpr extends Expr {
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
         fnCall.analyze(analyzer);
         type = getFnCall().getType();
-
-        for (Expr e : partitionExprs) {
-            if (e.isLiteral()) {
-                throw new AnalysisException(
-                    "Expressions in the PARTITION BY clause must not be constant: "
-                    + e.toSql() + " (in " + toSql() + ")");
-            }
-        }
-
-        for (OrderByElement e : orderByElements) {
-            if (e.getExpr().isLiteral()) {
-                throw new AnalysisException(
-                    "Expressions in the ORDER BY clause must not be constant: "
-                            + e.getExpr().toSql() + " (in " + toSql() + ")");
-            }
-        }
+        partitionExprs.removeIf(expr -> expr.isConstant());
+        orderByElements.removeIf(expr -> expr.getExpr().isConstant());
 
         if (getFnCall().getParams().isDistinct()) {
             throw new AnalysisException(
@@ -567,6 +559,15 @@ public class AnalyticExpr extends Expr {
         standardize(analyzer);
 
         setChildren();
+
+        String functionName = fn.functionName();
+        if (functionName.equalsIgnoreCase("sum") || functionName.equalsIgnoreCase("max")
+                || functionName.equalsIgnoreCase("min") || functionName.equalsIgnoreCase("avg")) {
+            // sum, max, min and avg in window function should be always nullable
+            Function function = fnCall.fn.clone();
+            function.setNullableMode(Function.NullableMode.ALWAYS_NULLABLE);
+            fnCall.setFn(function);
+        }
     }
 
     /**
@@ -957,5 +958,10 @@ public class AnalyticExpr extends Expr {
             strings.add(expr.toDigest());
         }
         return Joiner.on(", ").join(strings);
+    }
+
+    @Override
+    public boolean supportSerializable() {
+        return false;
     }
 }

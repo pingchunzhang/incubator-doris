@@ -24,11 +24,8 @@
 #include "common/status.h"
 #include "operator.h"
 #include "pipeline/exec/scan_operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/scan/vscan_node.h"
 
 namespace doris {
-class ExecNode;
 
 namespace vectorized {
 class NewEsScanner;
@@ -48,30 +45,39 @@ public:
 private:
     friend class vectorized::NewEsScanner;
 
-    void set_scan_ranges(const std::vector<TScanRangeParams>& scan_ranges) override;
+    void set_scan_ranges(RuntimeState* state,
+                         const std::vector<TScanRangeParams>& scan_ranges) override;
     Status _init_profile() override;
-    Status _process_conjuncts() override;
+    Status _process_conjuncts(RuntimeState* state) override;
     Status _init_scanners(std::list<vectorized::VScannerSPtr>* scanners) override;
 
     std::vector<std::unique_ptr<TEsScanRange>> _scan_ranges;
-    std::unique_ptr<RuntimeProfile> _es_profile;
-    RuntimeProfile::Counter* _rows_read_counter;
-    RuntimeProfile::Counter* _read_timer;
-    RuntimeProfile::Counter* _materialize_timer;
+    // FIXME: non-static data member '_rows_read_counter' of 'EsScanLocalState' shadows member inherited from type 'ScanLocalStateBase'
+#ifdef __clang__
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wshadow-field"
+#endif
+    RuntimeProfile::Counter* _blocks_read_counter = nullptr;
+#ifdef __clang__
+#pragma clang diagnostic pop
+#endif
+    RuntimeProfile::Counter* _read_timer = nullptr;
+    RuntimeProfile::Counter* _materialize_timer = nullptr;
 };
 
 class EsScanOperatorX final : public ScanOperatorX<EsScanLocalState> {
 public:
-    EsScanOperatorX(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+    EsScanOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                    const DescriptorTbl& descs, int parallel_tasks);
 
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
-    Status prepare(RuntimeState* state) override;
+    Status open(RuntimeState* state) override;
 
 private:
     friend class EsScanLocalState;
 
     TupleId _tuple_id;
-    TupleDescriptor* _tuple_desc;
+    TupleDescriptor* _tuple_desc = nullptr;
 
     std::map<std::string, std::string> _properties;
     std::map<std::string, std::string> _fields_context;

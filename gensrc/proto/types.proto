@@ -112,6 +112,9 @@ message PGenericType {
         TIME = 35;
         AGG_STATE = 36;
         TIMEV2 = 37;
+        DECIMAL256 = 38;
+        IPV4 = 39;
+        IPV6 = 40;
         UNKNOWN = 999;
     }
     required TypeId id = 2;
@@ -185,6 +188,8 @@ message PValues {
     repeated string string_value = 11;
     repeated bytes bytes_value = 12;
     repeated PDateTime datetime_value = 13;
+    repeated PValues child_element = 14;
+    repeated int64 child_offset = 15;
 }
 
 // this mesage may not used for now
@@ -230,4 +235,9 @@ enum PPlanFragmentCancelReason {
     TIMEOUT = 4;
     CALL_RPC_ERROR = 5;
     MEMORY_LIMIT_EXCEED = 6;
+}
+
+message PNetworkAddress {
+    required string hostname = 1;
+    required int32 port = 2;
 }

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite("test_sql_block_rule") {
+suite("test_sql_block_rule", "nonConcurrent") {
 
     sql """
         DROP SQL_BLOCK_RULE if exists test_rule_partition
@@ -63,6 +63,22 @@ suite("test_sql_block_rule") {
 
     test {
         sql("INSERT INTO table_2 SELECT * FROM table_2", false)
+        exception "sql match regex sql block rule: test_rule_sql"
+    }
+
+    sql """
+        ALTER SQL_BLOCK_RULE test_rule_sql PROPERTIES("enable"="false")
+        """
+
+    sql "SELECT * FROM table_2"
+
+    sql """
+        ALTER SQL_BLOCK_RULE test_rule_sql
+        PROPERTIES("sql"="SELECT abcd FROM table_2", "global"= "true", "enable"= "true")
+    """
+
+    test {
+        sql("SELECT abcd FROM table_2", false)
         exception "sql match regex sql block rule: test_rule_sql"
     }
 
@@ -200,5 +216,36 @@ suite("test_sql_block_rule") {
         """
     }
 
+    sql """
+        CREATE SQL_BLOCK_RULE if not exists test_rule_create_view PROPERTIES ( "sql"="create view", "global" = "true",
+        "enable"="true");
+    """
+    try {
+        test {
+            sql("""create view table_test_rule_create_view as select 1 """, false)
+            exception """sql match regex sql block rule: test_rule_create_view"""
+        }
+    } finally {
+        sql """
+            drop SQL_BLOCK_RULE if exists test_rule_create_view;
+        """
+    }
+
+    sql """
+        CREATE SQL_BLOCK_RULE if not exists test_rule_alter_view PROPERTIES ( "sql"="alter view", "global" = "true",
+        "enable"="true");
+    """
+    sql """ drop view if exists table_test_rule_alter_view """
+    sql "create view table_test_rule_alter_view as select 2"
+    try {
+        test {
+            sql("""alter view table_test_rule_alter_view as select 1""", false)
+            exception """sql match regex sql block rule: test_rule_alter_view"""
+        }
+    } finally {
+        sql """
+            drop SQL_BLOCK_RULE if exists test_rule_alter_view;
+        """
+    }
 
 }

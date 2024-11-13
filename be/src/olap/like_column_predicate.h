@@ -62,8 +62,9 @@ public:
         return Status::OK();
     }
 
-    uint16_t evaluate(const vectorized::IColumn& column, uint16_t* sel,
-                      uint16_t size) const override;
+    bool can_do_apply_safely(PrimitiveType input_type, bool is_null) const override {
+        return input_type == T || (is_string_type(input_type) && is_string_type(T));
+    }
 
     void evaluate_and_vec(const vectorized::IColumn& column, uint16_t size,
                           bool* flags) const override;
@@ -87,6 +88,9 @@ public:
     bool can_do_bloom_filter(bool ngram) const override { return ngram; }
 
 private:
+    uint16_t _evaluate_inner(const vectorized::IColumn& column, uint16_t* sel,
+                             uint16_t size) const override;
+
     template <bool is_and>
     void _evaluate_vec(const vectorized::IColumn& column, uint16_t size, bool* flags) const {
         if (column.is_nullable()) {
@@ -125,6 +129,7 @@ private:
                 }
             } else {
                 LOG(FATAL) << "vectorized (not) like predicates should be dict column";
+                __builtin_unreachable();
             }
         } else {
             if (column.is_column_dictionary()) {
@@ -149,6 +154,7 @@ private:
                 }
             } else {
                 LOG(FATAL) << "vectorized (not) like predicates should be dict column";
+                __builtin_unreachable();
             }
         }
     }
@@ -163,7 +169,7 @@ private:
     using StateType = vectorized::LikeState;
     StringRef pattern;
 
-    StateType* _state;
+    StateType* _state = nullptr;
 
     // A separate scratch region is required for every concurrent caller of the
     // Hyperscan API. So here _like_state is separate for each instance of

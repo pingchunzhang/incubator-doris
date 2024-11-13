@@ -20,16 +20,14 @@ package org.apache.doris.datasource.jdbc.client;
 import org.apache.doris.catalog.ArrayType;
 import org.apache.doris.catalog.ScalarType;
 import org.apache.doris.catalog.Type;
+import org.apache.doris.datasource.jdbc.util.JdbcFieldSchema;
+
+import java.util.Optional;
 
 public class JdbcClickHouseClient extends JdbcClient {
 
     protected JdbcClickHouseClient(JdbcClientConfig jdbcClientConfig) {
         super(jdbcClientConfig);
-    }
-
-    @Override
-    protected String getDatabaseQuery() {
-        return "SHOW DATABASES";
     }
 
     @Override
@@ -40,14 +38,16 @@ public class JdbcClickHouseClient extends JdbcClient {
     @Override
     protected Type jdbcTypeToDoris(JdbcFieldSchema fieldSchema) {
 
-        String ckType = fieldSchema.getDataTypeName();
+        String ckType = fieldSchema.getDataTypeName().orElse("unknown");
 
         if (ckType.startsWith("LowCardinality")) {
+            fieldSchema.setAllowNull(true);
             ckType = ckType.substring(15, ckType.length() - 1);
             if (ckType.startsWith("Nullable")) {
                 ckType = ckType.substring(9, ckType.length() - 1);
             }
         } else if (ckType.startsWith("Nullable")) {
+            fieldSchema.setAllowNull(true);
             ckType = ckType.substring(9, ckType.length() - 1);
         }
 
@@ -58,38 +58,33 @@ public class JdbcClickHouseClient extends JdbcClient {
             return createDecimalOrStringType(precision, scale);
         }
 
-        if ("String".contains(ckType) || ckType.startsWith("Enum")
-                || ckType.startsWith("IPv") || "UUID".contains(ckType)
+        if ("String".contains(ckType)
+                || ckType.startsWith("Enum")
+                || ckType.startsWith("IPv")
+                || "UUID".contains(ckType)
                 || ckType.startsWith("FixedString")) {
             return ScalarType.createStringType();
         }
 
         if (ckType.startsWith("DateTime")) {
             // DateTime with second precision
-            if (ckType.equals("DateTime")) {
+            if (ckType.startsWith("DateTime(") || ckType.equals("DateTime")) {
                 return ScalarType.createDatetimeV2Type(0);
             } else {
-                // DateTime64 with [0~9] precision
-                int indexStart = ckType.indexOf('(');
-                int indexEnd = ckType.indexOf(')');
-                if (indexStart != -1 && indexEnd != -1) {
-                    String scaleStr = ckType.substring(indexStart + 1, indexEnd);
-                    int scale = Integer.parseInt(scaleStr);
-                    if (scale > 6) {
-                        scale = 6;
-                    }
-                    // return with the actual scale
-                    return ScalarType.createDatetimeV2Type(scale);
-                } else {
-                    // default precision if not specified
-                    return ScalarType.createDatetimeV2Type(JDBC_DATETIME_SCALE);
+                // DateTime64 with millisecond precision
+                // Datetime64(6) / DateTime64(6, 'Asia/Shanghai')
+                String[] accuracy = ckType.substring(11, ckType.length() - 1).split(", ");
+                int precision = Integer.parseInt(accuracy[0]);
+                if (precision > 6) {
+                    precision = JDBC_DATETIME_SCALE;
                 }
+                return ScalarType.createDatetimeV2Type(precision);
             }
         }
 
         if (ckType.startsWith("Array")) {
             String cktype = ckType.substring(6, ckType.length() - 1);
-            fieldSchema.setDataTypeName(cktype);
+            fieldSchema.setDataTypeName(Optional.of(cktype));
             Type type = jdbcTypeToDoris(fieldSchema);
             return ArrayType.create(type, true);
         }

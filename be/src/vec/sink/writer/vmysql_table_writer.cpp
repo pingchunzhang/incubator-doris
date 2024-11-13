@@ -25,7 +25,6 @@
 #include <memory>
 #include <sstream>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "runtime/decimalv2_value.h"
 #include "runtime/define_primitive_type.h"
@@ -62,8 +61,10 @@ std::string MysqlConnInfo::debug_string() const {
 }
 
 VMysqlTableWriter::VMysqlTableWriter(const TDataSink& t_sink,
-                                     const VExprContextSPtrs& output_expr_ctxs)
-        : AsyncResultWriter(output_expr_ctxs) {
+                                     const VExprContextSPtrs& output_expr_ctxs,
+                                     std::shared_ptr<pipeline::Dependency> dep,
+                                     std::shared_ptr<pipeline::Dependency> fin_dep)
+        : AsyncResultWriter(output_expr_ctxs, dep, fin_dep) {
     const auto& t_mysql_sink = t_sink.mysql_table_sink;
     _conn_info.host = t_mysql_sink.host;
     _conn_info.port = t_mysql_sink.port;
@@ -110,7 +111,7 @@ Status VMysqlTableWriter::open(RuntimeState* state, RuntimeProfile* profile) {
     return Status::OK();
 }
 
-Status VMysqlTableWriter::append_block(vectorized::Block& block) {
+Status VMysqlTableWriter::write(RuntimeState* state, vectorized::Block& block) {
     Block output_block;
     RETURN_IF_ERROR(_projection_block(block, &output_block));
     auto num_rows = output_block.rows();
@@ -197,7 +198,7 @@ Status VMysqlTableWriter::_insert_row(vectorized::Block& block, size_t row) {
         case TYPE_DECIMALV2: {
             DecimalV2Value value =
                     (DecimalV2Value)
-                            assert_cast<const vectorized::ColumnDecimal<vectorized::Decimal128>&>(
+                            assert_cast<const vectorized::ColumnDecimal<vectorized::Decimal128V2>&>(
                                     *column)
                                     .get_data()[row];
             fmt::format_to(_insert_stmt_buffer, "{}", value.to_string());
@@ -205,7 +206,8 @@ Status VMysqlTableWriter::_insert_row(vectorized::Block& block, size_t row) {
         }
         case TYPE_DECIMAL32:
         case TYPE_DECIMAL64:
-        case TYPE_DECIMAL128I: {
+        case TYPE_DECIMAL128I:
+        case TYPE_DECIMAL256: {
             auto val = type_ptr->to_string(*column, row);
             fmt::format_to(_insert_stmt_buffer, "{}", val);
             break;

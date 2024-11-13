@@ -17,6 +17,7 @@
 use doris_test;
 
 Insert into dbo.student values (1, 'doris', 18), (2, 'alice', 19), (3, 'bob', 20);
+UPDATE STATISTICS dbo.student;
 
 Insert into dbo.test_int values
 (1, 0, 1, 1), (2, 1, -1, -1),
@@ -63,3 +64,39 @@ VALUES (
 INSERT INTO dbo.t_id (ID, Name) VALUES (NEWID(), 'Data 1');
 INSERT INTO dbo.t_id (ID, Name) VALUES (NEWID(), 'Data 2');
 
+Insert into dbo.all_type values
+(
+1,
+'doris',
+18,
+0,
+1,
+1,
+123.123,
+123.123,
+123.123,
+12345678901234567890123456789012345678,
+12345678901234567890123456789012345678,
+1234567890123456789012345678.0123456789,
+1234567890123456789012345678.0123456789,
+'Make Doris Great!',
+'Make Doris Great!',
+'Make Doris Great!',
+'Make Doris Great!',
+'Make Doris Great!',
+'Make Doris Great!',
+'2023-01-17',
+'16:49:05.1234567',
+'2023-01-17 16:49:05',
+'2023-01-17 16:49:05.1234567',
+'2023-01-17 16:49:05',
+'2023-01-17 16:49:05+08:00',
+'Make Doris Great!',
+'Make Doris Great!',
+922337203685477.5807,
+214748.3647,
+0
+),
+(2,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL);
+
+insert into dbo.test_timestamp(id_col) values(1);

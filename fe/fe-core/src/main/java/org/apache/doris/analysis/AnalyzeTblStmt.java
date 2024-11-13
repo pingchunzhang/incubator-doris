@@ -21,20 +21,19 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.TableIf;
 import org.apache.doris.catalog.View;
-import org.apache.doris.catalog.external.ExternalTable;
-import org.apache.doris.catalog.external.HMSExternalTable;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeNameFormat;
 import org.apache.doris.common.UserException;
 import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.datasource.hive.HMSExternalTable;
 import org.apache.doris.mysql.privilege.PrivPredicate;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.statistics.AnalysisInfo.AnalysisType;
-import org.apache.doris.statistics.ColumnStatistic;
 import org.apache.doris.statistics.util.StatisticsUtil;
 
 import com.google.common.collect.Sets;
@@ -79,7 +78,7 @@ import java.util.stream.Collectors;
  * - 'sample.rows' = '1000'
  * - 'num.buckets' = 10
  */
-public class AnalyzeTblStmt extends AnalyzeStmt {
+public class AnalyzeTblStmt extends AnalyzeStmt implements NotFallbackInParser {
     // The properties passed in by the user through "with" or "properties('K', 'V')"
 
     private final TableName tableName;
@@ -105,13 +104,17 @@ public class AnalyzeTblStmt extends AnalyzeStmt {
     }
 
     public AnalyzeTblStmt(AnalyzeProperties analyzeProperties, TableName tableName, List<String> columnNames, long dbId,
-            TableIf table) {
+            TableIf table) throws AnalysisException {
         super(analyzeProperties);
         this.tableName = tableName;
         this.columnNames = columnNames;
         this.dbId = dbId;
         this.table = table;
         this.isAllColumns = columnNames == null;
+        String catalogName = tableName.getCtl();
+        CatalogIf catalog = Env.getCurrentEnv().getCatalogMgr()
+                .getCatalogOrAnalysisException(catalogName);
+        this.catalogId = catalog.getId();
     }
 
     @Override
@@ -142,28 +145,28 @@ public class AnalyzeTblStmt extends AnalyzeStmt {
         if (table instanceof View) {
             throw new AnalysisException("Analyze view is not allowed");
         }
-        checkAnalyzePriv(tableName.getDb(), tableName.getTbl());
+        checkAnalyzePriv(tableName.getCtl(), tableName.getDb(), tableName.getTbl());
         if (columnNames == null) {
-            // Filter unsupported type columns.
-            columnNames = table.getBaseSchema(false).stream()
+            columnNames = table.getSchemaAllIndexes(false).stream()
+                // Filter unsupported type columns.
                 .filter(c -> !StatisticsUtil.isUnsupportedType(c.getType()))
                 .map(Column::getName)
                 .collect(Collectors.toList());
-        }
-        table.readLock();
-        try {
-            List<String> baseSchema = table.getBaseSchema(false)
-                    .stream().map(Column::getName).collect(Collectors.toList());
-            Optional<String> optional = columnNames.stream()
-                    .filter(entity -> !baseSchema.contains(entity)).findFirst();
-            if (optional.isPresent()) {
-                String columnName = optional.get();
-                ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_COLUMN_NAME,
-                        columnName, FeNameFormat.getColumnNameRegex());
+        } else {
+            table.readLock();
+            try {
+                List<String> baseSchema = table.getSchemaAllIndexes(false)
+                        .stream().map(Column::getName).collect(Collectors.toList());
+                Optional<String> optional = columnNames.stream()
+                        .filter(entity -> !baseSchema.contains(entity)).findFirst();
+                if (optional.isPresent()) {
+                    String columnName = optional.get();
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_FIELD_ERROR, columnName, tableName.getTbl());
+                }
+                checkColumn();
+            } finally {
+                table.readUnlock();
             }
-            checkColumn();
-        } finally {
-            table.readUnlock();
         }
         analyzeProperties.check();
 
@@ -184,12 +187,14 @@ public class AnalyzeTblStmt extends AnalyzeStmt {
     private void checkColumn() throws AnalysisException {
         boolean containsUnsupportedTytpe = false;
         for (String colName : columnNames) {
-            Column column = table.getColumn(colName);
+            Column column = table instanceof OlapTable
+                    ? ((OlapTable) table).getVisibleColumn(colName)
+                    : table.getColumn(colName);
             if (column == null) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_WRONG_COLUMN_NAME,
                         colName, FeNameFormat.getColumnNameRegex());
             }
-            if (ColumnStatistic.UNSUPPORTED_TYPE.contains(column.getType())) {
+            if (StatisticsUtil.isUnsupportedType(column.getType())) {
                 containsUnsupportedTytpe = true;
             }
         }
@@ -197,7 +202,9 @@ public class AnalyzeTblStmt extends AnalyzeStmt {
             if (ConnectContext.get() == null
                     || !ConnectContext.get().getSessionVariable().enableAnalyzeComplexTypeColumn) {
                 columnNames = columnNames.stream()
-                        .filter(c -> !StatisticsUtil.isUnsupportedType(table.getColumn(c).getType()))
+                        .filter(c -> !StatisticsUtil.isUnsupportedType(table instanceof OlapTable
+                            ? ((OlapTable) table).getVisibleColumn(c).getType()
+                            : table.getColumn(c).getType()))
                         .collect(Collectors.toList());
             } else {
                 throw new AnalysisException(
@@ -230,29 +237,27 @@ public class AnalyzeTblStmt extends AnalyzeStmt {
     }
 
     public Set<String> getColumnNames() {
-        return columnNames == null ? table.getBaseSchema(false)
-                .stream().map(Column::getName).collect(Collectors.toSet()) : Sets.newHashSet(columnNames);
+        return Sets.newHashSet(columnNames);
     }
 
     public Set<String> getPartitionNames() {
-        if (partitionNames == null || partitionNames.getPartitionNames() == null) {
-            if (table instanceof ExternalTable) {
-                // External table couldn't return all partitions when partitionNames is not set.
-                // Because Analyze Table command for external table could specify partition names.
-                return Collections.emptySet();
-            }
-            return table.getPartitionNames();
+        if (partitionNames == null || partitionNames.getPartitionNames() == null || partitionNames.isStar()) {
+            return Collections.emptySet();
         }
         Set<String> partitions = Sets.newHashSet();
         partitions.addAll(partitionNames.getPartitionNames());
         return partitions;
     }
 
-    public boolean isAllPartitions() {
+    /**
+     * @return for OLAP table, only in overwrite situation, overwrite auto detect partition
+     *         for External table, all partitions.
+     */
+    public boolean isStarPartition() {
         if (partitionNames == null) {
             return false;
         }
-        return partitionNames.isAllPartitions();
+        return partitionNames.isStar();
     }
 
     public long getPartitionCount() {
@@ -277,14 +282,14 @@ public class AnalyzeTblStmt extends AnalyzeStmt {
         return table instanceof HMSExternalTable && table.getPartitionNames().size() > partNum;
     }
 
-    private void checkAnalyzePriv(String dbName, String tblName) throws AnalysisException {
+    private void checkAnalyzePriv(String ctlName, String dbName, String tblName) throws AnalysisException {
         ConnectContext ctx = ConnectContext.get();
         // means it a system analyze
         if (ctx == null) {
             return;
         }
         if (!Env.getCurrentEnv().getAccessManager()
-                .checkTblPriv(ctx, dbName, tblName, PrivPredicate.SELECT)) {
+                .checkTblPriv(ctx, ctlName, dbName, tblName, PrivPredicate.SELECT)) {
             ErrorReport.reportAnalysisException(
                     ErrorCode.ERR_TABLEACCESS_DENIED_ERROR,
                     "ANALYZE",

@@ -21,6 +21,7 @@ import com.google.common.base.Objects;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.cache.CacheLoader;
 import com.google.common.cache.LoadingCache;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
@@ -33,7 +34,6 @@ import org.slf4j.LoggerFactory;
 import java.util.Map;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-
 
 public class PaimonTableCache {
     private static final Logger LOG = LoggerFactory.getLogger(PaimonTableCache.class);
@@ -55,7 +55,7 @@ public class PaimonTableCache {
     private static TableExt loadTable(PaimonTableCacheKey key) {
         try {
             LOG.warn("load table:{}", key);
-            Catalog catalog = createCatalog(key.getPaimonOptionParams());
+            Catalog catalog = createCatalog(key.getPaimonOptionParams(), key.getHadoopOptionParams());
             Table table = catalog.getTable(Identifier.create(key.getDbName(), key.getTblName()));
             return new TableExt(table, System.currentTimeMillis());
         } catch (Catalog.TableNotExistException e) {
@@ -64,10 +64,14 @@ public class PaimonTableCache {
         }
     }
 
-    private static Catalog createCatalog(Map<String, String> paimonOptionParams) {
+    private static Catalog createCatalog(
+            Map<String, String> paimonOptionParams,
+            Map<String, String> hadoopOptionParams) {
         Options options = new Options();
         paimonOptionParams.entrySet().stream().forEach(kv -> options.set(kv.getKey(), kv.getValue()));
-        CatalogContext context = CatalogContext.create(options);
+        Configuration hadoopConf = new Configuration();
+        hadoopOptionParams.entrySet().stream().forEach(kv -> hadoopConf.set(kv.getKey(), kv.getValue()));
+        CatalogContext context = CatalogContext.create(options, hadoopConf);
         return CatalogFactory.createCatalog(context);
     }
 
@@ -82,7 +86,6 @@ public class PaimonTableCache {
             throw new RuntimeException("failed to get table for:" + key);
         }
     }
-
 
     public static class TableExt {
         private Table table;
@@ -110,15 +113,19 @@ public class PaimonTableCache {
 
         // not in key
         private Map<String, String> paimonOptionParams;
+        private Map<String, String> hadoopOptionParams;
         private String dbName;
         private String tblName;
 
         public PaimonTableCacheKey(long ctlId, long dbId, long tblId,
-                Map<String, String> paimonOptionParams, String dbName, String tblName) {
+                Map<String, String> paimonOptionParams,
+                Map<String, String> hadoopOptionParams,
+                String dbName, String tblName) {
             this.ctlId = ctlId;
             this.dbId = dbId;
             this.tblId = tblId;
             this.paimonOptionParams = paimonOptionParams;
+            this.hadoopOptionParams = hadoopOptionParams;
             this.dbName = dbName;
             this.tblName = tblName;
         }
@@ -137,6 +144,10 @@ public class PaimonTableCache {
 
         public Map<String, String> getPaimonOptionParams() {
             return paimonOptionParams;
+        }
+
+        public Map<String, String> getHadoopOptionParams() {
+            return hadoopOptionParams;
         }
 
         public String getDbName() {
@@ -173,6 +184,7 @@ public class PaimonTableCache {
                     + ", dbId=" + dbId
                     + ", tblId=" + tblId
                     + ", paimonOptionParams=" + paimonOptionParams
+                    + ", hadoopOptionParams=" + hadoopOptionParams
                     + ", dbName='" + dbName + '\''
                     + ", tblName='" + tblName + '\''
                     + '}';

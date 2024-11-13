@@ -161,10 +161,10 @@ HYPERSCAN_MD5SUM="202f4b42f5dd4a7bb2506445e51a33b9"
 MACHINE_TYPE=$(uname -m)
 if [[ "${MACHINE_TYPE}" == "aarch64" || "${MACHINE_TYPE}" == 'arm64' ]]; then
     echo "use vectorscan instead of hyperscan on aarch64"
-    HYPERSCAN_DOWNLOAD="https://github.com/VectorCamp/vectorscan/archive/refs/tags/vectorscan/5.4.7.tar.gz"
-    HYPERSCAN_NAME=vectorscan-5.4.7.tar.gz
-    HYPERSCAN_SOURCE=vectorscan-vectorscan-5.4.7
-    HYPERSCAN_MD5SUM="ae924ccce79ef9bf6bf118693ae14fe5"
+    HYPERSCAN_DOWNLOAD="https://github.com/VectorCamp/vectorscan/archive/refs/tags/vectorscan/5.4.11.tar.gz"
+    HYPERSCAN_NAME=vectorscan-5.4.11.tar.gz
+    HYPERSCAN_SOURCE=vectorscan-vectorscan-5.4.11
+    HYPERSCAN_MD5SUM="e67b70403cba6c1654a9fef4fd15a2f2"
 fi
 
 # ragel (dependency for hyperscan)
@@ -174,7 +174,7 @@ RAGEL_SOURCE=ragel-6.10
 RAGEL_MD5SUM="748cae8b50cffe9efcaa5acebc6abf0d"
 
 # boost
-BOOST_DOWNLOAD="https://boostorg.jfrog.io/artifactory/main/release/1.81.0/source/boost_1_81_0.tar.gz"
+BOOST_DOWNLOAD="https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.gz"
 BOOST_NAME=boost_1_81_0.tar.gz
 BOOST_SOURCE=boost_1_81_0
 BOOST_MD5SUM="4bf02e84afb56dfdccd1e6aec9911f4b"
@@ -215,11 +215,11 @@ CYRUS_SASL_NAME=cyrus-sasl-2.1.27.tar.gz
 CYRUS_SASL_SOURCE=cyrus-sasl-2.1.27
 CYRUS_SASL_MD5SUM="a33820c66e0622222c5aefafa1581083"
 
-# librdkafka-1.8.2
-LIBRDKAFKA_DOWNLOAD="https://github.com/edenhill/librdkafka/archive/refs/tags/v1.8.2.tar.gz"
-LIBRDKAFKA_NAME=librdkafka-1.8.2.tar.gz
-LIBRDKAFKA_SOURCE=librdkafka-1.8.2
-LIBRDKAFKA_MD5SUM="0abec0888d10c9553cdcbcbf9172d558"
+# librdkafka-1.9.2
+LIBRDKAFKA_DOWNLOAD="https://github.com/edenhill/librdkafka/archive/v1.9.2.tar.gz"
+LIBRDKAFKA_NAME=librdkafka-1.9.2.tar.gz
+LIBRDKAFKA_SOURCE=librdkafka-1.9.2
+LIBRDKAFKA_MD5SUM="fe9624e905abbf8324b0f6be520d9c24"
 
 # zstd
 ZSTD_DOWNLOAD="https://github.com/facebook/zstd/releases/download/v1.5.5/zstd-1.5.5.tar.gz"
@@ -253,10 +253,10 @@ GRPC_SOURCE=grpc-1.54.3
 GRPC_MD5SUM="af00a2edeae0f02bb25917cc3473b7de"
 
 # arrow
-ARROW_DOWNLOAD="https://github.com/apache/arrow/archive/refs/tags/apache-arrow-13.0.0.tar.gz"
-ARROW_NAME="apache-arrow-13.0.0.tar.gz"
-ARROW_SOURCE="arrow-apache-arrow-13.0.0"
-ARROW_MD5SUM="8ec1ec6a119514bcaea1cf7aabc9df1f"
+ARROW_DOWNLOAD="https://github.com/apache/arrow/archive/refs/tags/apache-arrow-17.0.0.tar.gz"
+ARROW_NAME="apache-arrow-17.0.0.tar.gz"
+ARROW_SOURCE="arrow-apache-arrow-17.0.0"
+ARROW_MD5SUM="ba18bf83e2164abd34b9ac4cb164f0f0"
 
 # Abseil
 ABSEIL_DOWNLOAD="https://github.com/abseil/abseil-cpp/archive/refs/tags/20230125.3.tar.gz"
@@ -277,10 +277,10 @@ BITSHUFFLE_SOURCE=bitshuffle-0.5.1
 BITSHUFFLE_MD5SUM="b3bf6a9838927f7eb62214981c138e2f"
 
 # croaringbitmap
-CROARINGBITMAP_DOWNLOAD="https://github.com/RoaringBitmap/CRoaring/archive/refs/tags/v0.4.0.tar.gz"
-CROARINGBITMAP_NAME=CRoaring-0.4.0.tar.gz
-CROARINGBITMAP_SOURCE=CRoaring-0.4.0
-CROARINGBITMAP_MD5SUM="7c5cb6f2089cedc5ad9373f538a83334"
+CROARINGBITMAP_DOWNLOAD="https://github.com/RoaringBitmap/CRoaring/archive/refs/tags/v2.1.2.tar.gz"
+CROARINGBITMAP_NAME=CRoaring-2.1.2.tar.gz
+CROARINGBITMAP_SOURCE=CRoaring-2.1.2
+CROARINGBITMAP_MD5SUM="419bfbafdf93e9a7e6cdc234454908fc"
 
 # fmt
 FMT_DOWNLOAD="https://github.com/fmtlib/fmt/archive/7.1.3.tar.gz"
@@ -313,7 +313,7 @@ JEMALLOC_DORIS_SOURCE="jemalloc-5.3.0"
 JEMALLOC_DORIS_MD5SUM="09a8328574dab22a7df848eae6dbbf53"
 
 # libunwind
-LIBUNWIND_DOWNLOAD="http://download.savannah.nongnu.org/releases/libunwind/libunwind-1.6.2.tar.gz"
+LIBUNWIND_DOWNLOAD="https://github.com/libunwind/libunwind/releases/download/v1.6.2/libunwind-1.6.2.tar.gz"
 LIBUNWIND_NAME="libunwind-1.6.2.tar.gz"
 LIBUNWIND_SOURCE="libunwind-1.6.2"
 LIBUNWIND_MD5SUM="f625b6a98ac1976116c71708a73dc44a"
@@ -412,11 +412,11 @@ BENCHMARK_SOURCE=benchmark-1.8.0
 BENCHMARK_MD5SUM="8ddf8571d3f6198d37852bcbd964f817"
 
 # xsimd
-# for arrow-13.0.0, if arrow upgrade, this version may also need to be changed
-XSIMD_DOWNLOAD="https://github.com/xtensor-stack/xsimd/archive/refs/tags/9.0.1.tar.gz"
-XSIMD_NAME="xsimd-9.0.1.tar.gz"
-XSIMD_SOURCE=xsimd-9.0.1
-XSIMD_MD5SUM="59f38fe3364acd7ed137771258812d6c"
+# for arrow-17.0.0, if arrow upgrade, this version may also need to be changed
+XSIMD_DOWNLOAD="https://github.com/xtensor-stack/xsimd/archive/refs/tags/13.0.0.tar.gz"
+XSIMD_NAME="13.0.0.tar.gz"
+XSIMD_SOURCE=xsimd-13.0.0
+XSIMD_MD5SUM="c661deb91836e82d3070f81032014fe6"
 
 # simdjson
 SIMDJSON_DOWNLOAD="https://github.com/simdjson/simdjson/archive/refs/tags/v3.0.1.tar.gz"
@@ -429,18 +429,6 @@ NLOHMANN_JSON_DOWNLOAD="https://github.com/nlohmann/json/archive/refs/tags/v3.10
 NLOHMANN_JSON_NAME=json-3.10.1.tar.gz
 NLOHMANN_JSON_SOURCE=json-3.10.1
 NLOHMANN_JSON_MD5SUM="7b369d567afc0dffdcf5800fd9abb836"
-
-# opentelemetry-proto
-OPENTELEMETRY_PROTO_DOWNLOAD="https://github.com/open-telemetry/opentelemetry-proto/archive/refs/tags/v1.0.0.tar.gz"
-OPENTELEMETRY_PROTO_NAME="opentelemetry-proto-v1.0.0.tar.gz"
-OPENTELEMETRY_PROTO_SOURCE=opentelemetry-proto-1.0.0
-OPENTELEMETRY_PROTO_MD5SUM="8c7495a0dceea7cfdbdbcd53b07436dc"
-
-# opentelemetry
-OPENTELEMETRY_DOWNLOAD="https://github.com/open-telemetry/opentelemetry-cpp/archive/refs/tags/v1.10.0.tar.gz"
-OPENTELEMETRY_NAME="opentelemetry-cpp-v1.10.0.tar.gz"
-OPENTELEMETRY_SOURCE=opentelemetry-cpp-1.10.0
-OPENTELEMETRY_MD5SUM="89169762241b2f5142b728c775173283"
 
 # libbacktrace
 LIBBACKTRACE_DOWNLOAD="https://codeload.github.com/ianlancetaylor/libbacktrace/zip/2446c66076480ce07a6bd868badcbceb3eeecc2e"
@@ -473,10 +461,58 @@ FAST_FLOAT_SOURCE=fast_float-3.9.0
 FAST_FLOAT_MD5SUM="5656b0d8b150a3b157cfb092d214f6ea"
 
 # libhdfs
-HADOOP_LIBS_DOWNLOAD="https://github.com/apache/doris-thirdparty/archive/refs/tags/hadoop-3.3.4.5-for-doris.tar.gz"
-HADOOP_LIBS_NAME="hadoop-3.3.4.5-for-doris.tar.gz"
-HADOOP_LIBS_SOURCE="doris-thirdparty-hadoop-3.3.4.5-for-doris"
-HADOOP_LIBS_MD5SUM="15b7be1747b27c37923b0cb9db6cff8c"
+HADOOP_LIBS_DOWNLOAD="https://github.com/apache/doris-thirdparty/archive/refs/tags/hadoop-3.3.6.4-for-doris.tar.gz"
+HADOOP_LIBS_NAME="hadoop-3.3.6.4-for-doris.tar.gz"
+HADOOP_LIBS_SOURCE="doris-thirdparty-hadoop-3.3.6.4-for-doris"
+HADOOP_LIBS_MD5SUM="6993de49713eb0892e42c8ec57fbdc6c"
+
+# AvxToNeon
+AVX2NEON_DOWNLOAD="https://github.com/kunpengcompute/AvxToNeon/archive/refs/tags/v1.0.0.tar.gz"
+AVX2NEON_NAME=v1.0.0.tar.gz
+AVX2NEON_SOURCE=AvxToNeon-1.0.0
+AVX2NEON_MD5SUM="692d0e0f8b885a86ebc5172a9d8ee8db"
+
+# libdeflate
+LIBDEFLATE_DOWNLOAD="https://github.com/ebiggers/libdeflate/archive/refs/tags/v1.19.tar.gz"
+LIBDEFLATE_NAME=libdeflate-1.19.tar.gz
+LIBDEFLATE_SOURCE=libdeflate-1.19
+LIBDEFLATE_MD5SUM="c69e9193d2975a729068ffa862c81fb6"
+
+# streamvbyte
+STREAMVBYTE_DOWNLOAD="https://github.com/lemire/streamvbyte/archive/refs/tags/v1.0.0.tar.gz"
+STREAMVBYTE_NAME=streamvbyte-1.0.0.tar.gz
+STREAMVBYTE_SOURCE=streamvbyte-1.0.0
+STREAMVBYTE_MD5SUM="f334219db5a832b6dae3589a56a29563"
+
+# jsoncpp
+JSONCPP_DOWNLOAD="https://github.com/open-source-parsers/jsoncpp/archive/refs/tags/1.9.5.tar.gz"
+JSONCPP_NAME="1.9.5.tar.gz"
+JSONCPP_SOURCE="jsoncpp-1.9.5"
+JSONCPP_MD5SUM="d6c8c609f2162eff373db62b90a051c7"
+
+# libuuid
+LIBUUID_DOWNLOAD="https://nchc.dl.sourceforge.net/project/libuuid/libuuid-1.0.3.tar.gz"
+LIBUUID_NAME="libuuid-1.0.3.tar.gz"
+LIBUUID_SOURCE="libuuid-1.0.3"
+LIBUUID_MD5SUM="d44d866d06286c08ba0846aba1086d68"
+
+# ali
+ALI_SDK_DOWNLOAD="https://github.com/aliyun/aliyun-openapi-cpp-sdk/archive/refs/tags/1.36.1586.tar.gz"
+ALI_SDK_NAME="1.36.1586.tar.gz"
+ALI_SDK_SOURCE="aliyun-openapi-cpp-sdk-1.36.1586"
+ALI_SDK_MD5SUM="14623ee8e87c89615477d9bf8cb30bea"
+
+# base64
+BASE64_DOWNLOAD="https://github.com/aklomp/base64/archive/refs/tags/v0.5.2.tar.gz"
+BASE64_NAME="v0.5.2.tar.gz"
+BASE64_SOURCE="base64-0.5.2"
+BASE64_MD5SUM="49e5a6c98bd0192aedd16c16eec39974"
+
+# azure blob
+AZURE_DOWNLOAD="https://github.com/Azure/azure-sdk-for-cpp/archive/azure-core_1.10.3.tar.gz"
+AZURE_NAME="azure-core_1.10.3.tar.gz"
+AZURE_SOURCE="azure-sdk-for-cpp-azure-core_1.10.3"
+AZURE_MD5SUM="aa470cfdba93dd69a6f3112a6958c13c"
 
 # libdragonbox for faster double/float to string
 DRAGONBOX_DOWNLOAD="https://github.com/jk-jeon/dragonbox/archive/refs/tags/1.1.3.tar.gz"
@@ -546,14 +582,20 @@ export TP_ARCHIVES=(
     'XSIMD'
     'SIMDJSON'
     'NLOHMANN_JSON'
-    'OPENTELEMETRY_PROTO'
-    'OPENTELEMETRY'
     'LIBBACKTRACE'
     'SSE2NEON'
     'XXHASH'
     'CONCURRENTQUEUE'
     'FAST_FLOAT'
     'HADOOP_LIBS'
+    'AVX2NEON'
+    'LIBDEFLATE'
+    'STREAMVBYTE'
+    'JSONCPP'
+    'LIBUUID'
+    'ALI_SDK'
+    'BASE64'
+    'AZURE'
     'DRAGONBOX'
 )
 

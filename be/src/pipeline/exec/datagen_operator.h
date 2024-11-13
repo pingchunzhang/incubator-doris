@@ -20,34 +20,14 @@
 #include <stdint.h>
 
 #include "common/status.h"
-#include "operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/vdata_gen_scan_node.h"
+#include "pipeline/common/data_gen_functions/vdata_gen_function_inf.h"
+#include "pipeline/exec/operator.h"
 
 namespace doris {
-class ExecNode;
 class RuntimeState;
 } // namespace doris
 
 namespace doris::pipeline {
-
-class DataGenOperatorBuilder : public OperatorBuilder<vectorized::VDataGenFunctionScanNode> {
-public:
-    DataGenOperatorBuilder(int32_t id, ExecNode* exec_node);
-    bool is_source() const override { return true; }
-    OperatorPtr build_operator() override;
-};
-
-class DataGenOperator : public SourceOperator<DataGenOperatorBuilder> {
-public:
-    DataGenOperator(OperatorBuilderBase* operator_builder, ExecNode* datagen_node);
-
-    bool can_read() override { return true; }
-
-    Status open(RuntimeState* state) override;
-
-    Status close(RuntimeState* state) override;
-};
 
 class DataGenSourceOperatorX;
 class DataGenLocalState final : public PipelineXLocalState<> {
@@ -63,17 +43,19 @@ public:
 
 private:
     friend class DataGenSourceOperatorX;
-    std::shared_ptr<vectorized::VDataGenFunctionInf> _table_func;
+    std::shared_ptr<VDataGenFunctionInf> _table_func;
+    RuntimeProfile::Counter* _table_function_execution_timer = nullptr;
+    RuntimeProfile::Counter* _filter_timer = nullptr;
 };
 
 class DataGenSourceOperatorX final : public OperatorX<DataGenLocalState> {
 public:
-    DataGenSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+    DataGenSourceOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                           const DescriptorTbl& descs);
 
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
-    Status prepare(RuntimeState* state) override;
-    Status get_block(RuntimeState* state, vectorized::Block* block,
-                     SourceState& source_state) override;
+    Status open(RuntimeState* state) override;
+    Status get_block(RuntimeState* state, vectorized::Block* block, bool* eos) override;
 
     [[nodiscard]] bool is_source() const override { return true; }
 
@@ -83,7 +65,7 @@ private:
     TupleId _tuple_id;
 
     // Descriptor of tuples generated
-    const TupleDescriptor* _tuple_desc;
+    const TupleDescriptor* _tuple_desc = nullptr;
 
     std::vector<TRuntimeFilterDesc> _runtime_filter_descs;
 };

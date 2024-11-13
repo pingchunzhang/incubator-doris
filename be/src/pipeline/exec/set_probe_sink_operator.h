@@ -21,11 +21,8 @@
 
 #include "common/status.h"
 #include "operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/vset_operation_node.h"
 
 namespace doris {
-class ExecNode;
 class RuntimeState;
 
 namespace vectorized {
@@ -37,50 +34,20 @@ struct HashTableProbe;
 namespace pipeline {
 
 template <bool is_intersect>
-class SetProbeSinkOperatorBuilder final
-        : public OperatorBuilder<vectorized::VSetOperationNode<is_intersect>> {
-private:
-    constexpr static auto builder_name =
-            is_intersect ? "IntersectProbeSinkOperator" : "ExceptProbeSinkOperator";
-
-public:
-    SetProbeSinkOperatorBuilder(int32_t id, int child_id, ExecNode* set_node);
-    [[nodiscard]] bool is_sink() const override { return true; }
-
-    OperatorPtr build_operator() override;
-
-private:
-    int _child_id;
-};
-
-template <bool is_intersect>
-class SetProbeSinkOperator : public StreamingOperator<SetProbeSinkOperatorBuilder<is_intersect>> {
-public:
-    SetProbeSinkOperator(OperatorBuilderBase* operator_builder, int child_id, ExecNode* set_node);
-
-    bool can_write() override;
-
-    Status sink(RuntimeState* state, vectorized::Block* block, SourceState source_state) override;
-    Status open(RuntimeState* /*state*/) override { return Status::OK(); }
-
-private:
-    int _child_id;
-};
-
-template <bool is_intersect>
 class SetProbeSinkOperatorX;
 
 template <bool is_intersect>
-class SetProbeSinkLocalState final : public PipelineXSinkLocalState<SetDependency> {
+class SetProbeSinkLocalState final : public PipelineXSinkLocalState<SetSharedState> {
 public:
     ENABLE_FACTORY_CREATOR(SetProbeSinkLocalState);
-    using Base = PipelineXSinkLocalState<SetDependency>;
+    using Base = PipelineXSinkLocalState<SetSharedState>;
     using Parent = SetProbeSinkOperatorX<is_intersect>;
 
     SetProbeSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state)
             : Base(parent, state) {}
 
     Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
+    Status open(RuntimeState* state) override;
     int64_t* valid_element_in_hash_tbl() { return &_shared_state->valid_element_in_hash_tbl; }
 
 private:
@@ -93,19 +60,28 @@ private:
     vectorized::ColumnRawPtrs _probe_columns;
     // every child has its result expr list
     vectorized::VExprContextSPtrs _child_exprs;
+
+    RuntimeProfile::Counter* _extract_probe_data_timer = nullptr;
+    RuntimeProfile::Counter* _probe_timer = nullptr;
 };
 
 template <bool is_intersect>
 class SetProbeSinkOperatorX final : public DataSinkOperatorX<SetProbeSinkLocalState<is_intersect>> {
 public:
     using Base = DataSinkOperatorX<SetProbeSinkLocalState<is_intersect>>;
-    using DataSinkOperatorXBase::id;
+    using DataSinkOperatorXBase::operator_id;
+    using Base::get_local_state;
     using typename Base::LocalState;
 
     friend class SetProbeSinkLocalState<is_intersect>;
     SetProbeSinkOperatorX(int child_id, int sink_id, ObjectPool* pool, const TPlanNode& tnode,
                           const DescriptorTbl& descs)
-            : Base(sink_id, tnode.node_id, tnode.node_id), _cur_child_id(child_id) {}
+            : Base(sink_id, tnode.node_id, tnode.node_id),
+              _cur_child_id(child_id),
+              _is_colocate(is_intersect ? tnode.intersect_node.is_colocate
+                                        : tnode.except_node.is_colocate),
+              _partition_exprs(is_intersect ? tnode.intersect_node.result_expr_lists[child_id]
+                                            : tnode.except_node.result_expr_lists[child_id]) {}
     ~SetProbeSinkOperatorX() override = default;
     Status init(const TDataSink& tsink) override {
         return Status::InternalError(
@@ -115,14 +91,15 @@ public:
 
     Status init(const TPlanNode& tnode, RuntimeState* state) override;
 
-    Status prepare(RuntimeState* state) override;
-
     Status open(RuntimeState* state) override;
 
-    Status sink(RuntimeState* state, vectorized::Block* in_block,
-                SourceState source_state) override;
+    Status sink(RuntimeState* state, vectorized::Block* in_block, bool eos) override;
+    DataDistribution required_data_distribution() const override {
+        return _is_colocate ? DataDistribution(ExchangeType::BUCKET_HASH_SHUFFLE, _partition_exprs)
+                            : DataDistribution(ExchangeType::HASH_SHUFFLE, _partition_exprs);
+    }
 
-    WriteDependency* wait_for_dependency(RuntimeState* state) override;
+    std::shared_ptr<BasicSharedState> create_shared_state() const override { return nullptr; }
 
 private:
     void _finalize_probe(SetProbeSinkLocalState<is_intersect>& local_state);
@@ -133,7 +110,9 @@ private:
     const int _cur_child_id;
     // every child has its result expr list
     vectorized::VExprContextSPtrs _child_exprs;
-    using OperatorBase::_child_x;
+    const bool _is_colocate;
+    const std::vector<TExpr> _partition_exprs;
+    using OperatorBase::_child;
 };
 
 } // namespace pipeline

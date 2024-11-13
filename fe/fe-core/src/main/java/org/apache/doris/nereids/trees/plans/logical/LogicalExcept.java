@@ -18,8 +18,11 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
+import org.apache.doris.nereids.properties.DataTrait.Builder;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.expressions.SlotReference;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
@@ -27,8 +30,11 @@ import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableSet;
 
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -96,5 +102,44 @@ public class LogicalExcept extends LogicalSetOperation {
     public LogicalExcept withNewOutputs(List<NamedExpression> newOutputs) {
         return new LogicalExcept(qualifier, newOutputs, regularChildrenOutputs,
                 Optional.empty(), Optional.empty(), children);
+    }
+
+    Map<Slot, Slot> constructReplaceMapForChild(int index) {
+        Map<Slot, Slot> replaceMap = new HashMap<>();
+        List<Slot> output = getOutput();
+        List<? extends Slot> originalOutputs = regularChildrenOutputs.isEmpty()
+                ? child(index).getOutput()
+                : regularChildrenOutputs.get(index);
+        for (int i = 0; i < output.size(); i++) {
+            replaceMap.put(originalOutputs.get(i), output.get(i));
+        }
+        return replaceMap;
+    }
+
+    @Override
+    public void computeUnique(Builder builder) {
+        builder.addUniqueSlot(child(0).getLogicalProperties().getTrait());
+        if (qualifier == Qualifier.DISTINCT) {
+            builder.addUniqueSlot(ImmutableSet.copyOf(getOutput()));
+        }
+        builder.replaceUniqueBy(constructReplaceMapForChild(0));
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child(0).getLogicalProperties().getTrait());
+        builder.replaceEqualSetBy(constructReplaceMapForChild(0));
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child(0).getLogicalProperties().getTrait());
+        builder.replaceFuncDepsBy(constructReplaceMapForChild(0));
+    }
+
+    @Override
+    public void computeUniform(Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+        builder.replaceUniformBy(constructReplaceMapForChild(0));
     }
 }

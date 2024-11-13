@@ -107,7 +107,7 @@ public class AnotherDemoTest {
         CreateTableStmt createTableStmt = (CreateTableStmt) UtFrameUtils.parseAndAnalyzeStmt(createTblStmtStr, ctx);
         Env.getCurrentEnv().createTable(createTableStmt);
         // 4. get and test the created db and table
-        Database db = Env.getCurrentInternalCatalog().getDbOrMetaException("default_cluster:db1");
+        Database db = Env.getCurrentInternalCatalog().getDbOrMetaException("db1");
         OlapTable tbl = (OlapTable) db.getTableOrMetaException("tbl1", Table.TableType.OLAP);
         tbl.readLock();
         try {
@@ -120,7 +120,7 @@ public class AnotherDemoTest {
         }
         // 5. query
         // TODO: we can not process real query for now. So it has to be a explain query
-        String queryStr = "explain select /*+ SET_VAR(enable_nereids_planner=false) */ * from db1.tbl1";
+        String queryStr = "explain select /*+ SET_VAR(disable_nereids_rules=PRUNE_EMPTY_PARTITION) */ * from db1.tbl1";
         StmtExecutor stmtExecutor = new StmtExecutor(ctx, queryStr);
         stmtExecutor.execute();
         Planner planner = stmtExecutor.planner();

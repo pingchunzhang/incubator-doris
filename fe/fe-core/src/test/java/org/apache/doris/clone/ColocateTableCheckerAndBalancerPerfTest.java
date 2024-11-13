@@ -59,13 +59,13 @@ public class ColocateTableCheckerAndBalancerPerfTest {
         Config.tablet_schedule_interval_ms = 100;
         Config.enable_round_robin_create_tablet = false;
         Config.disable_balance = true;
-        Config.schedule_batch_size = 400;
+        Config.schedule_batch_size = 500;
         Config.schedule_slot_num_per_hdd_path = 1000;
         Config.disable_colocate_balance = true;
         Config.disable_tablet_scheduler = true;
         UtFrameUtils.createDorisClusterWithMultiTag(runningDir, 6);
 
-        backends = Env.getCurrentSystemInfo().getIdToBackend().values().asList();
+        backends = Env.getCurrentSystemInfo().getAllBackendsByAllCluster().values().asList();
         for (Backend be : backends) {
             for (DiskInfo diskInfo : be.getDisks().values()) {
                 diskInfo.setTotalCapacityB(10L << 40);
@@ -127,7 +127,7 @@ public class ColocateTableCheckerAndBalancerPerfTest {
         ColocateTableIndex colocateIndex = env.getColocateTableIndex();
         Set<GroupId> groupIds = colocateIndex.getAllGroupIds();
 
-        RebalancerTestUtil.updateReplicaDataSize(100L << 10, 10, 10);
+        RebalancerTestUtil.updateReplicaDataSize(1L << 10, 10, 10);
         RebalancerTestUtil.updateReplicaPathHash();
 
         BalanceStatistic beforeBalanceStatistic = BalanceStatistic.getCurrentBalanceStatistic();
@@ -146,7 +146,12 @@ public class ColocateTableCheckerAndBalancerPerfTest {
             backends.get(i).setTagMap(tagMap);
         }
         Config.disable_colocate_balance = false;
-        Thread.sleep(1000);
+        for (int i = 0; i < 10; i++) {
+            Thread.sleep(1000);
+            if (groupIds.stream().allMatch(groupId -> colocateIndex.isGroupUnstable(groupId))) {
+                break;
+            }
+        }
         Assert.assertTrue("some groups are stable",
                 groupIds.stream().allMatch(groupId -> colocateIndex.isGroupUnstable(groupId)));
 

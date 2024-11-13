@@ -31,15 +31,16 @@ import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.SessionVariable;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
 import org.apache.doris.thrift.TExprOpcode;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.gson.annotations.SerializedName;
 
 import java.io.DataInput;
-import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
@@ -111,7 +112,8 @@ public class ArithmeticExpr extends Expr {
             for (int j = 0; j < Type.getNumericTypes().size(); j++) {
                 Type t2 = Type.getNumericTypes().get(j);
 
-                Type retType = Type.getNextNumType(Type.getAssignmentCompatibleType(t1, t2, false));
+                // For old planner, set enableDecimal256 to false to keep the original behaviour
+                Type retType = Type.getNextNumType(Type.getAssignmentCompatibleType(t1, t2, false, false));
                 NullableMode mode = retType.isDecimalV3() ? NullableMode.CUSTOM : NullableMode.DEPEND_ON_ARGUMENT;
                 functionSet.addBuiltin(ScalarFunction.createBuiltinOperator(
                         Operator.MULTIPLY.getName(), Lists.newArrayList(t1, t2), retType, mode));
@@ -197,18 +199,20 @@ public class ArithmeticExpr extends Expr {
             for (int j = 0; j < Type.getIntegerTypes().size(); j++) {
                 Type t2 = Type.getIntegerTypes().get(j);
 
+                // For old planner, set enableDecimal256 to false to keep the original behaviour
                 functionSet.addBuiltin(ScalarFunction.createBuiltinOperator(
                         Operator.INT_DIVIDE.getName(), Lists.newArrayList(t1, t2),
-                        Type.getAssignmentCompatibleType(t1, t2, false),
+                        Type.getAssignmentCompatibleType(t1, t2, false, false),
                         Function.NullableMode.ALWAYS_NULLABLE));
                 functionSet.addBuiltin(ScalarFunction.createBuiltinOperator(
                         Operator.MOD.getName(), Lists.newArrayList(t1, t2),
-                        Type.getAssignmentCompatibleType(t1, t2, false),
+                        Type.getAssignmentCompatibleType(t1, t2, false, false),
                         Function.NullableMode.ALWAYS_NULLABLE));
             }
         }
     }
 
+    @SerializedName("op")
     private final Operator op;
 
     public ArithmeticExpr(Operator op, Expr e1, Expr e2) {
@@ -279,7 +283,6 @@ public class ArithmeticExpr extends Expr {
         msg.node_type = TExprNodeType.ARITHMETIC_EXPR;
         if (!(type.isDecimalV2() || type.isDecimalV3())) {
             msg.setOpcode(op.getOpcode());
-            msg.setOutputColumn(outputColumn);
         }
     }
 
@@ -289,20 +292,6 @@ public class ArithmeticExpr extends Expr {
             return false;
         }
         return ((ArithmeticExpr) obj).opcode == opcode;
-    }
-
-    @Override
-    public void computeOutputColumn(Analyzer analyzer) {
-        super.computeOutputColumn(analyzer);
-
-        List<TupleId> tupleIds = Lists.newArrayList();
-        getIds(tupleIds, null);
-        Preconditions.checkArgument(tupleIds.size() == 1);
-
-        // for (Expr child : children) {
-        //     if (child.getOutputColumn() > analyzer.getTupleDesc(tupleIds.get(0)).getSlots().size()) {
-        //     }
-        // }
     }
 
     private Type findCommonType(Type t1, Type t2) {
@@ -401,7 +390,7 @@ public class ArithmeticExpr extends Expr {
                     t1 = Type.TINYINT;
                     t2 = Type.TINYINT;
                 }
-                commonType = Type.getAssignmentCompatibleType(t1, t2, false);
+                commonType = Type.getAssignmentCompatibleType(t1, t2, false, SessionVariable.getEnableDecimal256());
                 if (commonType.getPrimitiveType().ordinal() > PrimitiveType.LARGEINT.ordinal()) {
                     commonType = Type.BIGINT;
                 }
@@ -647,15 +636,6 @@ public class ArithmeticExpr extends Expr {
         Type t2 = getChild(1).getType();
         if (t1.isDecimalV3() || t2.isDecimalV3()) {
             analyzeDecimalV3Op(t1, t2);
-        }
-    }
-
-    @Override
-    public void write(DataOutput out) throws IOException {
-        Text.writeString(out, op.name());
-        out.writeInt(children.size());
-        for (Expr expr : children) {
-            Expr.writeTo(expr, out);
         }
     }
 

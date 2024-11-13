@@ -18,37 +18,37 @@
 #pragma once
 
 #include "operator.h"
-#include "pipeline/pipeline_x/dependency.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/join/vjoin_node_base.h"
 
-namespace doris {
-
-namespace pipeline {
+namespace doris::pipeline {
 template <typename LocalStateType>
 class JoinBuildSinkOperatorX;
 
-template <typename DependencyType, typename Derived>
-class JoinBuildSinkLocalState : public PipelineXSinkLocalState<DependencyType> {
+template <typename SharedStateType, typename Derived>
+class JoinBuildSinkLocalState : public PipelineXSinkLocalState<SharedStateType> {
 public:
     Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
 
+    const std::vector<std::shared_ptr<IRuntimeFilter>>& runtime_filters() const {
+        return _runtime_filters;
+    }
+
 protected:
     JoinBuildSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state)
-            : PipelineXSinkLocalState<DependencyType>(parent, state) {}
+            : PipelineXSinkLocalState<SharedStateType>(parent, state) {}
     ~JoinBuildSinkLocalState() override = default;
     template <typename LocalStateType>
     friend class JoinBuildSinkOperatorX;
 
-    RuntimeProfile::Counter* _build_rows_counter;
-    RuntimeProfile::Counter* _push_down_timer;
-    RuntimeProfile::Counter* _push_compute_timer;
+    RuntimeProfile::Counter* _publish_runtime_filter_timer = nullptr;
+    RuntimeProfile::Counter* _runtime_filter_compute_timer = nullptr;
+    std::vector<std::shared_ptr<IRuntimeFilter>> _runtime_filters;
 };
 
 template <typename LocalStateType>
 class JoinBuildSinkOperatorX : public DataSinkOperatorX<LocalStateType> {
 public:
-    JoinBuildSinkOperatorX(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+    JoinBuildSinkOperatorX(ObjectPool* pool, int operator_id, const TPlanNode& tnode,
+                           const DescriptorTbl& descs);
     ~JoinBuildSinkOperatorX() override = default;
 
 protected:
@@ -56,8 +56,8 @@ protected:
     template <typename DependencyType, typename Derived>
     friend class JoinBuildSinkLocalState;
 
-    TJoinOp::type _join_op;
-    vectorized::JoinOpVariants _join_op_variants;
+    const TJoinOp::type _join_op;
+    JoinOpVariants _join_op_variants;
 
     const bool _have_other_join_conjunct;
     const bool _match_all_probe; // output all rows coming from the probe input. Full/Left Join
@@ -74,7 +74,8 @@ protected:
     // 2. In build phase, we stop materialize build side when we meet the first null value and set _has_null_in_build_side to true.
     // 3. In probe phase, if _has_null_in_build_side is true, join node returns empty block directly. Otherwise, probing will continue as the same as generic left anti join.
     const bool _short_circuit_for_null_in_build_side;
+
+    const std::vector<TRuntimeFilterDesc> _runtime_filter_descs;
 };
 
-} // namespace pipeline
-} // namespace doris
+} // namespace doris::pipeline

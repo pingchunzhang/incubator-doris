@@ -39,6 +39,7 @@ namespace doris {
 CheckRPCChannelAction::CheckRPCChannelAction(ExecEnv* exec_env, TPrivilegeHier::type hier,
                                              TPrivilegeType::type type)
         : HttpHandlerWithAuth(exec_env, hier, type) {}
+
 void CheckRPCChannelAction::handle(HttpRequest* req) {
     std::string req_ip = req->param("ip");
     std::string req_port = req->param("port");
@@ -97,8 +98,7 @@ void CheckRPCChannelAction::handle(HttpRequest* req) {
         return;
     }
     if (response.status().status_code() == 0) {
-        std::string err =
-                fmt::format("open brpc connection to {0}:{1} succcess.", req_ip, req_port);
+        std::string err = fmt::format("open brpc connection to {0}:{1} success.", req_ip, req_port);
         LOG(WARNING) << err;
         HttpChannel::send_reply(req, HttpStatus::OK, err);
     } else {

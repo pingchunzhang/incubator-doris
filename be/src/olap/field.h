@@ -32,6 +32,7 @@
 #include "util/hash_util.hpp"
 #include "util/slice.h"
 #include "vec/common/arena.h"
+#include "vec/json/path_in_data.h"
 
 namespace doris {
 
@@ -47,7 +48,10 @@ public:
               _name(column.name()),
               _index_size(column.index_length()),
               _is_nullable(column.is_nullable()),
-              _unique_id(column.unique_id()) {}
+              _unique_id(column.unique_id()),
+              _parent_unique_id(column.parent_unique_id()),
+              _is_extracted_column(column.is_extracted_column()),
+              _path(column.path_info_ptr()) {}
 
     virtual ~Field() = default;
 
@@ -56,7 +60,10 @@ public:
     size_t field_size() const { return size() + 1; }
     size_t index_size() const { return _index_size; }
     int32_t unique_id() const { return _unique_id; }
+    int32_t parent_unique_id() const { return _parent_unique_id; }
+    bool is_extracted_column() const { return _is_extracted_column; }
     const std::string& name() const { return _name; }
+    const vectorized::PathInDataPtr& path() const { return _path; }
 
     virtual void set_to_max(char* buf) const { return _type_info->set_to_max(buf); }
     virtual void set_to_zone_map_max(char* buf) const { set_to_max(buf); }
@@ -238,6 +245,8 @@ protected:
         other->_precision = this->_precision;
         other->_scale = this->_scale;
         other->_unique_id = this->_unique_id;
+        other->_parent_unique_id = this->_parent_unique_id;
+        other->_is_extracted_column = this->_is_extracted_column;
         for (const auto& f : _sub_fields) {
             Field* item = f->clone();
             other->add_sub_field(std::unique_ptr<Field>(item));
@@ -255,6 +264,9 @@ private:
     int32_t _precision;
     int32_t _scale;
     int32_t _unique_id;
+    int32_t _parent_unique_id;
+    bool _is_extracted_column = false;
+    vectorized::PathInDataPtr _path;
 };
 
 class MapField : public Field {
@@ -486,8 +498,6 @@ public:
             case FieldType::OLAP_FIELD_TYPE_CHAR:
                 return new CharField(column);
             case FieldType::OLAP_FIELD_TYPE_VARCHAR:
-            case FieldType::OLAP_FIELD_TYPE_AGG_STATE:
-                return new VarcharField(column);
             case FieldType::OLAP_FIELD_TYPE_STRING:
                 return new StringField(column);
             case FieldType::OLAP_FIELD_TYPE_STRUCT: {
@@ -520,6 +530,8 @@ public:
             case FieldType::OLAP_FIELD_TYPE_DECIMAL64:
                 [[fallthrough]];
             case FieldType::OLAP_FIELD_TYPE_DECIMAL128I:
+                [[fallthrough]];
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL256:
                 [[fallthrough]];
             case FieldType::OLAP_FIELD_TYPE_DATETIMEV2: {
                 Field* field = new Field(column);
@@ -578,6 +590,8 @@ public:
             case FieldType::OLAP_FIELD_TYPE_DECIMAL64:
                 [[fallthrough]];
             case FieldType::OLAP_FIELD_TYPE_DECIMAL128I:
+                [[fallthrough]];
+            case FieldType::OLAP_FIELD_TYPE_DECIMAL256:
                 [[fallthrough]];
             case FieldType::OLAP_FIELD_TYPE_DATETIMEV2: {
                 Field* field = new Field(column);

@@ -18,9 +18,8 @@
 package org.apache.doris.fs;
 
 import org.apache.doris.analysis.StorageBackend;
-import org.apache.doris.common.FeConstants;
-import org.apache.doris.common.Pair;
-import org.apache.doris.common.util.S3Util;
+import org.apache.doris.datasource.property.constants.AzureProperties;
+import org.apache.doris.fs.remote.AzureFileSystem;
 import org.apache.doris.fs.remote.BrokerFileSystem;
 import org.apache.doris.fs.remote.RemoteFileSystem;
 import org.apache.doris.fs.remote.S3FileSystem;
@@ -28,13 +27,10 @@ import org.apache.doris.fs.remote.dfs.DFSFileSystem;
 import org.apache.doris.fs.remote.dfs.JFSFileSystem;
 import org.apache.doris.fs.remote.dfs.OFSFileSystem;
 
-import com.google.common.base.Strings;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
 
 import java.io.IOException;
-import java.net.URI;
-import java.util.HashMap;
 import java.util.Map;
 
 public class FileSystemFactory {
@@ -42,6 +38,9 @@ public class FileSystemFactory {
     public static RemoteFileSystem get(String name, StorageBackend.StorageType type, Map<String, String> properties) {
         // TODO: rename StorageBackend.StorageType
         if (type == StorageBackend.StorageType.S3) {
+            if (AzureProperties.checkAzureProviderPropertyExist(properties)) {
+                return new AzureFileSystem(properties);
+            }
             return new S3FileSystem(properties);
         } else if (type == StorageBackend.StorageType.HDFS || type == StorageBackend.StorageType.GFS) {
             return new DFSFileSystem(properties);
@@ -56,41 +55,13 @@ public class FileSystemFactory {
         }
     }
 
-    public static Pair<FileSystemType, String> getFSIdentity(String location, String bindBrokerName) {
-        FileSystemType fsType;
-        if (bindBrokerName != null) {
-            fsType = FileSystemType.BROKER;
-        } else if (S3Util.isObjStorage(location)) {
-            if (S3Util.isHdfsOnOssEndpoint(location)) {
-                // if hdfs service is enabled on oss, use hdfs lib to access oss.
-                fsType = FileSystemType.DFS;
-            } else {
-                fsType = FileSystemType.S3;
-            }
-        } else if (location.startsWith(FeConstants.FS_PREFIX_HDFS) || location.startsWith(FeConstants.FS_PREFIX_GFS)
-                 || location.startsWith(FeConstants.FS_PREFIX_VIEWFS)) {
-            fsType = FileSystemType.DFS;
-        } else if (location.startsWith(FeConstants.FS_PREFIX_OFS) || location.startsWith(FeConstants.FS_PREFIX_COSN)) {
-            // ofs:// and cosn:// use the same underlying file system: Tencent Cloud HDFS, aka CHDFS)) {
-            fsType = FileSystemType.OFS;
-        } else if (location.startsWith(FeConstants.FS_PREFIX_JFS)) {
-            fsType = FileSystemType.JFS;
-        } else {
-            throw new UnsupportedOperationException("Unknown file system for location: " + location);
-        }
-
-        Path path = new Path(location);
-        URI uri = path.toUri();
-        String fsIdent = Strings.nullToEmpty(uri.getScheme()) + "://" + Strings.nullToEmpty(uri.getAuthority());
-        return Pair.of(fsType, fsIdent);
-    }
-
-    public static RemoteFileSystem getRemoteFileSystem(FileSystemType type, Configuration conf,
+    public static RemoteFileSystem getRemoteFileSystem(FileSystemType type, Map<String, String> properties,
                                                        String bindBrokerName) {
-        Map<String, String> properties = new HashMap<>();
-        conf.iterator().forEachRemaining(e -> properties.put(e.getKey(), e.getValue()));
         switch (type) {
             case S3:
+                if (AzureProperties.checkAzureProviderPropertyExist(properties)) {
+                    return new AzureFileSystem(properties);
+                }
                 return new S3FileSystem(properties);
             case DFS:
                 return new DFSFileSystem(properties);
@@ -100,6 +71,8 @@ public class FileSystemFactory {
                 return new JFSFileSystem(properties);
             case BROKER:
                 return new BrokerFileSystem(bindBrokerName, properties);
+            case AZURE:
+                return new AzureFileSystem(properties);
             default:
                 throw new IllegalStateException("Not supported file system type: " + type);
         }

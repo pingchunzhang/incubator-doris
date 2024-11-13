@@ -17,7 +17,10 @@
 package org.apache.doris.regression.suite
 
 import org.apache.doris.regression.Config
+import org.apache.doris.regression.util.DebugPoint
 import org.apache.doris.regression.util.Http
+import org.apache.doris.regression.util.JdbcUtils
+import org.apache.doris.regression.util.NodeType
 
 import com.google.common.collect.Maps
 import org.slf4j.Logger
@@ -27,14 +30,53 @@ import groovy.json.JsonSlurper
 import groovy.transform.CompileStatic
 import groovy.util.logging.Slf4j
 import java.util.stream.Collectors
+import java.sql.Connection
 
 class ClusterOptions {
 
     int feNum = 1
     int beNum = 3
-    int beDiskNum = 1
-    List<String> feConfigs = []
-    List<String> beConfigs = []
+
+    Boolean sqlModeNodeMgr = false
+    Boolean beMetaServiceEndpoint = true
+    Boolean beClusterId = false
+
+    int waitTimeout = 180
+
+    // don't add whitespace in feConfigs items,
+    // for example, ' xx = yy ' is bad, should use 'xx=yy'
+    List<String> feConfigs = [
+        'heartbeat_interval_second=5',
+    ]
+
+    // don't add whitespace in beConfigs items,
+    // for example, ' xx = yy ' is bad, should use 'xx=yy'
+    List<String> beConfigs = [
+        'max_sys_mem_available_low_water_mark_bytes=0', //no check mem available memory
+        'report_disk_state_interval_seconds=2',
+        'report_random_wait=false',
+    ]
+
+    boolean connectToFollower = false
+
+    // 1. cloudMode = true, only create cloud cluster.
+    // 2. cloudMode = false, only create none-cloud cluster.
+    // 3. cloudMode = null, create both cloud and none-cloud cluster, depend on the running pipeline mode.
+    Boolean cloudMode = false
+
+    // in cloud mode, deployment methods are divided into
+    // 1. master - multi observers
+    // 2. mutli followers - multi observers
+    // default use 1
+    Boolean useFollowersMode = false
+
+    // each be disks, a disks format is: disk_type=disk_num[,disk_capacity]
+    // here disk_type=HDD or SSD,  disk capacity is in gb unit.
+    // for example: beDisks = ["HDD=1", "SSD=2,10", "SSD=10,3"] means:
+    // each be has 1 HDD disks without capacity limit, 2 SSD disks with 10GB capacity limit,
+    // and 10 SSD disks with 3GB capacity limit
+    // if not specific, docker will let each be contains 1 HDD disk.
+    List<String> beDisks = null
 
     void enableDebugPoints() {
         feConfigs.add('enable_debug_points=true')
@@ -62,62 +104,54 @@ class ListHeader {
 
 }
 
-enum NodeType {
-
-    FE,
-    BE,
-
-}
-
 class ServerNode {
 
     int index
     String host
     int httpPort
     boolean alive
+    String path
 
     static void fromCompose(ServerNode node, ListHeader header, int index, List<Object> fields) {
         node.index = index
         node.host = (String) fields.get(header.indexOf('IP'))
         node.httpPort = (Integer) fields.get(header.indexOf('http_port'))
         node.alive = fields.get(header.indexOf('alive')) == 'true'
+        node.path = (String) fields.get(header.indexOf('path'))
     }
 
-    String getHttpAddress() {
-        return 'http://' + host + ':' + httpPort
+    static long toLongOrDefault(Object val, long defValue) {
+        return val == '' ? defValue : (long) val
+    }
+
+    def getHttpAddress() {
+        return [host, httpPort]
     }
 
     void enableDebugPoint(String name, Map<String, String> params = null) {
-        def url = getHttpAddress() + '/api/debug_point/add/' + name
-        if (params != null && params.size() > 0) {
-            url += '?' + params.collect((k, v) -> k + '=' + v).join('&')
-        }
-        def result = Http.http_post(url, null, true)
-        checkHttpResult(result)
+        def (host, port) = getHttpAddress()
+        DebugPoint.enableDebugPoint(host, port, getNodeType(), name, params)
     }
 
     void disableDebugPoint(String name) {
-        def url = getHttpAddress() + '/api/debug_point/remove/' + name
-        def result = Http.http_post(url, null, true)
-        checkHttpResult(result)
+        def (host, port) = getHttpAddress()
+        DebugPoint.disableDebugPoint(host, port, getNodeType(), name)
     }
 
     void clearDebugPoints() {
-        def url = getHttpAddress() + '/api/debug_point/clear'
-        def result = Http.http_post(url, null, true)
-        checkHttpResult(result)
-    }
-
-    private void checkHttpResult(Object result) {
-        def type = getNodeType()
-        if (type == NodeType.FE) {
-            assert result.code == 0 : result.toString()
-        } else if (type == NodeType.BE) {
-            assert result.status == 'OK' : result.toString()
-        }
+        def (host, port) = getHttpAddress()
+        DebugPoint.clearDebugPoints(host, port, getNodeType())
     }
 
     NodeType getNodeType() {
+        assert false : 'Unknown node type'
+    }
+
+    String getLogFilePath() {
+        assert false : 'Unknown node type'
+    }
+
+    String getConfFilePath() {
         assert false : 'Unknown node type'
     }
 
@@ -125,6 +159,7 @@ class ServerNode {
 
 class Frontend extends ServerNode {
 
+    int editLogPort
     int queryPort
     boolean isMaster
 
@@ -132,6 +167,7 @@ class Frontend extends ServerNode {
         Frontend fe = new Frontend()
         ServerNode.fromCompose(fe, header, index, fields)
         fe.queryPort = (Integer) fields.get(header.indexOf('query_port'))
+        fe.editLogPort = (Integer) fields.get(header.indexOf('edit_log_port'))
         fe.isMaster = fields.get(header.indexOf('is_master')) == 'true'
         return fe
     }
@@ -140,23 +176,86 @@ class Frontend extends ServerNode {
         return NodeType.FE
     }
 
+    String getLogFilePath() {
+        return path + '/log/fe.log'
+    }
+
+    String getConfFilePath() {
+        return path + '/conf/fe.conf'
+    }
+
 }
 
 class Backend extends ServerNode {
 
+    int heartbeatPort
     long backendId
     int tabletNum
 
     static Backend fromCompose(ListHeader header, int index, List<Object> fields) {
         Backend be = new Backend()
         ServerNode.fromCompose(be, header, index, fields)
-        be.backendId = (long) fields.get(header.indexOf('backend_id'))
-        be.tabletNum = (int) fields.get(header.indexOf('tablet_num'))
+        be.heartbeatPort = (Integer) fields.get(header.indexOf('heartbeat_port'))
+        be.backendId = toLongOrDefault(fields.get(header.indexOf('backend_id')), -1L)
+        be.tabletNum = (int) toLongOrDefault(fields.get(header.indexOf('tablet_num')), 0L)
+
         return be
     }
 
     NodeType getNodeType() {
         return NodeType.BE
+    }
+
+    String getLogFilePath() {
+        return path + '/log/be.INFO'
+    }
+
+    String getConfFilePath() {
+        return path + '/conf/be.conf'
+    }
+
+}
+
+class MetaService extends ServerNode {
+
+    static MetaService fromCompose(ListHeader header, int index, List<Object> fields) {
+        MetaService ms = new MetaService()
+        ServerNode.fromCompose(ms, header, index, fields)
+        return ms
+    }
+
+    NodeType getNodeType() {
+        return NodeType.MS
+    }
+
+    String getLogFilePath() {
+        return path + '/log/meta_service.INFO'
+    }
+
+    String getConfFilePath() {
+        return path + '/conf/doris_cloud.conf'
+    }
+
+}
+
+class Recycler extends ServerNode {
+
+    static Recycler fromCompose(ListHeader header, int index, List<Object> fields) {
+        Recycler rs = new Recycler()
+        ServerNode.fromCompose(rs, header, index, fields)
+        return rs
+    }
+
+    NodeType getNodeType() {
+        return NodeType.RECYCLER
+    }
+
+    String getLogFilePath() {
+        return path + '/log/recycler.INFO'
+    }
+
+    String getConfFilePath() {
+        return path + '/conf/doris_cloud.conf'
     }
 
 }
@@ -169,50 +268,77 @@ class SuiteCluster {
 
     final String name
     final Config config
-    private boolean inited
+    private boolean running
+    private boolean sqlModeNodeMgr = false
+    private boolean isCloudMode = false
 
     SuiteCluster(String name, Config config) {
         this.name = name
         this.config = config
-        this.inited = false
+        this.running = false
     }
 
-    void init(ClusterOptions options) {
-        if (inited) {
-            return
-        }
-
+    void init(ClusterOptions options, boolean isCloud) {
         assert name != null && name != ''
         assert options.feNum > 0 || options.beNum > 0
         assert config.image != null && config.image != ''
 
-        def sb = new StringBuilder()
-        sb.append('up ' + name + ' ')
-        sb.append(config.image + ' ')
+        this.isCloudMode = isCloud
+
+        def cmd = [
+            'up', name, config.image
+        ]
+
         if (options.feNum > 0) {
-            sb.append('--add-fe-num ' + options.feNum + ' ')
+            cmd += ['--add-fe-num', String.valueOf(options.feNum)]
         }
         if (options.beNum > 0) {
-            sb.append('--add-be-num ' + options.beNum + ' ')
+            cmd += ['--add-be-num', String.valueOf(options.beNum)]
         }
         // TODO: need escape white space in config
         if (options.feConfigs != null && options.feConfigs.size() > 0) {
-            sb.append('--fe-config ')
-            options.feConfigs.forEach(item -> sb.append(' ' + item + ' '))
+            cmd += ['--fe-config']
+            cmd += options.feConfigs
         }
         if (options.beConfigs != null && options.beConfigs.size() > 0) {
-            sb.append('--be-config ')
-            options.beConfigs.forEach(item -> sb.append(' ' + item + ' '))
+            cmd += ['--be-config']
+            cmd += options.beConfigs
         }
-        sb.append('--be-disk-num ' + options.beDiskNum + ' ')
-        sb.append('--wait-timeout 180')
+        if (options.beDisks != null) {
+            cmd += ['--be-disks']
+            cmd += options.beDisks
+        }
+        if (config.dockerCoverageOutputDir != null && config.dockerCoverageOutputDir != '') {
+            cmd += ['--coverage-dir', config.dockerCoverageOutputDir]
+        }
+        if (isCloud) {
+            cmd += ['--cloud']
+        }
 
-        runCmd(sb.toString(), -1)
+        if (isCloud && options.useFollowersMode) {
+            cmd += ['--fe-follower']
+        }
+
+        if (options.sqlModeNodeMgr) {
+            cmd += ['--sql-mode-node-mgr']
+        }
+        if (!options.beMetaServiceEndpoint) {
+            cmd += ['--no-be-metaservice-endpoint']
+        }
+        if (!options.beClusterId) {
+            cmd += ['--no-be-cluster-id']
+        }
+
+        cmd += ['--wait-timeout', String.valueOf(options.waitTimeout)]
+
+        sqlModeNodeMgr = options.sqlModeNodeMgr
+
+        runCmd(cmd.join(' '), -1)
 
         // wait be report disk
         Thread.sleep(5000)
 
-        inited = true
+        running = true
     }
 
     void injectDebugPoints(NodeType type, Map<String, Map<String, String>> injectPoints) {
@@ -248,6 +374,10 @@ class SuiteCluster {
         return getFrontends().stream().filter(fe -> fe.isMaster).findFirst().orElse(null)
     }
 
+    Frontend getOneFollowerFe() {
+        return getFrontends().stream().filter(fe -> !fe.isMaster).findFirst().orElse(null)
+    }
+
     Frontend getFeByIndex(int index) {
         return getFrontends().stream().filter(fe -> fe.index == index).findFirst().orElse(null)
     }
@@ -268,25 +398,44 @@ class SuiteCluster {
         return getBackends().stream().filter(be -> be.alive || !needAlive).collect(Collectors.toList());
     }
 
+    List<MetaService> getAllMetaservices(boolean needAlive = false) {
+        return getMetaservices().stream().filter(ms -> ms.alive || !needAlive).collect(Collectors.toList());
+    }
+
+    List<MetaService> getAllRecyclers(boolean needAlive = false) {
+        return getRecyclers().stream().filter(rc -> rc.alive || !needAlive).collect(Collectors.toList());
+    }
+
     private List<Frontend> getFrontends() {
-        List<Frontend> frontends = []
-        List<Backend> backends = []
-        getAllNodes(frontends, backends)
-        return frontends
+        def ret = getAllNodes()
+        return ret.getV1()
     }
 
     private List<Backend> getBackends() {
-        List<Frontend> frontends = []
-        List<Backend> backends = []
-        getAllNodes(frontends, backends)
-        return backends
+        def ret = getAllNodes()
+        return ret.getV2()
     }
 
-    private void getAllNodes(List<Frontend> frontends, List<Backend> backends) {
+    private List<MetaService> getMetaservices() {
+        def ret = getAllNodes()
+        return ret.getV3()
+    }
+
+    private List<Recycler> getRecyclers() {
+        def ret = getAllNodes()
+        return ret.getV4()
+    }
+
+    private Tuple4<List<Frontend>, List<Backend>, List<MetaService>, List<Recycler>> getAllNodes() {
+        List<Frontend> frontends = []
+        List<Backend> backends = []
+        List<MetaService> metaservices = []
+        List<Recycler> recyclers = []
         def cmd = 'ls ' + name + ' --detail'
         def data = runCmd(cmd)
         assert data instanceof List
         def rows = (List<List<Object>>) data
+        logger.info('get all nodes {}', rows)
         def header = new ListHeader(rows.get(0))
         for (int i = 1; i < rows.size(); i++) {
             def row = (List<Object>) rows.get(i)
@@ -297,32 +446,49 @@ class SuiteCluster {
             } else if (name.startsWith('fe-')) {
                 int index = name.substring('fe-'.length()) as int
                 frontends.add(Frontend.fromCompose(header, index, row))
+            } else if (name.startsWith('ms-')) {
+                int index = name.substring('ms-'.length()) as int
+                metaservices.add(MetaService.fromCompose(header, index, row))
+            } else if (name.startsWith('recycle-')) {
+                int index = name.substring('recycle-'.length()) as int
+                recyclers.add(Recycler.fromCompose(header, index, row))
+            } else if (name.startsWith('fdb-')) {
+            // current not used
             } else {
                 assert false : 'Unknown node type with name: ' + name
             }
         }
+        return new Tuple4(frontends, backends, metaservices, recyclers)
     }
 
-    List<Integer> addFrontend(int num) throws Exception {
-        def result = add(num, 0)
+    List<Integer> addFrontend(int num, boolean followerMode=false) throws Exception {
+        def result = add(num, 0, null, followerMode)
         return result.first
     }
 
-    List<Integer> addBackend(int num) throws Exception {
-        def result = add(0, num)
+    List<Integer> addBackend(int num, String ClusterName='') throws Exception {
+        def result = add(0, num, ClusterName)
         return result.second
     }
 
-    Tuple2<List<Integer>, List<Integer>> add(int feNum, int beNum) throws Exception {
+    // ATTN: clusterName just used for cloud mode, 1 cluster has n bes
+    // ATTN: followerMode just used for cloud mode
+    Tuple2<List<Integer>, List<Integer>> add(int feNum, int beNum, String clusterName, boolean followerMode=false) throws Exception {
         assert feNum > 0 || beNum > 0
 
         def sb = new StringBuilder()
         sb.append('up ' + name + ' ')
         if (feNum > 0) {
             sb.append('--add-fe-num ' + feNum + ' ')
+            if (followerMode) {
+                sb.append('--fe-follower' + ' ')
+            }
         }
         if (beNum > 0) {
             sb.append('--add-be-num ' + beNum + ' ')
+            if (clusterName != null && !clusterName.isEmpty()) {
+                sb.append(' --be-cluster ' + clusterName + ' ')
+            }
         }
         sb.append('--wait-timeout 60')
 
@@ -337,48 +503,57 @@ class SuiteCluster {
     }
 
     void destroy(boolean clean) throws Exception {
-        def cmd = 'down ' + name
-        if (clean) {
-            cmd += ' --clean'
+        try {
+            def cmd = 'down ' + name
+            if (clean) {
+                cmd += ' --clean'
+            }
+            runCmd(cmd)
+        } finally {
+            running = false
         }
-        runCmd(cmd)
-        inited = false
     }
+
+    boolean isRunning() {
+        return running
+    }
+
+    boolean isCloudMode() {
+        return this.isCloudMode
+    }
+
+    int START_WAIT_TIMEOUT = 120
 
     // if not specific fe indices, then start all frontends
     void startFrontends(int... indices) {
-        runFrontendsCmd('start', indices)
-        waitHbChanged()
+        runFrontendsCmd(START_WAIT_TIMEOUT + 5, "start  --wait-timeout ${START_WAIT_TIMEOUT}".toString(), indices)
     }
 
     // if not specific be indices, then start all backends
     void startBackends(int... indices) {
-        runBackendsCmd('start', indices)
-        waitHbChanged()
+        runBackendsCmd(START_WAIT_TIMEOUT + 5, "start  --wait-timeout ${START_WAIT_TIMEOUT}".toString(), indices)
     }
 
     // if not specific fe indices, then stop all frontends
     void stopFrontends(int... indices) {
-        runFrontendsCmd('stop', indices)
+        runFrontendsCmd(60, 'stop', indices)
         waitHbChanged()
     }
 
     // if not specific be indices, then stop all backends
     void stopBackends(int... indices) {
-        runBackendsCmd('stop', indices)
+        runBackendsCmd(60, 'stop', indices)
         waitHbChanged()
     }
 
     // if not specific fe indices, then restart all frontends
     void restartFrontends(int... indices) {
-        runFrontendsCmd('restart', indices)
-        waitHbChanged()
+        runFrontendsCmd(START_WAIT_TIMEOUT + 5, "restart --wait-timeout ${START_WAIT_TIMEOUT}".toString(), indices)
     }
 
     // if not specific be indices, then restart all backends
     void restartBackends(int... indices) {
-        runBackendsCmd('restart', indices)
-        waitHbChanged()
+        runBackendsCmd(START_WAIT_TIMEOUT + 5, "restart --wait-timeout ${START_WAIT_TIMEOUT}".toString(), indices)
     }
 
     // if not specific fe indices, then drop all frontends
@@ -387,7 +562,7 @@ class SuiteCluster {
         if (clean) {
             cmd += ' --clean'
         }
-        runFrontendsCmd(cmd, indices)
+        runFrontendsCmd(60, cmd, indices)
     }
 
     // if not specific be indices, then decommission all backends
@@ -405,7 +580,7 @@ class SuiteCluster {
         if (clean) {
             cmd += ' --clean'
         }
-        runBackendsCmd(cmd, indices)
+        runBackendsCmd(60, cmd, indices)
     }
 
     void checkFeIsAlive(int index, boolean isAlive) {
@@ -440,26 +615,28 @@ class SuiteCluster {
         }
     }
 
-    private void waitHbChanged() {
-        Thread.sleep(6000)
-    }
-
-    private void runFrontendsCmd(String op, int... indices) {
-        def cmd = op + ' ' + name + ' --fe-id ' + indices.join(' ')
+    void addRWPermToAllFiles() {
+        def cmd = 'add-rw-perm ' + name
         runCmd(cmd)
     }
 
-    private void runBackendsCmd(Integer timeoutSecond = null, String op, int... indices) {
+    private void waitHbChanged() {
+        // heart beat interval is 5s
+        Thread.sleep(7000)
+    }
+
+    private void runFrontendsCmd(int timeoutSecond, String op, int... indices) {
+        def cmd = op + ' ' + name + ' --fe-id ' + indices.join(' ')
+        runCmd(cmd, timeoutSecond)
+    }
+
+    private void runBackendsCmd(int timeoutSecond, String op, int... indices) {
         def cmd = op + ' ' + name + ' --be-id ' + indices.join(' ')
-        if (timeoutSecond == null) {
-            runCmd(cmd)
-        } else {
-            runCmd(cmd, timeoutSecond)
-        }
+        runCmd(cmd, timeoutSecond)
     }
 
     private Object runCmd(String cmd, int timeoutSecond = 60) throws Exception {
-        def fullCmd = String.format('python %s %s --output-json', config.dorisComposePath, cmd)
+        def fullCmd = String.format('python -W ignore %s %s --output-json', config.dorisComposePath, cmd)
         logger.info('Run doris compose cmd: {}', fullCmd)
         def proc = fullCmd.execute()
         def outBuf = new StringBuilder()
@@ -470,14 +647,15 @@ class SuiteCluster {
         } else {
             proc.waitFor()
         }
-        def out = outBuf.toString()
-        def err = errBuf.toString()
-        if (proc.exitValue()) {
+        if (proc.exitValue() != 0) {
             throw new Exception(String.format('Exit value: %s != 0, stdout: %s, stderr: %s',
-                                              proc.exitValue(), out, err))
+                                              proc.exitValue(), outBuf.toString(), errBuf.toString()))
         }
         def parser = new JsonSlurper()
-        def object = (Map<String, Object>) parser.parseText(out)
+        if (outBuf.toString().size() == 0) {
+            throw new Exception(String.format('doris compose output is empty, err: %s', errBuf.toString()))
+        }
+        def object = (Map<String, Object>) parser.parseText(outBuf.toString())
         if (object.get('code') != 0) {
             throw new Exception(String.format('Code: %s != 0, err: %s', object.get('code'), object.get('err')))
         }

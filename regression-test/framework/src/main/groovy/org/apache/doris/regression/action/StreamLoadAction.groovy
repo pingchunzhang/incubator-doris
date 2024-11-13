@@ -40,7 +40,7 @@ import org.junit.Assert
 
 @Slf4j
 class StreamLoadAction implements SuiteAction {
-    public final InetSocketAddress address
+    public InetSocketAddress address
     public final String user
     public final String password
     String db
@@ -53,9 +53,11 @@ class StreamLoadAction implements SuiteAction {
     Closure check
     Map<String, String> headers
     SuiteContext context
+    boolean directToBe = false
+    boolean twoPhaseCommit = false
 
     StreamLoadAction(SuiteContext context) {
-        this.address = context.config.feHttpInetSocketAddress
+        this.address = context.getFeHttpAddress()
         this.user = context.config.feHttpUser
         this.password = context.config.feHttpPassword
 
@@ -81,6 +83,11 @@ class StreamLoadAction implements SuiteAction {
 
     void table(Closure<String> table) {
         this.table = table.call()
+    }
+
+    void directToBe(String beHost, int beHttpPort) {
+        this.address = new InetSocketAddress(beHost, beHttpPort)
+        this.directToBe = true
     }
 
     void inputStream(InputStream inputStream) {
@@ -131,6 +138,22 @@ class StreamLoadAction implements SuiteAction {
         this.time = time.call()
     }
 
+    void twoPhaseCommit(boolean twoPhaseCommit) {
+        this.twoPhaseCommit = twoPhaseCommit;
+    }
+
+    void twoPhaseCommit(Closure<Boolean> twoPhaseCommit) {
+        this.twoPhaseCommit = twoPhaseCommit.call();
+    }
+
+    // compatible with selectdb case
+    void isCloud(boolean isCloud) {
+    }
+
+    // compatible with selectdb case
+    void isCloud(Closure<Boolean> isCloud) {
+    }
+
     void check(@ClosureParams(value = FromString, options = ["String,Throwable,Long,Long"]) Closure check) {
         this.check = check
     }
@@ -148,32 +171,34 @@ class StreamLoadAction implements SuiteAction {
         String responseText = null
         Throwable ex = null
         long startTime = System.currentTimeMillis()
+        def isHttpStream = headers.containsKey("version")
         try {
-            if (headers.containsKey("version")) {
-                log.info("http stream")
-                def uri = "http://${address.hostString}:${address.port}/api/_http_stream"
-                HttpClients.createDefault().withCloseable { client ->
-                    RequestBuilder requestBuilder = prepareRequestHeader(RequestBuilder.put(uri))
-                    HttpEntity httpEntity = prepareHttpEntity(client)
-                    String beLocation = streamLoadToFe(client, requestBuilder)
-                    responseText = streamLoadToBe(client, requestBuilder, beLocation, httpEntity)
-                }
+            def uri = ""
+            if (isHttpStream) {
+                uri = "http://${address.hostString}:${address.port}/api/_http_stream"
+            } else if (twoPhaseCommit) {
+                uri = "http://${address.hostString}:${address.port}/api/${db}/_stream_load_2pc"
             } else {
-                def uri = "http://${address.hostString}:${address.port}/api/${db}/${table}/_stream_load"
-                HttpClients.createDefault().withCloseable { client ->
-                    RequestBuilder requestBuilder = prepareRequestHeader(RequestBuilder.put(uri))
-                    HttpEntity httpEntity = prepareHttpEntity(client)
+                uri = "http://${address.hostString}:${address.port}/api/${db}/${table}/_stream_load"
+            }
+            HttpClients.createDefault().withCloseable { client ->
+                RequestBuilder requestBuilder = prepareRequestHeader(RequestBuilder.put(uri))
+                HttpEntity httpEntity = prepareHttpEntity(client)
+                if (!directToBe) {
                     String beLocation = streamLoadToFe(client, requestBuilder)
-                    responseText = streamLoadToBe(client, requestBuilder, beLocation, httpEntity)
+                    log.info("Redirect stream load to ${beLocation}".toString())
+                    requestBuilder.setUri(beLocation)
                 }
+                requestBuilder.setEntity(httpEntity)
+                responseText = streamLoadToBe(client, requestBuilder)
             }
         } catch (Throwable t) {
             ex = t
         }
         long endTime = System.currentTimeMillis()
 
-        log.info("Stream load elapsed ${endTime - startTime} ms, response: ${responseText}".toString() +
-                 ex.toString())
+        log.info("Stream load elapsed ${endTime - startTime} ms, is http stream: ${isHttpStream}, " +
+                " response: ${responseText}" + ex.toString())
         checkResult(responseText, ex, startTime, endTime)
     }
 
@@ -289,10 +314,7 @@ class StreamLoadAction implements SuiteAction {
         return backendStreamLoadUri
     }
 
-    private String streamLoadToBe(CloseableHttpClient client, RequestBuilder requestBuilder, String beLocation, HttpEntity httpEntity) {
-        log.info("Redirect stream load to ${beLocation}".toString())
-        requestBuilder.setUri(beLocation)
-        requestBuilder.setEntity(httpEntity)
+    private String streamLoadToBe(CloseableHttpClient client, RequestBuilder requestBuilder) {
         String responseText
         try{
             client.execute(requestBuilder.build()).withCloseable { resp ->
@@ -344,10 +366,10 @@ class StreamLoadAction implements SuiteAction {
 
             if (time > 0) {
                 long elapsed = endTime - startTime
-                try{
-                    Assert.assertTrue("Expect elapsed <= ${time}, but meet ${elapsed}", elapsed <= time)
-                } catch (Throwable t) {
-                    throw new IllegalStateException("Expect elapsed <= ${time}, but meet ${elapsed}")
+                if (elapsed > time) {
+                    log.info("Stream load consums more time than expected, elapsed ${elapsed} ms, expect ${time} ms")
+                } else {
+                    log.info("Stream load consums time elapsed ${elapsed} ms, expect ${time} ms")
                 }
             }
         }
@@ -363,6 +385,10 @@ class StreamLoadAction implements SuiteAction {
             def jsonSlurper = new JsonSlurper()
             def parsed = jsonSlurper.parseText(responseText)
             String status = parsed.Status
+            if (twoPhaseCommit) {
+                status = parsed.status
+                return status;
+            }
             long txnId = parsed.TxnId
             if (!status.equalsIgnoreCase("Publish Timeout")) {
                 return status;

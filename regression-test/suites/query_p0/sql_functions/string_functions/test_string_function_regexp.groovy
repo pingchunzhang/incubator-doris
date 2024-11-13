@@ -51,6 +51,11 @@ suite("test_string_function_regexp") {
 
     qt_sql "SELECT regexp_extract('AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 1);"
     qt_sql "SELECT regexp_extract('AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 2);"
+    qt_sql "SELECT regexp_extract('AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 3);"
+
+    qt_sql "SELECT regexp_extract_or_null('AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 1);"
+    qt_sql "SELECT regexp_extract_or_null('AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 2);"
+    qt_sql "SELECT regexp_extract_or_null('AbCdE', '([[:lower:]]+)C([[:lower:]]+)', 3);"
 
     qt_sql "SELECT regexp_extract_all('x=a3&x=18abc&x=2&y=3&x=4&x=17bcd', 'x=([0-9]+)([a-z]+)');"
     qt_sql "SELECT regexp_extract_all('http://a.m.baidu.com/i41915i73660.htm', 'i([0-9]+)');"
@@ -58,6 +63,7 @@ suite("test_string_function_regexp") {
     qt_sql "select regexp_extract_all('xxfs','f');"
     qt_sql "select regexp_extract_all('asdfg', '(z|x|c|)');"
     qt_sql "select regexp_extract_all('abcdfesscca', '(ab|c|)');"
+    qt_sql_regexp_extract_all "select regexp_extract_all('', '\"([^\"]+)\":'), length(regexp_extract_all('', '\"([^\"]+)\":')) from test_string_function_regexp;"
 
     qt_sql "SELECT regexp_replace('a b c', \" \", \"-\");"
     qt_sql "SELECT regexp_replace('a b c','(b)','<\\\\1>');"
@@ -150,5 +156,7 @@ suite("test_string_function_regexp") {
     qt_sql_field1 "select name from ${tbName2} order by field(name,'Suzi','Ben','Henry');"
     qt_sql_field2 "select name from ${tbName2} order by field(name,'Ben','Henry');"
     qt_sql_field3 "select name from ${tbName2} order by field(name,'Henry') desc,id;"
-}
 
+    qt_sql_field4 "SELECT FIELD('21','2130', '2131', '21');"
+    qt_sql_field5 "SELECT FIELD(21, 2130, 21, 2131);"
+}

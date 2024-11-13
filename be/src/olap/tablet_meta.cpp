@@ -26,17 +26,28 @@
 #include <json2pb/pb_to_json.h>
 #include <time.h>
 
+#include <cstdint>
 #include <set>
 #include <utility>
 
+#include "cloud/cloud_meta_mgr.h"
+#include "cloud/cloud_storage_engine.h"
+#include "cloud/config.h"
 #include "common/config.h"
+#include "gutil/integral_types.h"
 #include "io/fs/file_writer.h"
+#include "io/fs/local_file_system.h"
 #include "olap/data_dir.h"
 #include "olap/file_header.h"
 #include "olap/olap_common.h"
 #include "olap/olap_define.h"
+#include "olap/rowset/rowset.h"
+#include "olap/rowset/rowset_meta_manager.h"
 #include "olap/tablet_meta_manager.h"
 #include "olap/utils.h"
+#include "util/debug_points.h"
+#include "util/mem_info.h"
+#include "util/parse_util.h"
 #include "util/string_util.h"
 #include "util/time.h"
 #include "util/uid_util.h"
@@ -48,15 +59,31 @@ using std::vector;
 namespace doris {
 using namespace ErrorCode;
 
-Status TabletMeta::create(const TCreateTabletReq& request, const TabletUid& tablet_uid,
-                          uint64_t shard_id, uint32_t next_unique_id,
-                          const unordered_map<uint32_t, uint32_t>& col_ordinal_to_unique_id,
-                          TabletMetaSharedPtr* tablet_meta) {
+TabletMetaSharedPtr TabletMeta::create(
+        const TCreateTabletReq& request, const TabletUid& tablet_uid, uint64_t shard_id,
+        uint32_t next_unique_id,
+        const unordered_map<uint32_t, uint32_t>& col_ordinal_to_unique_id) {
     std::optional<TBinlogConfig> binlog_config;
     if (request.__isset.binlog_config) {
         binlog_config = request.binlog_config;
     }
-    *tablet_meta = std::make_shared<TabletMeta>(
+    TInvertedIndexFileStorageFormat::type inverted_index_file_storage_format =
+            request.inverted_index_file_storage_format;
+
+    // We will discard this format. Don't make any further changes here.
+    if (request.__isset.inverted_index_storage_format) {
+        switch (request.inverted_index_storage_format) {
+        case TInvertedIndexStorageFormat::V1:
+            inverted_index_file_storage_format = TInvertedIndexFileStorageFormat::V1;
+            break;
+        case TInvertedIndexStorageFormat::V2:
+            inverted_index_file_storage_format = TInvertedIndexFileStorageFormat::V2;
+            break;
+        default:
+            break;
+        }
+    }
+    return std::make_shared<TabletMeta>(
             request.table_id, request.partition_id, request.tablet_id, request.replica_id,
             request.tablet_schema.schema_hash, shard_id, request.tablet_schema, next_unique_id,
             col_ordinal_to_unique_id, tablet_uid,
@@ -68,8 +95,9 @@ Status TabletMeta::create(const TCreateTabletReq& request, const TabletUid& tabl
             std::move(binlog_config), request.compaction_policy,
             request.time_series_compaction_goal_size_mbytes,
             request.time_series_compaction_file_count_threshold,
-            request.time_series_compaction_time_threshold_seconds);
-    return Status::OK();
+            request.time_series_compaction_time_threshold_seconds,
+            request.time_series_compaction_empty_rowsets_threshold,
+            request.time_series_compaction_level_threshold, inverted_index_file_storage_format);
 }
 
 TabletMeta::TabletMeta()
@@ -87,7 +115,10 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
                        std::optional<TBinlogConfig> binlog_config, std::string compaction_policy,
                        int64_t time_series_compaction_goal_size_mbytes,
                        int64_t time_series_compaction_file_count_threshold,
-                       int64_t time_series_compaction_time_threshold_seconds)
+                       int64_t time_series_compaction_time_threshold_seconds,
+                       int64_t time_series_compaction_empty_rowsets_threshold,
+                       int64_t time_series_compaction_level_threshold,
+                       TInvertedIndexFileStorageFormat::type inverted_index_file_storage_format)
         : _tablet_uid(0, 0),
           _schema(new TabletSchema),
           _delete_bitmap(new DeleteBitmap(tablet_id)) {
@@ -115,6 +146,10 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
             time_series_compaction_file_count_threshold);
     tablet_meta_pb.set_time_series_compaction_time_threshold_seconds(
             time_series_compaction_time_threshold_seconds);
+    tablet_meta_pb.set_time_series_compaction_empty_rowsets_threshold(
+            time_series_compaction_empty_rowsets_threshold);
+    tablet_meta_pb.set_time_series_compaction_level_threshold(
+            time_series_compaction_level_threshold);
     TabletSchemaPB* schema = tablet_meta_pb.mutable_schema();
     schema->set_num_short_key_columns(tablet_schema.short_key_column_count);
     schema->set_num_rows_per_row_block(config::default_num_rows_per_column_file_block);
@@ -161,6 +196,18 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
         break;
     }
 
+    switch (inverted_index_file_storage_format) {
+    case TInvertedIndexFileStorageFormat::V1:
+        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V1);
+        break;
+    case TInvertedIndexFileStorageFormat::V2:
+        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V2);
+        break;
+    default:
+        schema->set_inverted_index_storage_format(InvertedIndexStorageFormatPB::V2);
+        break;
+    }
+
     switch (tablet_schema.sort_type) {
     case TSortType::type::ZORDER:
         schema->set_sort_type(SortType::ZORDER);
@@ -169,6 +216,9 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
         schema->set_sort_type(SortType::LEXICAL);
     }
     schema->set_sort_col_num(tablet_schema.sort_col_num);
+    for (const auto& i : tablet_schema.cluster_key_idxes) {
+        schema->add_cluster_key_idxes(i);
+    }
     tablet_meta_pb.set_in_restore_mode(false);
 
     // set column information
@@ -261,6 +311,10 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
         schema->set_disable_auto_compaction(tablet_schema.disable_auto_compaction);
     }
 
+    if (tablet_schema.__isset.variant_enable_flatten_nested) {
+        schema->set_variant_enable_flatten_nested(tablet_schema.variant_enable_flatten_nested);
+    }
+
     if (tablet_schema.__isset.enable_single_replica_compaction) {
         schema->set_enable_single_replica_compaction(
                 tablet_schema.enable_single_replica_compaction);
@@ -272,8 +326,15 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
     if (tablet_schema.__isset.store_row_column) {
         schema->set_store_row_column(tablet_schema.store_row_column);
     }
+    if (tablet_schema.__isset.row_store_page_size) {
+        schema->set_row_store_page_size(tablet_schema.row_store_page_size);
+    }
     if (tablet_schema.__isset.skip_write_index_on_load) {
         schema->set_skip_write_index_on_load(tablet_schema.skip_write_index_on_load);
+    }
+    if (tablet_schema.__isset.row_store_col_cids) {
+        schema->mutable_row_store_column_unique_ids()->Add(tablet_schema.row_store_col_cids.begin(),
+                                                           tablet_schema.row_store_col_cids.end());
     }
     if (binlog_config.has_value()) {
         BinlogConfig tmp_binlog_config;
@@ -282,11 +343,12 @@ TabletMeta::TabletMeta(int64_t table_id, int64_t partition_id, int64_t tablet_id
     }
 
     init_from_pb(tablet_meta_pb);
-    LOG(INFO) << "init tablet meta from pb: " << tablet_meta_pb.ShortDebugString();
 }
 
 TabletMeta::TabletMeta(const TabletMeta& b)
-        : _table_id(b._table_id),
+        : MetadataAdder(b),
+          _table_id(b._table_id),
+          _index_id(b._index_id),
           _partition_id(b._partition_id),
           _tablet_id(b._tablet_id),
           _replica_id(b._replica_id),
@@ -312,13 +374,17 @@ TabletMeta::TabletMeta(const TabletMeta& b)
           _time_series_compaction_file_count_threshold(
                   b._time_series_compaction_file_count_threshold),
           _time_series_compaction_time_threshold_seconds(
-                  b._time_series_compaction_time_threshold_seconds) {};
+                  b._time_series_compaction_time_threshold_seconds),
+          _time_series_compaction_empty_rowsets_threshold(
+                  b._time_series_compaction_empty_rowsets_threshold),
+          _time_series_compaction_level_threshold(b._time_series_compaction_level_threshold) {};
 
 void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tcolumn,
                                           ColumnPB* column) {
     column->set_unique_id(unique_id);
     column->set_name(tcolumn.column_name);
     column->set_has_bitmap_index(tcolumn.has_bitmap_index);
+    column->set_is_auto_increment(tcolumn.is_auto_increment);
     string data_type;
     EnumToString(TPrimitiveType, tcolumn.column_type.type, data_type);
     column->set_type(data_type);
@@ -332,6 +398,10 @@ void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tco
 
     if (tcolumn.__isset.result_is_nullable) {
         column->set_result_is_nullable(tcolumn.result_is_nullable);
+    }
+
+    if (tcolumn.__isset.be_exec_version) {
+        column->set_be_exec_version(tcolumn.be_exec_version);
     }
 
     if (tcolumn.column_type.type == TPrimitiveType::VARCHAR ||
@@ -364,7 +434,8 @@ void TabletMeta::init_column_from_tcolumn(uint32_t unique_id, const TColumn& tco
     }
     for (size_t i = 0; i < tcolumn.children_column.size(); i++) {
         ColumnPB* children_column = column->add_children_columns();
-        init_column_from_tcolumn(i, tcolumn.children_column[i], children_column);
+        init_column_from_tcolumn(tcolumn.children_column[i].col_unique_id,
+                                 tcolumn.children_column[i], children_column);
     }
 }
 
@@ -391,7 +462,7 @@ std::string TabletMeta::construct_header_file_path(const string& schema_hash_pat
     return header_name_stream.str();
 }
 
-Status TabletMeta::save_as_json(const string& file_path, DataDir* dir) {
+Status TabletMeta::save_as_json(const string& file_path) {
     std::string json_meta;
     json2pb::Pb2JsonOptions json_options;
     json_options.pretty_json = true;
@@ -399,7 +470,7 @@ Status TabletMeta::save_as_json(const string& file_path, DataDir* dir) {
     to_json(&json_meta, json_options);
     // save to file
     io::FileWriterPtr file_writer;
-    RETURN_IF_ERROR(dir->fs()->create_file(file_path, &file_writer));
+    RETURN_IF_ERROR(io::global_local_filesystem()->create_file(file_path, &file_writer));
     RETURN_IF_ERROR(file_writer->append(json_meta));
     RETURN_IF_ERROR(file_writer->close());
     return Status::OK();
@@ -440,7 +511,7 @@ Status TabletMeta::_save_meta(DataDir* data_dir) {
     string meta_binary;
 
     auto t1 = MonotonicMicros();
-    RETURN_IF_ERROR(serialize(&meta_binary));
+    serialize(&meta_binary);
     auto t2 = MonotonicMicros();
     Status status = TabletMetaManager::save(data_dir, tablet_id(), schema_hash(), meta_binary);
     if (!status.ok()) {
@@ -457,19 +528,47 @@ Status TabletMeta::_save_meta(DataDir* data_dir) {
     return status;
 }
 
-Status TabletMeta::serialize(string* meta_binary) {
+void TabletMeta::serialize(string* meta_binary) {
     TabletMetaPB tablet_meta_pb;
     to_meta_pb(&tablet_meta_pb);
+    if (tablet_meta_pb.partition_id() <= 0) {
+        LOG(WARNING) << "invalid partition id " << tablet_meta_pb.partition_id() << " tablet "
+                     << tablet_meta_pb.tablet_id();
+    }
+    DBUG_EXECUTE_IF("TabletMeta::serialize::zero_partition_id", {
+        long partition_id = tablet_meta_pb.partition_id();
+        tablet_meta_pb.set_partition_id(0);
+        LOG(WARNING) << "set debug point TabletMeta::serialize::zero_partition_id old="
+                     << partition_id << " new=" << tablet_meta_pb.DebugString();
+    });
     bool serialize_success = tablet_meta_pb.SerializeToString(meta_binary);
+    if (!_rs_metas.empty() || !_stale_rs_metas.empty()) {
+        _avg_rs_meta_serialize_size =
+                meta_binary->length() / (_rs_metas.size() + _stale_rs_metas.size());
+        if (meta_binary->length() > config::tablet_meta_serialize_size_limit ||
+            !serialize_success) {
+            int64_t origin_meta_size = meta_binary->length();
+            int64_t stale_rowsets_num = tablet_meta_pb.stale_rs_metas().size();
+            tablet_meta_pb.clear_stale_rs_metas();
+            meta_binary->clear();
+            serialize_success = tablet_meta_pb.SerializeToString(meta_binary);
+            LOG(WARNING) << "tablet meta serialization size exceeds limit: "
+                         << config::tablet_meta_serialize_size_limit
+                         << " clean up stale rowsets, tablet id: " << tablet_id()
+                         << " stale rowset num: " << stale_rowsets_num
+                         << " serialization size before clean " << origin_meta_size
+                         << " serialization size after clean " << meta_binary->length();
+        }
+    }
+
     if (!serialize_success) {
         LOG(FATAL) << "failed to serialize meta " << tablet_id();
     }
-    return Status::OK();
 }
 
-Status TabletMeta::deserialize(const string& meta_binary) {
+Status TabletMeta::deserialize(std::string_view meta_binary) {
     TabletMetaPB tablet_meta_pb;
-    bool parsed = tablet_meta_pb.ParseFromString(meta_binary);
+    bool parsed = tablet_meta_pb.ParseFromArray(meta_binary.data(), meta_binary.size());
     if (!parsed) {
         return Status::Error<INIT_FAILED>("parse tablet meta failed");
     }
@@ -477,21 +576,9 @@ Status TabletMeta::deserialize(const string& meta_binary) {
     return Status::OK();
 }
 
-void TabletMeta::init_rs_metas_fs(const io::FileSystemSPtr& fs) {
-    for (auto& rs_meta : _rs_metas) {
-        if (rs_meta->is_local()) {
-            rs_meta->set_fs(fs);
-        }
-    }
-    for (auto& rs_meta : _stale_rs_metas) {
-        if (rs_meta->is_local()) {
-            rs_meta->set_fs(fs);
-        }
-    }
-}
-
 void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     _table_id = tablet_meta_pb.table_id();
+    _index_id = tablet_meta_pb.index_id();
     _partition_id = tablet_meta_pb.partition_id();
     _tablet_id = tablet_meta_pb.tablet_id();
     _replica_id = tablet_meta_pb.replica_id();
@@ -500,6 +587,7 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     _creation_time = tablet_meta_pb.creation_time();
     _cumulative_layer_point = tablet_meta_pb.cumulative_layer_point();
     _tablet_uid = TabletUid(tablet_meta_pb.tablet_uid());
+    _ttl_seconds = tablet_meta_pb.ttl_seconds();
     if (tablet_meta_pb.has_tablet_type()) {
         _tablet_type = tablet_meta_pb.tablet_type();
     } else {
@@ -545,7 +633,7 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
     // For mow table, delete bitmap of stale rowsets has not been persisted.
     // When be restart, query should not read the stale rowset, otherwise duplicate keys
     // will be read out. Therefore, we don't add them to _stale_rs_meta for mow table.
-    if (!_enable_unique_key_merge_on_write) {
+    if (!config::skip_loading_stale_rowset_meta && !_enable_unique_key_merge_on_write) {
         for (auto& it : tablet_meta_pb.stale_rs_metas()) {
             RowsetMetaSharedPtr rs_meta(new RowsetMeta());
             rs_meta->init_from_pb(it);
@@ -593,10 +681,15 @@ void TabletMeta::init_from_pb(const TabletMetaPB& tablet_meta_pb) {
             tablet_meta_pb.time_series_compaction_file_count_threshold();
     _time_series_compaction_time_threshold_seconds =
             tablet_meta_pb.time_series_compaction_time_threshold_seconds();
+    _time_series_compaction_empty_rowsets_threshold =
+            tablet_meta_pb.time_series_compaction_empty_rowsets_threshold();
+    _time_series_compaction_level_threshold =
+            tablet_meta_pb.time_series_compaction_level_threshold();
 }
 
 void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
     tablet_meta_pb->set_table_id(table_id());
+    tablet_meta_pb->set_index_id(index_id());
     tablet_meta_pb->set_partition_id(partition_id());
     tablet_meta_pb->set_tablet_id(tablet_id());
     tablet_meta_pb->set_replica_id(replica_id());
@@ -606,6 +699,7 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
     tablet_meta_pb->set_cumulative_layer_point(cumulative_layer_point());
     *(tablet_meta_pb->mutable_tablet_uid()) = tablet_uid().to_proto();
     tablet_meta_pb->set_tablet_type(_tablet_type);
+    tablet_meta_pb->set_ttl_seconds(_ttl_seconds);
     switch (tablet_state()) {
     case TABLET_NOTREADY:
         tablet_meta_pb->set_tablet_state(PB_NOTREADY);
@@ -624,12 +718,16 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
         break;
     }
 
-    for (auto& rs : _rs_metas) {
-        rs->to_rowset_pb(tablet_meta_pb->add_rs_metas());
+    // RowsetMetaPB is separated from TabletMetaPB
+    if (!config::is_cloud_mode()) {
+        for (auto& rs : _rs_metas) {
+            rs->to_rowset_pb(tablet_meta_pb->add_rs_metas());
+        }
+        for (auto rs : _stale_rs_metas) {
+            rs->to_rowset_pb(tablet_meta_pb->add_stale_rs_metas());
+        }
     }
-    for (auto rs : _stale_rs_metas) {
-        rs->to_rowset_pb(tablet_meta_pb->add_stale_rs_metas());
-    }
+
     _schema->to_schema_pb(tablet_meta_pb->mutable_schema());
 
     tablet_meta_pb->set_in_restore_mode(in_restore_mode());
@@ -674,9 +772,13 @@ void TabletMeta::to_meta_pb(TabletMetaPB* tablet_meta_pb) {
             time_series_compaction_file_count_threshold());
     tablet_meta_pb->set_time_series_compaction_time_threshold_seconds(
             time_series_compaction_time_threshold_seconds());
+    tablet_meta_pb->set_time_series_compaction_empty_rowsets_threshold(
+            time_series_compaction_empty_rowsets_threshold());
+    tablet_meta_pb->set_time_series_compaction_level_threshold(
+            time_series_compaction_level_threshold());
 }
 
-uint32_t TabletMeta::mem_size() const {
+int64_t TabletMeta::mem_size() const {
     auto size = sizeof(TabletMeta);
     size += _schema->mem_size();
     return size;
@@ -698,6 +800,16 @@ Version TabletMeta::max_version() const {
     return max_version;
 }
 
+size_t TabletMeta::version_count_cross_with_range(const Version& range) const {
+    size_t count = 0;
+    for (const auto& rs_meta : _rs_metas) {
+        if (!(range.first > rs_meta->version().second || range.second < rs_meta->version().first)) {
+            count++;
+        }
+    }
+    return count;
+}
+
 Status TabletMeta::add_rs_meta(const RowsetMetaSharedPtr& rs_meta) {
     // check RowsetMeta is valid
     for (auto& rs : _rs_metas) {
@@ -714,6 +826,12 @@ Status TabletMeta::add_rs_meta(const RowsetMetaSharedPtr& rs_meta) {
     }
     _rs_metas.push_back(rs_meta);
     return Status::OK();
+}
+
+void TabletMeta::add_rowsets_unchecked(const std::vector<RowsetSharedPtr>& to_add) {
+    for (const auto& rs : to_add) {
+        _rs_metas.push_back(rs->rowset_meta());
+    }
 }
 
 void TabletMeta::delete_rs_meta_by_version(const Version& version,
@@ -746,11 +864,6 @@ void TabletMeta::modify_rs_metas(const std::vector<RowsetMetaSharedPtr>& to_add,
             } else {
                 ++it;
             }
-        }
-        // delete delete_bitmap of to_delete's rowsets if not added to _stale_rs_metas.
-        if (same_version && _enable_unique_key_merge_on_write) {
-            delete_bitmap().remove({rs_to_del->rowset_id(), 0, 0},
-                                   {rs_to_del->rowset_id(), UINT32_MAX, 0});
         }
     }
     if (!same_version) {
@@ -828,8 +941,8 @@ RowsetMetaSharedPtr TabletMeta::acquire_stale_rs_meta_by_version(const Version& 
 
 Status TabletMeta::set_partition_id(int64_t partition_id) {
     if ((_partition_id > 0 && _partition_id != partition_id) || partition_id < 1) {
-        LOG(FATAL) << "cur partition id=" << _partition_id << " new partition id=" << partition_id
-                   << " not equal";
+        LOG(WARNING) << "cur partition id=" << _partition_id << " new partition id=" << partition_id
+                     << " not equal";
     }
     _partition_id = partition_id;
     return Status::OK();
@@ -837,6 +950,7 @@ Status TabletMeta::set_partition_id(int64_t partition_id) {
 
 bool operator==(const TabletMeta& a, const TabletMeta& b) {
     if (a._table_id != b._table_id) return false;
+    if (a._index_id != b._index_id) return false;
     if (a._partition_id != b._partition_id) return false;
     if (a._tablet_id != b._tablet_id) return false;
     if (a._replica_id != b._replica_id) return false;
@@ -864,6 +978,11 @@ bool operator==(const TabletMeta& a, const TabletMeta& b) {
     if (a._time_series_compaction_time_threshold_seconds !=
         b._time_series_compaction_time_threshold_seconds)
         return false;
+    if (a._time_series_compaction_empty_rowsets_threshold !=
+        b._time_series_compaction_empty_rowsets_threshold)
+        return false;
+    if (a._time_series_compaction_level_threshold != b._time_series_compaction_level_threshold)
+        return false;
     return true;
 }
 
@@ -872,7 +991,18 @@ bool operator!=(const TabletMeta& a, const TabletMeta& b) {
 }
 
 DeleteBitmap::DeleteBitmap(int64_t tablet_id) : _tablet_id(tablet_id) {
-    _agg_cache.reset(new AggCache(config::delete_bitmap_agg_cache_capacity));
+    // The default delete bitmap cache is set to 100MB,
+    // which can be insufficient and cause performance issues when the amount of user data is large.
+    // To mitigate the problem of an inadequate cache,
+    // we will take the larger of 0.5% of the total memory and 100MB as the delete bitmap cache size.
+    bool is_percent = false;
+    int64_t delete_bitmap_agg_cache_cache_limit =
+            ParseUtil::parse_mem_spec(config::delete_bitmap_dynamic_agg_cache_limit,
+                                      MemInfo::mem_limit(), MemInfo::physical_mem(), &is_percent);
+    _agg_cache.reset(new AggCache(delete_bitmap_agg_cache_cache_limit >
+                                                  config::delete_bitmap_agg_cache_capacity
+                                          ? delete_bitmap_agg_cache_cache_limit
+                                          : config::delete_bitmap_agg_cache_capacity));
 }
 
 DeleteBitmap::DeleteBitmap(const DeleteBitmap& o) {
@@ -955,6 +1085,24 @@ bool DeleteBitmap::empty() const {
     return delete_bitmap.empty();
 }
 
+uint64_t DeleteBitmap::cardinality() const {
+    std::shared_lock l(lock);
+    uint64_t res = 0;
+    for (auto entry : delete_bitmap) {
+        res += entry.second.cardinality();
+    }
+    return res;
+}
+
+uint64_t DeleteBitmap::get_size() const {
+    std::shared_lock l(lock);
+    uint64_t charge = 0;
+    for (auto& [k, v] : delete_bitmap) {
+        charge += v.getSizeInBytes();
+    }
+    return charge;
+}
+
 bool DeleteBitmap::contains_agg_without_cache(const BitmapKey& bmk, uint32_t row_id) const {
     std::shared_lock l(lock);
     DeleteBitmap::BitmapKey start {std::get<0>(bmk), std::get<1>(bmk), 0};
@@ -969,6 +1117,16 @@ bool DeleteBitmap::contains_agg_without_cache(const BitmapKey& bmk, uint32_t row
         }
     }
     return false;
+}
+
+void DeleteBitmap::remove_sentinel_marks() {
+    for (auto it = delete_bitmap.begin(), end = delete_bitmap.end(); it != end;) {
+        if (std::get<1>(it->first) == DeleteBitmap::INVALID_SEGMENT_ID) {
+            it = delete_bitmap.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 int DeleteBitmap::set(const BitmapKey& bmk, const roaring::Roaring& segment_delete_bitmap) {
@@ -1022,6 +1180,55 @@ void DeleteBitmap::merge(const DeleteBitmap& other) {
     }
 }
 
+void DeleteBitmap::add_to_remove_queue(
+        const std::string& version_str,
+        const std::vector<std::tuple<int64_t, DeleteBitmap::BitmapKey, DeleteBitmap::BitmapKey>>&
+                vector) {
+    std::shared_lock l(stale_delete_bitmap_lock);
+    _stale_delete_bitmap.emplace(version_str, vector);
+}
+
+void DeleteBitmap::remove_stale_delete_bitmap_from_queue(const std::vector<std::string>& vector) {
+    if (!config::enable_delete_bitmap_merge_on_compaction) {
+        return;
+    }
+    std::shared_lock l(stale_delete_bitmap_lock);
+    //<rowset_id, start_version, end_version>
+    std::vector<std::tuple<std::string, uint64_t, uint64_t>> to_delete;
+    auto tablet_id = -1;
+    for (auto& version_str : vector) {
+        auto it = _stale_delete_bitmap.find(version_str);
+        if (it != _stale_delete_bitmap.end()) {
+            auto delete_bitmap_vector = it->second;
+            for (auto& delete_bitmap_tuple : it->second) {
+                if (tablet_id < 0) {
+                    tablet_id = std::get<0>(delete_bitmap_tuple);
+                }
+                auto start_bmk = std::get<1>(delete_bitmap_tuple);
+                auto end_bmk = std::get<2>(delete_bitmap_tuple);
+                remove(start_bmk, end_bmk);
+                to_delete.emplace_back(std::make_tuple(std::get<0>(start_bmk).to_string(), 0,
+                                                       std::get<2>(end_bmk)));
+            }
+            _stale_delete_bitmap.erase(version_str);
+        }
+    }
+    if (tablet_id == -1 || to_delete.empty()) {
+        return;
+    }
+    CloudStorageEngine& engine = ExecEnv::GetInstance()->storage_engine().to_cloud();
+    auto st = engine.meta_mgr().remove_old_version_delete_bitmap(tablet_id, to_delete);
+    if (!st.ok()) {
+        LOG(WARNING) << "fail to remove_stale_delete_bitmap_from_queue for tablet=" << tablet_id
+                     << ",st=" << st;
+    }
+}
+
+uint64_t DeleteBitmap::get_delete_bitmap_count() {
+    std::shared_lock l(lock);
+    return delete_bitmap.size();
+}
+
 // We cannot just copy the underlying memory to construct a string
 // due to equivalent objects may have different padding bytes.
 // Reading padding bytes is undefined behavior, neither copy nor
@@ -1065,11 +1272,8 @@ std::shared_ptr<roaring::Roaring> DeleteBitmap::get_agg(const BitmapKey& bmk) co
                 val->bitmap |= bm;
             }
         }
-        static auto deleter = [](const CacheKey& key, void* value) {
-            delete (AggCache::Value*)value; // Just delete to reclaim
-        };
         size_t charge = val->bitmap.getSizeInBytes() + sizeof(AggCache::Value);
-        handle = _agg_cache->repr()->insert(key, val, charge, deleter, CachePriority::NORMAL);
+        handle = _agg_cache->repr()->insert(key, val, charge, charge, CachePriority::NORMAL);
     }
 
     // It is natural for the cache to reclaim the underlying memory
@@ -1077,6 +1281,28 @@ std::shared_ptr<roaring::Roaring> DeleteBitmap::get_agg(const BitmapKey& bmk) co
             &val->bitmap, [this, handle](...) { _agg_cache->repr()->release(handle); });
 }
 
-std::atomic<ShardedLRUCache*> DeleteBitmap::AggCache::s_repr {nullptr};
+std::atomic<DeleteBitmap::AggCachePolicy*> DeleteBitmap::AggCache::s_repr {nullptr};
+
+std::string tablet_state_name(TabletState state) {
+    switch (state) {
+    case TABLET_NOTREADY:
+        return "TABLET_NOTREADY";
+
+    case TABLET_RUNNING:
+        return "TABLET_RUNNING";
+
+    case TABLET_TOMBSTONED:
+        return "TABLET_TOMBSTONED";
+
+    case TABLET_STOPPED:
+        return "TABLET_STOPPED";
+
+    case TABLET_SHUTDOWN:
+        return "TABLET_SHUTDOWN";
+
+    default:
+        return "TabletState(" + std::to_string(state) + ")";
+    }
+}
 
 } // namespace doris

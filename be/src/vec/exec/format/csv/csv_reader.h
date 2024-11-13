@@ -40,14 +40,12 @@
 namespace doris {
 
 class LineReader;
-class TextConverter;
 class Decompressor;
 class SlotDescriptor;
 class RuntimeProfile;
 class RuntimeState;
 
 namespace io {
-class FileSystem;
 struct IOContext;
 } // namespace io
 struct TypeDescriptor;
@@ -91,7 +89,7 @@ class BaseCsvTextFieldSplitter : public BaseLineFieldSplitter<BaseCsvTextFieldSp
 public:
     explicit BaseCsvTextFieldSplitter(bool trim_tailing_space, bool trim_ends,
                                       size_t value_sep_len = 1, char trimming_char = 0)
-            : trimming_char(trimming_char), value_sep_len(value_sep_len) {
+            : _trimming_char(trimming_char), _value_sep_len(value_sep_len) {
         if (trim_tailing_space) {
             if (trim_ends) {
                 process_value_func = &BaseCsvTextFieldSplitter::_process_value<true, true>;
@@ -112,8 +110,8 @@ public:
     }
 
 protected:
-    const char trimming_char;
-    const size_t value_sep_len;
+    const char _trimming_char;
+    const size_t _value_sep_len;
     ProcessValueFunc process_value_func;
 
 private:
@@ -172,6 +170,22 @@ private:
     std::string _value_sep;
 };
 
+class HiveCsvTextFieldSplitter : public BaseCsvTextFieldSplitter<HiveCsvTextFieldSplitter> {
+public:
+    explicit HiveCsvTextFieldSplitter(bool trim_tailing_space, bool trim_ends,
+                                      const string& value_sep, size_t value_sep_len = 1,
+                                      char trimming_char = 0, char escape_char = 0)
+            : BaseCsvTextFieldSplitter(trim_tailing_space, trim_ends, value_sep_len, trimming_char),
+              _value_sep(value_sep),
+              _escape_char(escape_char) {}
+
+    void do_split(const Slice& line, std::vector<Slice>* splitted_values);
+
+private:
+    std::string _value_sep;
+    char _escape_char;
+};
+
 class CsvReader : public GenericReader {
     ENABLE_FACTORY_CREATOR(CsvReader);
 
@@ -198,13 +212,14 @@ public:
     Status get_parsed_schema(std::vector<std::string>* col_names,
                              std::vector<TypeDescriptor>* col_types) override;
 
-    void close() override;
+    Status close() override;
 
 private:
     // used for stream/broker load of csv file.
     Status _create_decompressor();
     Status _fill_dest_columns(const Slice& line, Block* block,
                               std::vector<MutableColumnPtr>& columns, size_t* rows);
+    Status _fill_empty_line(Block* block, std::vector<MutableColumnPtr>& columns, size_t* rows);
     Status _line_split_to_values(const Slice& line, bool* success);
     void _split_line(const Slice& line);
     Status _check_array_format(std::vector<Slice>& split_values, bool* is_success);
@@ -231,9 +246,14 @@ private:
     // and the line is skipped as unqualified row, and the process should continue.
     Status _validate_line(const Slice& line, bool* success);
 
-    RuntimeState* _state;
-    RuntimeProfile* _profile;
-    ScannerCounter* _counter;
+    // If the CSV file is an UTF8 encoding with BOM,
+    // then remove the first 3 bytes at the beginning of this file
+    // and set size = size - 3.
+    const uint8_t* _remove_bom(const uint8_t* ptr, size_t& size);
+
+    RuntimeState* _state = nullptr;
+    RuntimeProfile* _profile = nullptr;
+    ScannerCounter* _counter = nullptr;
     const TFileScanRangeParams& _params;
     const TFileRangeDesc& _range;
     io::FileSystemProperties _system_properties;
@@ -252,7 +272,6 @@ private:
     // True if this is a load task
     bool _is_load = false;
 
-    std::shared_ptr<io::FileSystem> _file_system;
     io::FileReaderSPtr _file_reader;
     std::unique_ptr<LineReader> _line_reader;
     bool _line_reader_eof;
@@ -283,8 +302,9 @@ private:
     bool _trim_tailing_spaces = false;
     // `should_not_trim` is to manage the case that: user do not expect to trim double quotes but enclose is double quotes
     bool _not_trim_enclose = true;
+    bool _keep_cr = false;
 
-    io::IOContext* _io_ctx;
+    io::IOContext* _io_ctx = nullptr;
 
     // save source text which have been splitted.
     std::vector<Slice> _split_values;

@@ -74,21 +74,22 @@ TEST(CsvSerde, ScalaDataTypeSerdeCsvTest) {
                 FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_STRING, {"doris be better"},
                                   {"doris be better"}),
                 // decimal ==> decimalv2(decimal<128>(27,9))
-                FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_DECIMAL,
-                                  {
-                                          // (17, 9)(first 0 will ignore)
-                                          "012345678901234567.012345678",
-                                          // (18, 8) (automatically fill 0 for scala)
-                                          "123456789012345678.01234567",
-                                          // (17, 10) (rounding last to make it fit)
-                                          "12345678901234567.0123456779",
-                                          // (17, 11) (rounding last to make it fit)
-                                          "12345678901234567.01234567791",
-                                          // (19, 8) (wrong)
-                                          "1234567890123456789.01234567",
-                                  },
-                                  {"12345678901234567.012345678", "123456789012345678.012345670",
-                                   "12345678901234567.012345678", "", ""}),
+                FieldType_RandStr(
+                        FieldType::OLAP_FIELD_TYPE_DECIMAL,
+                        {
+                                // (17, 9)(first 0 will ignore)
+                                "012345678901234567.012345678",
+                                // (18, 8) (automatically fill 0 for scala)
+                                "123456789012345678.01234567",
+                                // (17, 10) (rounding last to make it fit)
+                                "12345678901234567.0123456779",
+                                // (17, 11) (rounding last to make it fit)
+                                "12345678901234567.01234567791",
+                                // (19, 8) (wrong)
+                                "1234567890123456789.01234567",
+                        },
+                        {"12345678901234567.012345678", "123456789012345678.012345670",
+                         "12345678901234567.012345678", "12345678901234567.012345678", ""}),
                 // decimal32 ==>  decimal32(9,2)                       (7,2)         (6,3)         (7,3)           (8,1)
                 FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_DECIMAL32,
                                   {"1234567.12", "123456.123", "1234567.123", "12345679.1"},
@@ -124,7 +125,9 @@ TEST(CsvSerde, ScalaDataTypeSerdeCsvTest) {
         for (auto type_pair : arithmetic_scala_field_types) {
             auto type = std::get<0>(type_pair);
             DataTypePtr data_type_ptr;
-            if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL32) {
+            if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL) {
+                data_type_ptr = DataTypeFactory::instance().create_data_type(type, 27, 9);
+            } else if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL32) {
                 // decimal32(7, 2)
                 data_type_ptr = DataTypeFactory::instance().create_data_type(type, 9, 2);
             } else if (type == FieldType::OLAP_FIELD_TYPE_DECIMAL64) {
@@ -163,8 +166,9 @@ TEST(CsvSerde, ScalaDataTypeSerdeCsvTest) {
                 }
                 EXPECT_EQ(st.ok(), true);
                 // serialize
-                serde->serialize_one_cell_to_hive_text(*col, i, buffer_writer,
-                                                       default_format_option);
+                st = serde->serialize_one_cell_to_hive_text(*col, i, buffer_writer,
+                                                            default_format_option);
+                EXPECT_EQ(st.ok(), true);
                 buffer_writer.commit();
                 EXPECT_EQ(ser_col->get_data_at(ser_col->size() - 1).to_string(),
                           std::get<2>(type_pair)[i]);
@@ -237,12 +241,80 @@ TEST(CsvSerde, ScalaDataTypeSerdeCsvTest) {
             StringRef max_s_d = ser_col->get_data_at(1);
             StringRef rand_s_d = ser_col->get_data_at(2);
 
-            std::cout << "min(" << min_s << ") with datat_ype_str:" << min_s_d << std::endl;
-            std::cout << "max(" << max_s << ") with datat_ype_str:" << max_s_d << std::endl;
-            std::cout << "rand(" << rand_date << ") with datat_type_str:" << rand_s_d << std::endl;
+            std::cout << "min(" << min_s << ") with data_type_str:" << min_s_d << std::endl;
+            std::cout << "max(" << max_s << ") with data_type_str:" << max_s_d << std::endl;
+            std::cout << "rand(" << rand_date << ") with data_type_str:" << rand_s_d << std::endl;
             EXPECT_EQ(min_s, min_s_d.to_string());
             EXPECT_EQ(max_s, max_s_d.to_string());
             EXPECT_EQ(rand_date, rand_s_d.to_string());
+        }
+    }
+
+    // ipv4 and ipv6 type
+    {
+        typedef std::pair<FieldType, string> FieldType_RandStr;
+        std::vector<FieldType_RandStr> date_scala_field_types = {
+                FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_IPV4, "127.0.0.1"),
+                FieldType_RandStr(FieldType::OLAP_FIELD_TYPE_IPV6, "2405:9800:9800:66::2")};
+        for (auto pair : date_scala_field_types) {
+            auto type = pair.first;
+            DataTypePtr data_type_ptr = DataTypeFactory::instance().create_data_type(type, 0, 0);
+            std::cout << "========= This type is  " << data_type_ptr->get_name() << ": "
+                      << fmt::format("{}", type) << std::endl;
+
+            std::unique_ptr<WrapperField> min_wf(WrapperField::create_by_type(type));
+            std::unique_ptr<WrapperField> max_wf(WrapperField::create_by_type(type));
+            std::unique_ptr<WrapperField> rand_wf(WrapperField::create_by_type(type));
+
+            min_wf->set_to_min();
+            max_wf->set_to_max();
+            EXPECT_EQ(rand_wf->from_string(pair.second, 0, 0).ok(), true);
+
+            string min_s = min_wf->to_string();
+            string max_s = max_wf->to_string();
+            string rand_ip = rand_wf->to_string();
+
+            Slice min_rb(min_s.data(), min_s.size());
+            Slice max_rb(max_s.data(), max_s.size());
+            Slice rand_rb(rand_ip.data(), rand_ip.size());
+
+            auto col = data_type_ptr->create_column();
+            DataTypeSerDeSPtr serde = data_type_ptr->get_serde();
+            // make use c++ lib equals to wrapper field from_string behavior
+            DataTypeSerDe::FormatOptions formatOptions;
+
+            Status st = serde->deserialize_one_cell_from_json(*col, min_rb, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            st = serde->deserialize_one_cell_from_json(*col, max_rb, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            st = serde->deserialize_one_cell_from_json(*col, rand_rb, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+
+            auto ser_col = ColumnString::create();
+            ser_col->reserve(3);
+            VectorBufferWriter buffer_writer(*ser_col.get());
+            st = serde->serialize_one_cell_to_json(*col, 0, buffer_writer, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            buffer_writer.commit();
+            st = serde->serialize_one_cell_to_json(*col, 1, buffer_writer, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            buffer_writer.commit();
+            st = serde->serialize_one_cell_to_json(*col, 2, buffer_writer, formatOptions);
+            EXPECT_EQ(st.ok(), true);
+            buffer_writer.commit();
+            rtrim(min_s);
+            rtrim(max_s);
+            rtrim(rand_ip);
+            StringRef min_s_d = ser_col->get_data_at(0);
+            StringRef max_s_d = ser_col->get_data_at(1);
+            StringRef rand_s_d = ser_col->get_data_at(2);
+
+            std::cout << "min(" << min_s << ") with data_type_str:" << min_s_d << std::endl;
+            std::cout << "max(" << max_s << ") with data_type_str:" << max_s_d << std::endl;
+            std::cout << "rand(" << rand_ip << ") with data_type_str:" << rand_s_d << std::endl;
+            EXPECT_EQ(min_s, min_s_d.to_string());
+            EXPECT_EQ(max_s, max_s_d.to_string());
+            EXPECT_EQ(rand_ip, rand_s_d.to_string());
         }
     }
 
@@ -278,8 +350,9 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         formatOptions.map_key_delim = '\003';
 
         string str =
-                "10\003key10\005100\004abcd\0051\002100\003key100\005100\004abcd\0052\0021000\003ke"
-                "y1000\0051000\004abcd\0053";
+                "10\003\"key10\"\005100\004\"abcd\"\0051\002100\003\"key100\"\005100\004\"abcd\""
+                "\0052\0021000\003\"ke"
+                "y1000\"\0051000\004\"abcd\"\0053";
 
         DataTypePtr data_type_ptr = std::make_shared<DataTypeMap>(
                 make_nullable(std::make_shared<DataTypeInt32>()),
@@ -296,7 +369,8 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         auto ser_col = ColumnString::create();
         ser_col->reserve(1);
         VectorBufferWriter buffer_writer(*ser_col.get());
-        serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        st = serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        EXPECT_EQ(st.ok(), true);
         buffer_writer.commit();
         StringRef rand_s_d = ser_col->get_data_at(0);
         std::cout << "test:" << str << std::endl;
@@ -309,7 +383,7 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         formatOptions.collection_delim = '\002';
         formatOptions.map_key_delim = '\003';
 
-        string str = "500\005true\00410\005true\004100\005true";
+        string str = "500\005\"true\"\00410\005\"true\"\004100\005\"true\"";
 
         DataTypePtr data_type_ptr = make_nullable(std::make_shared<DataTypeArray>(make_nullable(
                 std::make_shared<DataTypeArray>(make_nullable(std::make_shared<DataTypeMap>(
@@ -324,7 +398,8 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         auto ser_col = ColumnString::create();
         ser_col->reserve(1);
         VectorBufferWriter buffer_writer(*ser_col.get());
-        serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        st = serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        EXPECT_EQ(st.ok(), true);
         buffer_writer.commit();
         StringRef rand_s_d = ser_col->get_data_at(0);
         std::cout << "test:" << str << std::endl;
@@ -337,7 +412,8 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         formatOptions.map_key_delim = '\003';
 
         string str =
-                "5\0023\004value3\0034\004value4\0035\004value5\002true\003false\0037\0021\0032\003"
+                "5\0023\004\"value3\"\0034\004\"value4\"\0035\004\"value5\"\002\"true\"\003\"false"
+                "\"\0037\0021\0032\003"
                 "3";
         DataTypes substruct_dataTypes;
         substruct_dataTypes.push_back(make_nullable(std::make_shared<DataTypeString>()));
@@ -366,7 +442,8 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         auto ser_col = ColumnString::create();
         ser_col->reserve(1);
         VectorBufferWriter buffer_writer(*ser_col.get());
-        serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        st = serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        EXPECT_EQ(st.ok(), true);
         buffer_writer.commit();
         StringRef rand_s_d = ser_col->get_data_at(0);
         std::cout << "test:" << str << std::endl;
@@ -378,7 +455,7 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         formatOptions.collection_delim = '\002';
         formatOptions.map_key_delim = '\003';
 
-        string str = "6\003false\004example";
+        string str = "6\003\"false\"\004\"example\"";
         DataTypes substruct_dataTypes;
         substruct_dataTypes.push_back(make_nullable(std::make_shared<DataTypeString>()));
         substruct_dataTypes.push_back(make_nullable(std::make_shared<DataTypeString>()));
@@ -396,7 +473,8 @@ TEST(CsvSerde, ComplexTypeSerdeCsvTest) {
         auto ser_col = ColumnString::create();
         ser_col->reserve(1);
         VectorBufferWriter buffer_writer(*ser_col.get());
-        serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        st = serde->serialize_one_cell_to_hive_text(*col, 0, buffer_writer, formatOptions);
+        EXPECT_EQ(st.ok(), true);
         buffer_writer.commit();
         StringRef rand_s_d = ser_col->get_data_at(0);
         std::cout << "test:" << str << std::endl;

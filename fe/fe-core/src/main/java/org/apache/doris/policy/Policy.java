@@ -19,16 +19,13 @@ package org.apache.doris.policy;
 
 import org.apache.doris.analysis.CreatePolicyStmt;
 import org.apache.doris.analysis.UserIdentity;
-import org.apache.doris.catalog.DatabaseIf;
 import org.apache.doris.catalog.Env;
-import org.apache.doris.catalog.TableIf;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.DdlException;
 import org.apache.doris.common.io.Text;
 import org.apache.doris.common.io.Writable;
 import org.apache.doris.persist.gson.GsonPostProcessable;
 import org.apache.doris.persist.gson.GsonUtils;
-import org.apache.doris.qe.ConnectContext;
 
 import com.google.gson.annotations.SerializedName;
 import lombok.Data;
@@ -114,16 +111,14 @@ public abstract class Policy implements Writable, GsonPostProcessable {
                 return storagePolicy;
             case ROW:
                 // stmt must be analyzed.
-                DatabaseIf db = Env.getCurrentEnv().getCatalogMgr()
-                        .getCatalogOrAnalysisException(stmt.getTableName().getCtl())
-                        .getDbOrAnalysisException(stmt.getTableName().getDb());
                 UserIdentity userIdent = stmt.getUser();
                 if (userIdent != null) {
-                    userIdent.analyze(ConnectContext.get().getClusterName());
+                    userIdent.analyze();
                 }
-                TableIf table = db.getTableOrAnalysisException(stmt.getTableName().getTbl());
-                return new RowPolicy(policyId, stmt.getPolicyName(), db.getId(), userIdent, stmt.getRoleName(),
-                        stmt.getOrigStmt().originStmt, table.getId(), stmt.getFilterType(), stmt.getWherePredicate());
+                return new RowPolicy(policyId, stmt.getPolicyName(), stmt.getTableName().getCtl(),
+                        stmt.getTableName().getDb(), stmt.getTableName().getTbl(), userIdent, stmt.getRoleName(),
+                        stmt.getOrigStmt().originStmt, stmt.getOrigStmt().idx, stmt.getFilterType(),
+                        stmt.getWherePredicate());
             default:
                 throw new AnalysisException("Unknown policy type: " + stmt.getType());
         }

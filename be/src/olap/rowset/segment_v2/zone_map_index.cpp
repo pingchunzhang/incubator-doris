@@ -56,9 +56,7 @@ void TypedZoneMapIndexWriter<Type>::add_values(const void* values, size_t count)
     if (count > 0) {
         _page_zone_map.has_not_null = true;
     }
-    using ValType =
-            std::conditional_t<Type == TYPE_DATE, uint24_t,
-                               typename PredicatePrimitiveTypeTraits<Type>::PredicateFieldType>;
+    using ValType = PrimitiveTypeTraits<Type>::StorageFieldType;
     const ValType* vals = reinterpret_cast<const ValType*>(values);
     auto [min, max] = std::minmax_element(vals, vals + count);
     if (unaligned_load<ValType>(min) < unaligned_load<ValType>(_page_zone_map.min_value)) {
@@ -80,11 +78,6 @@ void TypedZoneMapIndexWriter<Type>::moidfy_index_before_flush(
 template <PrimitiveType Type>
 void TypedZoneMapIndexWriter<Type>::reset_page_zone_map() {
     _page_zone_map.pass_all = true;
-}
-
-template <PrimitiveType Type>
-void TypedZoneMapIndexWriter<Type>::reset_segment_zone_map() {
-    _segment_zone_map.pass_all = true;
 }
 
 template <PrimitiveType Type>
@@ -179,10 +172,18 @@ Status ZoneMapIndexReader::_load(bool use_page_cache, bool kept_in_memory,
                                                column->get_data_at(0).size)) {
             return Status::Corruption("Failed to parse zone map");
         }
+        _pb_meta_size += _page_zone_maps[i].ByteSizeLong();
     }
+
+    update_metadata_size();
     return Status::OK();
 }
 
+int64_t ZoneMapIndexReader::get_metadata_size() const {
+    return sizeof(ZoneMapIndexReader) + _pb_meta_size;
+}
+
+ZoneMapIndexReader::~ZoneMapIndexReader() = default;
 #define APPLY_FOR_PRIMITITYPE(M) \
     M(TYPE_TINYINT)              \
     M(TYPE_SMALLINT)             \
@@ -196,11 +197,14 @@ Status ZoneMapIndexReader::_load(bool use_page_cache, bool kept_in_memory,
     M(TYPE_DATETIME)             \
     M(TYPE_DATEV2)               \
     M(TYPE_DATETIMEV2)           \
+    M(TYPE_IPV4)                 \
+    M(TYPE_IPV6)                 \
     M(TYPE_VARCHAR)              \
     M(TYPE_STRING)               \
     M(TYPE_DECIMAL32)            \
     M(TYPE_DECIMAL64)            \
-    M(TYPE_DECIMAL128I)
+    M(TYPE_DECIMAL128I)          \
+    M(TYPE_DECIMAL256)
 
 Status ZoneMapIndexWriter::create(Field* field, std::unique_ptr<ZoneMapIndexWriter>& res) {
     switch (field->type()) {

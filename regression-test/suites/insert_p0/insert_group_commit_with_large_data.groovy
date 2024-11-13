@@ -53,22 +53,21 @@ suite("insert_group_commit_with_large_data") {
         sql """ drop table if exists ${table}; """
 
         sql """
-        CREATE TABLE `${table}` (
-            `id` int(11) NOT NULL,
-            `name` varchar(1100) NULL,
-            `score` int(11) NULL default "-1"
-        ) ENGINE=OLAP
-        DUPLICATE KEY(`id`, `name`)
-        DISTRIBUTED BY HASH(`id`) BUCKETS 1
-        PROPERTIES (
-            "replication_num" = "1"
-        );
-        """
+            CREATE TABLE `${table}` (
+                `id` int(11) NOT NULL,
+                `name` varchar(1100) NULL,
+                `score` int(11) NULL default "-1"
+            ) ENGINE=OLAP
+            DUPLICATE KEY(`id`, `name`)
+            DISTRIBUTED BY HASH(`id`) BUCKETS 1
+            PROPERTIES (
+                "group_commit_interval_ms" = "40",
+                "replication_num" = "1"
+            );
+            """
 
         connect(user = context.config.jdbcUser, password = context.config.jdbcPassword, url = context.config.jdbcUrl) {
-            sql """ set enable_insert_group_commit = true; """
-            // TODO
-            sql """ set enable_nereids_dml = false; """
+            sql """ set group_commit = async_mode; """
             sql """ use ${db}; """
 
             // insert into 5000 rows

@@ -17,6 +17,7 @@
 
 package org.apache.doris.nereids.memo;
 
+import org.apache.doris.catalog.MTMV;
 import org.apache.doris.common.IdGenerator;
 import org.apache.doris.common.Pair;
 import org.apache.doris.nereids.cost.Cost;
@@ -29,14 +30,16 @@ import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.properties.RequestPropertyDeriver;
 import org.apache.doris.nereids.properties.RequirePropertiesSupplier;
+import org.apache.doris.nereids.rules.exploration.mv.AbstractMaterializedViewRule;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.plans.GroupPlan;
 import org.apache.doris.nereids.trees.plans.LeafPlan;
 import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.algebra.CatalogRelation;
 import org.apache.doris.nereids.trees.plans.algebra.SetOperation;
+import org.apache.doris.nereids.trees.plans.logical.LogicalCatalogRelation;
 import org.apache.doris.nereids.trees.plans.logical.LogicalJoin;
 import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
-import org.apache.doris.nereids.trees.plans.logical.LogicalProject;
 import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
 import org.apache.doris.qe.ConnectContext;
 
@@ -50,12 +53,13 @@ import org.apache.logging.log4j.Logger;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
-import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.annotation.Nullable;
@@ -69,6 +73,12 @@ public class Memo {
     private static final EventProducer GROUP_MERGE_TRACER = new EventProducer(GroupMergeEvent.class,
             EventChannel.getDefaultChannel().addConsumers(new LogConsumer(GroupMergeEvent.class, EventChannel.LOG)));
     private static long stateId = 0;
+    private final ConnectContext connectContext;
+    private final AtomicLong refreshVersion = new AtomicLong(1);
+    private final Map<Class<? extends AbstractMaterializedViewRule>, Set<Long>> materializationCheckSuccessMap =
+            new LinkedHashMap<>();
+    private final Map<Class<? extends AbstractMaterializedViewRule>, Set<Long>> materializationCheckFailMap =
+            new LinkedHashMap<>();
     private final IdGenerator<GroupId> groupIdGenerator = GroupId.createGenerator();
     private final Map<GroupId, Group> groups = Maps.newLinkedHashMap();
     // we could not use Set, because Set does not have get method.
@@ -77,11 +87,13 @@ public class Memo {
 
     // FOR TEST ONLY
     public Memo() {
-        root = null;
+        this.root = null;
+        this.connectContext = null;
     }
 
-    public Memo(Plan plan) {
-        root = init(plan);
+    public Memo(ConnectContext connectContext, Plan plan) {
+        this.root = init(plan);
+        this.connectContext = connectContext;
     }
 
     public static long getStateId() {
@@ -116,57 +128,48 @@ public class Memo {
         return groupExpressions.size();
     }
 
-    /** just keep LogicalExpression in Memo. */
-    public void removePhysicalExpression() {
-        groupExpressions.entrySet().removeIf(entry -> entry.getValue().getPlan() instanceof PhysicalPlan);
-
-        Iterator<Map.Entry<GroupId, Group>> iterator = groups.entrySet().iterator();
-        while (iterator.hasNext()) {
-            Map.Entry<GroupId, Group> entry = iterator.next();
-            Group group = entry.getValue();
-
-            group.clearPhysicalExpressions();
-            group.clearLowestCostPlans();
-            group.removeParentPhysicalExpressions();
-            group.setExplored(false);
-
-            if (group.getLogicalExpressions().isEmpty() && group.getPhysicalExpressions().isEmpty()) {
-                iterator.remove();
-            }
-        }
-
-        // logical groupExpression reset ruleMask
-        groupExpressions.values().stream()
-                .filter(groupExpression -> groupExpression.getPlan() instanceof LogicalPlan)
-                .forEach(GroupExpression::clearApplied);
+    public long getRefreshVersion() {
+        return refreshVersion.get();
     }
 
-    private Plan skipProject(Plan plan, Group targetGroup) {
-        // Some top project can't be eliminated
-        if (plan instanceof LogicalProject) {
-            LogicalProject<?> logicalProject = (LogicalProject<?>) plan;
-            if (targetGroup != root) {
-                if (logicalProject.getOutputSet().equals(logicalProject.child().getOutputSet())) {
-                    return skipProject(logicalProject.child(), targetGroup);
-                }
-            } else {
-                if (logicalProject.getOutput().equals(logicalProject.child().getOutput())) {
-                    return skipProject(logicalProject.child(), targetGroup);
-                }
+    /**
+     * Record materialization check result for performance
+     */
+    public void recordMaterializationCheckResult(Class<? extends AbstractMaterializedViewRule> target,
+            Long checkedMaterializationId, boolean isSuccess) {
+        if (isSuccess) {
+            Set<Long> checkedSet = materializationCheckSuccessMap.get(target);
+            if (checkedSet == null) {
+                checkedSet = new HashSet<>();
+                materializationCheckSuccessMap.put(target, checkedSet);
             }
+            checkedSet.add(checkedMaterializationId);
+        } else {
+            Set<Long> checkResultSet = materializationCheckFailMap.get(target);
+            if (checkResultSet == null) {
+                checkResultSet = new HashSet<>();
+                materializationCheckFailMap.put(target, checkResultSet);
+            }
+            checkResultSet.add(checkedMaterializationId);
         }
-        return plan;
     }
 
-    private Plan skipProjectGetChild(Plan plan) {
-        if (plan instanceof LogicalProject) {
-            LogicalProject<?> logicalProject = (LogicalProject<?>) plan;
-            Plan child = logicalProject.child();
-            if (logicalProject.getOutputSet().equals(child.getOutputSet())) {
-                return skipProjectGetChild(child);
-            }
+    /**
+     * Get the info for materialization context is checked
+     *
+     * @return if true, check successfully, if false check fail, if null not checked
+     */
+    public Boolean materializationHasChecked(Class<? extends AbstractMaterializedViewRule> target,
+            long materializationId) {
+        Set<Long> checkSuccessSet = materializationCheckSuccessMap.get(target);
+        if (checkSuccessSet != null && checkSuccessSet.contains(materializationId)) {
+            return true;
         }
-        return plan;
+        Set<Long> checkFailSet = materializationCheckFailMap.get(target);
+        if (checkFailSet != null && checkFailSet.contains(materializationId)) {
+            return false;
+        }
+        return null;
     }
 
     public int countMaxContinuousJoin() {
@@ -212,7 +215,7 @@ public class Memo {
         if (rewrite) {
             result = doRewrite(plan, target);
         } else {
-            result = doCopyIn(skipProject(plan, target), target, planTable);
+            result = doCopyIn(plan, target, planTable);
         }
         maybeAddStateId(result);
         return result;
@@ -233,15 +236,14 @@ public class Memo {
         if (rewrite) {
             result = doRewrite(plan, target);
         } else {
-            result = doCopyIn(skipProject(plan, target), target, null);
+            result = doCopyIn(plan, target, null);
         }
         maybeAddStateId(result);
         return result;
     }
 
     private void maybeAddStateId(CopyInResult result) {
-        if (ConnectContext.get() != null
-                && ConnectContext.get().getSessionVariable().isEnableNereidsTrace()
+        if (connectContext != null && connectContext.getSessionVariable().isEnableNereidsTrace()
                 && result.generateNewExpression) {
             stateId++;
         }
@@ -430,6 +432,14 @@ public class Memo {
                     plan.getLogicalProperties(), targetGroup.getLogicalProperties());
             throw new IllegalStateException("Insert a plan into targetGroup but differ in logicalproperties");
         }
+        // TODO Support sync materialized view in the future
+        if (connectContext != null
+                && connectContext.getSessionVariable().isEnableMaterializedViewNestRewrite()
+                && plan instanceof LogicalCatalogRelation
+                && ((CatalogRelation) plan).getTable() instanceof MTMV
+                && !plan.getGroupExpression().isPresent()) {
+            refreshVersion.incrementAndGet();
+        }
         Optional<GroupExpression> groupExpr = plan.getGroupExpression();
         if (groupExpr.isPresent()) {
             Preconditions.checkState(groupExpressions.containsKey(groupExpr.get()));
@@ -438,7 +448,7 @@ public class Memo {
         List<Group> childrenGroups = Lists.newArrayList();
         for (int i = 0; i < plan.children().size(); i++) {
             // skip useless project.
-            Plan child = skipProjectGetChild(plan.child(i));
+            Plan child = plan.child(i);
             if (child instanceof GroupPlan) {
                 childrenGroups.add(((GroupPlan) child).getGroup());
             } else if (child.getGroupExpression().isPresent()) {
@@ -530,17 +540,22 @@ public class Memo {
             return;
         }
         List<GroupExpression> needReplaceChild = Lists.newArrayList();
-        for (GroupExpression parent : source.getParentGroupExpressions()) {
-            if (parent.getOwnerGroup().equals(destination)) {
+        for (GroupExpression dstParent : destination.getParentGroupExpressions()) {
+            if (dstParent.getOwnerGroup().equals(source)) {
                 // cycle, we should not merge
                 return;
             }
-            Group parentOwnerGroup = parent.getOwnerGroup();
-            HashSet<GroupExpression> enforcers = new HashSet<>(parentOwnerGroup.getEnforcers());
-            if (enforcers.contains(parent)) {
+        }
+        for (GroupExpression srcParent : source.getParentGroupExpressions()) {
+            if (srcParent.getOwnerGroup().equals(destination)) {
+                // cycle, we should not merge
+                return;
+            }
+            Group parentOwnerGroup = srcParent.getOwnerGroup();
+            if (parentOwnerGroup.getEnforcers().containsKey(srcParent)) {
                 continue;
             }
-            needReplaceChild.add(parent);
+            needReplaceChild.add(srcParent);
         }
         GROUP_MERGE_TRACER.log(GroupMergeEvent.of(source, destination, needReplaceChild));
 
@@ -603,16 +618,6 @@ public class Memo {
         Group group = new Group(groupIdGenerator.getNextId(), logicalProperties);
         groups.put(group.getGroupId(), group);
         return group;
-    }
-
-    // This function is used to copy new group expression
-    // It's used in DPHyp after construct new group expression
-    public Group copyInGroupExpression(GroupExpression newGroupExpression) {
-        Group newGroup = new Group(groupIdGenerator.getNextId(), newGroupExpression,
-                newGroupExpression.getPlan().getLogicalProperties());
-        groups.put(newGroup.getGroupId(), newGroup);
-        groupExpressions.put(newGroupExpression, newGroupExpression);
-        return newGroup;
     }
 
     private CopyInResult rewriteByNewGroupExpression(Group targetGroup, Plan newPlan,
@@ -876,11 +881,12 @@ public class Memo {
 
             List<Pair<Long, List<Integer>>> childrenId = new ArrayList<>();
             permute(children, 0, childrenId, new ArrayList<>());
-            Cost cost = CostCalculator.calculateCost(groupExpression, inputProperties);
+            Cost cost = CostCalculator.calculateCost(connectContext, groupExpression, inputProperties);
             for (Pair<Long, List<Integer>> c : childrenId) {
                 Cost totalCost = cost;
                 for (int i = 0; i < children.size(); i++) {
-                    totalCost = CostCalculator.addChildCost(groupExpression.getPlan(),
+                    totalCost = CostCalculator.addChildCost(connectContext,
+                            groupExpression.getPlan(),
                             totalCost,
                             children.get(i).get(c.second.get(i)).second,
                             i);
@@ -939,7 +945,7 @@ public class Memo {
         List<GroupExpression> exprs = Lists.newArrayList(bestExpr);
         Set<GroupExpression> hasVisited = new HashSet<>();
         hasVisited.add(bestExpr);
-        Stream.concat(group.getPhysicalExpressions().stream(), group.getEnforcers().stream())
+        Stream.concat(group.getPhysicalExpressions().stream(), group.getEnforcers().keySet().stream())
                 .forEach(groupExpression -> {
                     if (!groupExpression.getInputPropertiesListOrEmpty(prop).isEmpty()
                             && !groupExpression.equals(bestExpr) && !hasVisited.contains(groupExpression)) {
@@ -962,13 +968,13 @@ public class Memo {
         res.add(groupExpression.getInputPropertiesList(prop));
 
         // return optimized input for enforcer
-        if (groupExpression.getOwnerGroup().getEnforcers().contains(groupExpression)) {
+        if (groupExpression.getOwnerGroup().getEnforcers().containsKey(groupExpression)) {
             return res;
         }
 
         // return any if exits except RequirePropertiesSupplier and SetOperators
         // Because PropRegulator could change their input properties
-        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(prop);
+        RequestPropertyDeriver requestPropertyDeriver = new RequestPropertyDeriver(connectContext, prop);
         List<List<PhysicalProperties>> requestList = requestPropertyDeriver
                 .getRequestChildrenPropertyList(groupExpression);
         Optional<List<PhysicalProperties>> any = requestList.stream()

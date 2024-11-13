@@ -348,7 +348,9 @@ public class SparkEtlJobHandler {
             }
             filePathToSize.put(fstatus.getPath(), fstatus.getSize());
         }
-        LOG.debug("get spark etl file paths. files map: {}", filePathToSize);
+        if (LOG.isDebugEnabled()) {
+            LOG.debug("get spark etl file paths. files map: {}", filePathToSize);
+        }
 
         return filePathToSize;
     }
@@ -363,7 +365,7 @@ public class SparkEtlJobHandler {
 
     public void deleteEtlOutputPath(String outputPath, BrokerDesc brokerDesc) {
         try {
-            BrokerUtil.deletePath(outputPath, brokerDesc);
+            BrokerUtil.deletePathWithBroker(outputPath, brokerDesc);
             LOG.info("delete path success. path: {}", outputPath);
         } catch (UserException e) {
             LOG.warn("delete path failed. path: {}", outputPath, e);

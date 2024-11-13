@@ -34,21 +34,9 @@ suite("test_group_concat") {
                 SELECT abs(k3), group_concat(cast(abs(k2) as varchar), ":" order by abs(k2), k1) FROM nereids_test_query_db.baseall group by abs(k3) order by abs(k3)
               """
 
-    test {
-        sql"""SELECT abs(k3), group_concat(distinct cast(abs(k2) as char) order by abs(k1), k2) FROM nereids_test_query_db.baseall group by abs(k3) order by abs(k3);"""
-        check{result, exception, startTime, endTime ->
-            assertTrue(exception != null)
-            logger.info(exception.message)
-        }
-    }
+    sql"""SELECT abs(k3), group_concat(distinct cast(abs(k2) as char) order by abs(k1), k2) FROM nereids_test_query_db.baseall group by abs(k3) order by abs(k3);"""
 
-    test {
-        sql"""SELECT abs(k3), group_concat(distinct cast(abs(k2) as char), ":" order by abs(k1), k2) FROM nereids_test_query_db.baseall group by abs(k3) order by abs(k3);"""
-        check{result, exception, startTime, endTime ->
-            assertTrue(exception != null)
-            logger.info(exception.message)
-        }
-    }
+    sql"""SELECT abs(k3), group_concat(distinct cast(abs(k2) as char), ":" order by abs(k1), k2) FROM nereids_test_query_db.baseall group by abs(k3) order by abs(k3);"""
 
     qt_select """
                 SELECT count(distinct k7), group_concat(k6 order by k6) FROM nereids_test_query_db.baseall;
@@ -115,7 +103,7 @@ suite("test_group_concat") {
               """
 
     sql """create view if not exists test_view as SELECT b1, group_concat(cast(abs(b3) as varchar) order by abs(b2) desc, b3 desc) FROM table_group_concat  group by b1 order by b1;"""
-    qt_select_group_concat_order_by_desc4 """
+    order_qt_select_group_concat_order_by_desc4 """
                 select * from test_view;
     """
     sql """drop view if exists test_view"""

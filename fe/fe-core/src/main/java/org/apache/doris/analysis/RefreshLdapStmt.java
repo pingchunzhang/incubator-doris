@@ -18,7 +18,6 @@
 package org.apache.doris.analysis;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.cluster.ClusterNamespace;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.UserException;
@@ -27,7 +26,7 @@ import org.apache.doris.qe.ConnectContext;
 
 import com.google.common.base.Strings;
 
-public class RefreshLdapStmt extends DdlStmt {
+public class RefreshLdapStmt extends DdlStmt implements NotFallbackInParser {
 
     private boolean isAll;
 
@@ -53,9 +52,6 @@ public class RefreshLdapStmt extends DdlStmt {
             if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
                 ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
             }
-            if (!isAll) {
-                user = ClusterNamespace.getFullName(getClusterName(), user);
-            }
         } else {
             user = analyzer.getQualifiedUser();
         }
@@ -71,6 +67,11 @@ public class RefreshLdapStmt extends DdlStmt {
             stringBuilder.append("`").append(user).append("`");
         }
         return stringBuilder.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.REFRESH;
     }
 
 }

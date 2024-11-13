@@ -17,6 +17,7 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.AccessTestUtil;
 import org.apache.doris.analysis.Analyzer;
 import org.apache.doris.analysis.CreateViewStmt;
 import org.apache.doris.analysis.PartitionValue;
@@ -26,6 +27,7 @@ import org.apache.doris.analysis.SqlScanner;
 import org.apache.doris.analysis.StatementBase;
 import org.apache.doris.analysis.TupleDescriptor;
 import org.apache.doris.analysis.TupleId;
+import org.apache.doris.analysis.UserIdentity;
 import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.Env;
@@ -48,16 +50,12 @@ import org.apache.doris.common.Config;
 import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.UserException;
 import org.apache.doris.common.jmockit.Deencapsulation;
-import org.apache.doris.common.telemetry.Telemetry;
 import org.apache.doris.common.util.SqlParserUtils;
 import org.apache.doris.common.util.Util;
-import org.apache.doris.datasource.CatalogMgr;
 import org.apache.doris.datasource.InternalCatalog;
 import org.apache.doris.metric.MetricRepo;
 import org.apache.doris.mysql.MysqlChannel;
 import org.apache.doris.mysql.MysqlSerializer;
-import org.apache.doris.mysql.privilege.AccessControllerManager;
-import org.apache.doris.mysql.privilege.MockedAuth;
 import org.apache.doris.nereids.NereidsPlanner;
 import org.apache.doris.nereids.StatementContext;
 import org.apache.doris.nereids.glue.LogicalPlanAdapter;
@@ -72,13 +70,11 @@ import org.apache.doris.qe.cache.CacheAnalyzer;
 import org.apache.doris.qe.cache.CacheAnalyzer.CacheMode;
 import org.apache.doris.qe.cache.CacheCoordinator;
 import org.apache.doris.qe.cache.CacheProxy;
-import org.apache.doris.qe.cache.PartitionCache;
 import org.apache.doris.qe.cache.PartitionRange;
 import org.apache.doris.qe.cache.RowBatchBuilder;
 import org.apache.doris.qe.cache.SqlCache;
 import org.apache.doris.service.FrontendOptions;
 import org.apache.doris.system.Backend;
-import org.apache.doris.system.SystemInfoService;
 import org.apache.doris.thrift.TStorageType;
 import org.apache.doris.thrift.TUniqueId;
 
@@ -97,18 +93,15 @@ import org.junit.Test;
 
 import java.io.StringReader;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
-import java.util.function.Function;
 
 public class OlapQueryCacheTest {
     private static final Logger LOG = LogManager.getLogger(OlapQueryCacheTest.class);
-    public static String clusterName = "testCluster";
-    public static String dbName = "testDb";
-    public static String fullDbName = "testCluster:testDb";
-    public static String tableName = "testTbl";
-    public static String userName = "testUser";
+    public static String fullDbName = "testDb";
+    public static String userName = "root";
 
     private static ConnectContext context;
 
@@ -116,21 +109,12 @@ public class OlapQueryCacheTest {
     private Cache.HitRange hitRange;
     private Analyzer analyzer;
     private Database db;
-
-    @Mocked
-    private AccessControllerManager accessManager;
-    @Mocked
-    private SystemInfoService service;
-    @Mocked
     private Env env;
-    @Mocked
-    private InternalCatalog catalog;
-    @Mocked
     private ConnectContext ctx;
+    private QueryState state;
+    private ConnectScheduler scheduler;
     @Mocked
-    MysqlChannel channel;
-    @Mocked
-    ConnectScheduler scheduler;
+    private MysqlChannel channel = null;
 
     @BeforeClass
     public static void start() {
@@ -140,9 +124,8 @@ public class OlapQueryCacheTest {
             FrontendOptions.init();
             context = new ConnectContext();
             Config.cache_enable_sql_mode = true;
-            Config.cache_enable_partition_mode = true;
             context.getSessionVariable().setEnableSqlCache(true);
-            context.getSessionVariable().setEnablePartitionCache(true);
+
             Config.cache_last_version_interval_second = 7200;
         } catch (UnknownHostException e) {
             e.printStackTrace();
@@ -151,8 +134,15 @@ public class OlapQueryCacheTest {
 
     @Before
     public void setUp() throws Exception {
-        MockedAuth.mockedAccess(accessManager);
-        MockedAuth.mockedConnectContext(ctx, "root", "192.168.1.1");
+        state = new QueryState();
+        scheduler = new ConnectScheduler(10);
+        ctx = new ConnectContext();
+
+        SessionVariable sessionVariable = new SessionVariable();
+        Deencapsulation.setField(sessionVariable, "beNumberForTest", 1);
+        MysqlSerializer serializer = MysqlSerializer.newInstance();
+        env = AccessTestUtil.fetchAdminCatalog();
+
         new MockUp<Util>() {
             @Mock
             public boolean showHiddenColumns() {
@@ -161,82 +151,28 @@ public class OlapQueryCacheTest {
         };
         new MockUp<Env>() {
             @Mock
-            public SystemInfoService getCurrentSystemInfo() {
-                return service;
-            }
-        };
-        db = new Database(1L, fullDbName);
-
-        new Expectations(catalog) {
-            {
-                catalog.getDbNullable(fullDbName);
-                minTimes = 0;
-                result = db;
-
-                catalog.getDbNullable(dbName);
-                minTimes = 0;
-                result = db;
-
-                catalog.getDbNullable(db.getId());
-                minTimes = 0;
-                result = db;
-
-                catalog.getDbNames();
-                minTimes = 0;
-                result = Lists.newArrayList(fullDbName);
+            Env getCurrentEnv() {
+                return env;
             }
         };
 
-        CatalogMgr dsMgr = new CatalogMgr();
-        new Expectations(dsMgr) {
-            {
-                dsMgr.getCatalog((String) any);
-                minTimes = 0;
-                result = catalog;
-
-                dsMgr.getCatalogOrException((String) any, (Function) any);
-                minTimes = 0;
-                result = catalog;
-
-                dsMgr.getCatalogOrAnalysisException((String) any);
-                minTimes = 0;
-                result = catalog;
-            }
-        };
-
-        new Expectations(env) {
-            {
-                env.getAccessManager();
-                minTimes = 0;
-                result = accessManager;
-
-                env.getCurrentCatalog();
-                minTimes = 0;
-                result = catalog;
-
-                env.getInternalCatalog();
-                minTimes = 0;
-                result = catalog;
-
-                env.getCatalogMgr();
-                minTimes = 0;
-                result = dsMgr;
-            }
-        };
         FunctionSet fs = new FunctionSet();
         fs.init();
         Deencapsulation.setField(env, "functionSet", fs);
-        QueryState state = new QueryState();
-        channel.reset();
 
-        SessionVariable sessionVariable = new SessionVariable();
-        Deencapsulation.setField(sessionVariable, "beNumberForTest", 1);
+        channel.reset();
 
         new Expectations(channel) {
             {
+                channel.sendOnePacket((ByteBuffer) any);
+                minTimes = 0;
+
+                channel.reset();
+                minTimes = 0;
+
                 channel.getSerializer();
                 minTimes = 0;
-                result = MysqlSerializer.newInstance();
+                result = serializer;
             }
         };
 
@@ -245,10 +181,6 @@ public class OlapQueryCacheTest {
                 ctx.getMysqlChannel();
                 minTimes = 0;
                 result = channel;
-
-                ctx.getClusterName();
-                minTimes = 0;
-                result = clusterName;
 
                 ctx.getEnv();
                 minTimes = 0;
@@ -291,7 +223,7 @@ public class OlapQueryCacheTest {
 
                 ctx.getDatabase();
                 minTimes = 0;
-                result = dbName;
+                result = fullDbName;
 
                 ctx.getSessionVariable();
                 minTimes = 0;
@@ -304,41 +236,52 @@ public class OlapQueryCacheTest {
                 minTimes = 0;
                 result = 1L;
 
-                ctx.getTracer();
-                minTimes = 0;
-                result = Telemetry.getNoopTracer();
-
                 ctx.getCurrentCatalog();
                 minTimes = 0;
-                result = catalog;
+                result = env.getCurrentCatalog();
 
                 ctx.getCatalog(anyString);
                 minTimes = 0;
-                result = catalog;
+                result = env.getCurrentCatalog();
+
+                ConnectContext.get();
+                minTimes = 0;
+                result = ctx;
+
+                ctx.getRemoteIP();
+                minTimes = 0;
+                result = "192.168.1.1";
+
+                ctx.getCurrentUserIdentity();
+                minTimes = 0;
+                UserIdentity userIdentity = new UserIdentity(userName, "%");
+                userIdentity.setIsAnalyzed();
+                result = userIdentity;
             }
         };
 
         analyzer = new Analyzer(env, ctx);
         newRangeList = Lists.newArrayList();
 
+        db = ((InternalCatalog) env.getCurrentCatalog()).getDbNullable(fullDbName);
         // table and view init use analyzer, should init after analyzer build
         OlapTable tbl1 = createOrderTable();
-        db.createTable(tbl1);
+        db.registerTable(tbl1);
         OlapTable tbl2 = createProfileTable();
-        db.createTable(tbl2);
+        db.registerTable(tbl2);
         OlapTable tbl3 = createEventTable();
-        db.createTable(tbl3);
+        db.registerTable(tbl3);
 
         // build view meta inline sql and create view directly, the originStmt from inline sql
         // should be analyzed by create view statement analyzer and then to sql
         View view1 = createEventView1();
-        db.createTable(view1);
+        db.registerTable(view1);
         View view2 = createEventView2();
-        db.createTable(view2);
+        db.registerTable(view2);
         View view3 = createEventView3();
-        db.createTable(view3);
+        db.registerTable(view3);
         View view4 = createEventNestedView();
-        db.createTable(view4);
+        db.registerTable(view4);
     }
 
     private OlapTable createOrderTable() {
@@ -399,15 +342,6 @@ public class OlapQueryCacheTest {
             LOG.warn("Part,an_ex={}", e);
             Assert.fail(e.getMessage());
         }
-    }
-
-    private ScanNode createOrderScanNode(Collection<Long> selectedPartitionIds) {
-        OlapTable table = createOrderTable();
-        TupleDescriptor desc = new TupleDescriptor(new TupleId(10004));
-        desc.setTable(table);
-        OlapScanNode node = new OlapScanNode(new PlanNodeId(10008), desc, "ordernode");
-        node.setSelectedPartitionIds(selectedPartitionIds);
-        return node;
     }
 
     private OlapTable createProfileTable() {
@@ -565,9 +499,10 @@ public class OlapQueryCacheTest {
             LogicalPlan plan = new NereidsParser().parseSingle(sql);
             OriginStatement originStatement = new OriginStatement(sql, 0);
             StatementContext statementContext = new StatementContext(ctx, originStatement);
+            ctx.setStatementContext(statementContext);
             NereidsPlanner nereidsPlanner = new NereidsPlanner(statementContext);
             LogicalPlanAdapter adapter = new LogicalPlanAdapter(plan, statementContext);
-            nereidsPlanner.plan(adapter);
+            nereidsPlanner.planWithLock(adapter);
             statementContext.setParsedStatement(adapter);
             stmt = adapter;
         } catch (Throwable throwable) {
@@ -605,7 +540,6 @@ public class OlapQueryCacheTest {
 
     @Test
     public void testCacheNode() throws Exception {
-        Env.getCurrentSystemInfo();
         CacheCoordinator cp = CacheCoordinator.getInstance();
         cp.debugModel = true;
         Backend bd1 = new Backend(1, "", 1000);
@@ -631,7 +565,6 @@ public class OlapQueryCacheTest {
 
     @Test
     public void testCacheModeNone() throws Exception {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql("select @@version_comment limit 1");
         List<ScanNode> scanNodes = Lists.newArrayList();
         CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
@@ -641,7 +574,6 @@ public class OlapQueryCacheTest {
 
     @Test
     public void testCacheModeTable() throws Exception {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "SELECT country, COUNT(userid) FROM userprofile GROUP BY country"
         );
@@ -655,7 +587,6 @@ public class OlapQueryCacheTest {
 
     @Test
     public void testWithinMinTime() throws Exception {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "SELECT country, COUNT(userid) FROM userprofile GROUP BY country"
         );
@@ -668,24 +599,7 @@ public class OlapQueryCacheTest {
     }
 
     @Test
-    public void testPartitionModel() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(DISTINCT userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
-                        + "eventdate<=\"2020-01-15\" GROUP BY eventdate"
-        );
-
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L);  //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);
-    }
-
-    @Test
     public void testParseByte() throws Exception {
-        Env.getCurrentSystemInfo();
         RowBatchBuilder sb = new RowBatchBuilder(CacheMode.Partition);
         byte[] buffer = new byte[]{10, 50, 48, 50, 48, 45, 48, 51, 45, 49, 48, 1, 51, 2, 67, 78};
         PartitionRange.PartitionKeyType key1 = sb.getKeyFromRow(buffer, 0, Type.DATE);
@@ -697,95 +611,7 @@ public class OlapQueryCacheTest {
     }
 
     @Test
-    public void testPartitionIntTypeSql() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT `date`, COUNT(id) FROM `order` WHERE `date`>=20200112 and `date`<=20200115 GROUP BY date"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createOrderScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L);                              //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);    //assert cache model first
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            LOG.warn("Rewrite partition range size={}", size);
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setCacheFlag(20200113L);    //get data from cache
-
-            hitRange = range.buildDiskPartitionRange(newRangeList);
-            Assert.assertEquals(hitRange, Cache.HitRange.Left);
-            Assert.assertEquals(newRangeList.size(), 2);
-            Assert.assertEquals(newRangeList.get(0).getCacheKey().realValue(), 20200114);
-            Assert.assertEquals(newRangeList.get(1).getCacheKey().realValue(), 20200115);
-
-            cache.rewriteSelectStmt(newRangeList);
-            sql = ca.getRewriteStmt().getWhereClause().toSql();
-            Assert.assertEquals(sql, "`date` >= 20200114 AND `date` <= 20200115");
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testSimpleCacheSql() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
-                        + "eventdate<=\"2020-01-15\" GROUP BY eventdate"
-        );
-
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L); //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            LOG.warn("Rewrite partition range size={}", size);
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setCacheFlag(20200113L);    //get data from cache
-
-            hitRange = range.buildDiskPartitionRange(newRangeList);
-            cache.rewriteSelectStmt(newRangeList);
-            sql = ca.getRewriteStmt().getWhereClause().toSql();
-            Assert.assertEquals(sql, "`eventdate` >= '2020-01-14' AND `eventdate` <= '2020-01-15'");
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
     public void testHitSqlCache() throws Exception {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
                         + "eventdate<=\"2020-01-14\" GROUP BY eventdate"
@@ -799,316 +625,7 @@ public class OlapQueryCacheTest {
     }
 
     @Test
-    public void testHitPartPartition() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
-                        + "eventdate<=\"2020-01-14\" GROUP BY eventdate"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1578675600000L); // set now to 2020-01-11 1:00:00, for hit partition cache
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            LOG.warn("Rewrite partition range size={}", size);
-            Assert.assertEquals(size, 3);
-
-            range.setCacheFlag(20200113);
-            range.setCacheFlag(20200114);
-
-            hitRange = range.buildDiskPartitionRange(newRangeList);
-            Assert.assertEquals(hitRange, Cache.HitRange.Right);
-            Assert.assertEquals(newRangeList.size(), 2);
-            Assert.assertEquals(newRangeList.get(0).getCacheKey().realValue(), 20200112);
-            Assert.assertEquals(newRangeList.get(1).getCacheKey().realValue(), 20200112);
-
-            List<PartitionRange.PartitionSingle> updateRangeList = range.buildUpdatePartitionRange();
-            Assert.assertEquals(updateRangeList.size(), 1);
-            Assert.assertEquals(updateRangeList.get(0).getCacheKey().realValue(), 20200112);
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testNoUpdatePartition() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
-                        + "eventdate<=\"2020-01-14\" GROUP BY eventdate"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1578675600000L); // set now to 2020-01-11 1:00:00, for hit partition cache
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            LOG.warn("Rewrite partition range size={}", size);
-            Assert.assertEquals(size, 3);
-
-            range.setCacheFlag(20200112);    //get data from cache
-            range.setCacheFlag(20200113);
-            range.setCacheFlag(20200114);
-
-            hitRange = range.buildDiskPartitionRange(newRangeList);
-            Assert.assertEquals(hitRange, Cache.HitRange.Full);
-            Assert.assertEquals(newRangeList.size(), 0);
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-
-    @Test
-    public void testUpdatePartition() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
-                        + "eventdate<=\"2020-01-15\" GROUP BY eventdate"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L); //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            LOG.warn("Rewrite partition range size={}", size);
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setTooNewByKey(20200115);
-
-            range.buildDiskPartitionRange(newRangeList);
-            Assert.assertEquals(newRangeList.size(), 2);
-            cache.rewriteSelectStmt(newRangeList);
-
-            sql = ca.getRewriteStmt().getWhereClause().toSql();
-            Assert.assertEquals(sql, "`eventdate` >= '2020-01-13' AND `eventdate` <= '2020-01-15'");
-
-            List<PartitionRange.PartitionSingle> updateRangeList = range.buildUpdatePartitionRange();
-            Assert.assertEquals(updateRangeList.size(), 2);
-            Assert.assertEquals(updateRangeList.get(0).getCacheKey().realValue(), 20200113);
-            Assert.assertEquals(updateRangeList.get(1).getCacheKey().realValue(), 20200114);
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testRewriteMultiPredicate1() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>\"2020-01-11\" and "
-                        + "eventdate<\"2020-01-16\""
-                        + " and eventid=1 GROUP BY eventdate"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L); //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            LOG.warn("Nokey multi={}", cache.getNokeyStmt().getWhereClause().toSql());
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause().toSql(), "`eventid` = 1");
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setCacheFlag(20200113L);    //get data from cache
-
-            range.buildDiskPartitionRange(newRangeList);
-
-            cache.rewriteSelectStmt(newRangeList);
-            sql = ca.getRewriteStmt().getWhereClause().toSql();
-            LOG.warn("MultiPredicate={}", sql);
-            Assert.assertEquals(sql, "`eventdate` > '2020-01-13' AND `eventdate` < '2020-01-16' AND `eventid` = 1");
-        } catch (Exception e) {
-            LOG.warn("multi ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testRewriteJoin() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT appevent.eventdate, country, COUNT(appevent.userid) FROM appevent"
-                        + " INNER JOIN userprofile ON appevent.userid = userprofile.userid"
-                        + " WHERE appevent.eventdate>=\"2020-01-12\" and appevent.eventdate<=\"2020-01-15\""
-                        + " and eventid=1 GROUP BY appevent.eventdate, country"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L); //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-            cache.rewriteSelectStmt(null);
-            LOG.warn("Join nokey={}", cache.getNokeyStmt().getWhereClause().toSql());
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause().toSql(), "`eventid` = 1");
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setCacheFlag(20200113L);    //get data from cache
-
-            range.buildDiskPartitionRange(newRangeList);
-
-            cache.rewriteSelectStmt(newRangeList);
-            sql = ca.getRewriteStmt().getWhereClause().toSql();
-            LOG.warn("Join rewrite={}", sql);
-            Assert.assertEquals(sql, "`appevent`.`eventdate` >= '2020-01-14'"
-                    + " AND `appevent`.`eventdate` <= '2020-01-15' AND `eventid` = 1");
-        } catch (Exception e) {
-            LOG.warn("Join ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testSubSelect() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, sum(pv) FROM (SELECT eventdate, COUNT(userid) AS pv FROM appevent WHERE "
-                        + "eventdate>\"2020-01-11\" AND eventdate<\"2020-01-16\""
-                        + " AND eventid=1 GROUP BY eventdate) tbl GROUP BY eventdate"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L);                           //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition); //assert cache model first
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            LOG.warn("Sub nokey={}", cache.getNokeyStmt().toSql());
-            Assert.assertEquals(cache.getNokeyStmt().toSql(),
-                    "SELECT <slot 7> `eventdate` AS `eventdate`, <slot 8> sum(`pv`) AS `sum(``pv``)` FROM ("
-                            + "SELECT <slot 3> `eventdate` AS `eventdate`, <slot 4> count(`userid`) AS `pv` FROM "
-                            + "`testCluster:testDb`.`appevent` WHERE `eventid` = 1"
-                            + " GROUP BY `eventdate`) tbl GROUP BY `eventdate`");
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setCacheFlag(20200113L);    //get data from cache
-
-            range.buildDiskPartitionRange(newRangeList);
-
-            cache.rewriteSelectStmt(newRangeList);
-            sql = ca.getRewriteStmt().toSql();
-            LOG.warn("Sub rewrite={}", sql);
-            Assert.assertEquals(sql,
-                    "SELECT <slot 7> `eventdate` AS `eventdate`, <slot 8> sum(`pv`) AS `sum(``pv``)` FROM ("
-                            + "SELECT <slot 3> `eventdate` AS `eventdate`, <slot 4> count(`userid`) AS `pv` FROM "
-                            + "`testCluster:testDb`.`appevent` WHERE "
-                            + "`eventdate` > '2020-01-13' AND `eventdate` < '2020-01-16' AND `eventid` = 1 GROUP BY "
-                            + "`eventdate`) tbl GROUP BY `eventdate`");
-        } catch (Exception e) {
-            LOG.warn("sub ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testNotHitPartition() throws Exception {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
-                        + "eventdate<=\"2020-01-14\" GROUP BY eventdate"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1578675600000L); // set now to 2020-01-11 1:00:00, for hit partition cache
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition); //assert cache model first
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-            cache.rewriteSelectStmt(null);
-            PartitionRange range = cache.getPartitionRange();
-            range.analytics();
-            hitRange = range.buildDiskPartitionRange(newRangeList);
-            Assert.assertEquals(hitRange, Cache.HitRange.None);
-            Assert.assertEquals(newRangeList.size(), 2);
-            Assert.assertEquals(newRangeList.get(0).getCacheKey().realValue(), 20200112);
-            Assert.assertEquals(newRangeList.get(1).getCacheKey().realValue(), 20200114);
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
     public void testSqlCacheKey() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
                         + "eventdate<=\"2020-01-14\" GROUP BY eventdate"
@@ -1122,15 +639,14 @@ public class OlapQueryCacheTest {
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey, "SELECT <slot 2> `eventdate` AS `eventdate`, <slot 3> count(`userid`) AS "
-                + "`count(``userid``)` FROM `testCluster:testDb`.`appevent` WHERE `eventdate` >= '2020-01-12' AND "
-                + "`eventdate` <= '2020-01-14' GROUP BY `eventdate`|");
+        Assert.assertEquals(cacheKey, "SELECT `eventdate` AS `eventdate`, count(`userid`) "
+                + "AS `count(``userid``)` FROM `testDb`.`appevent` WHERE ((`eventdate` >= '2020-01-12') "
+                + "AND (`eventdate` <= '2020-01-14')) GROUP BY `eventdate`|");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
     public void testSqlCacheKeyWithChineseChar() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "SELECT eventdate, COUNT(userid) FROM appevent WHERE eventdate>=\"2020-01-12\" and "
                         + "eventdate<=\"2020-01-14\" and city=\"北京\" GROUP BY eventdate"
@@ -1150,7 +666,6 @@ public class OlapQueryCacheTest {
 
     @Test
     public void testSqlCacheKeyWithView() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql("SELECT * from testDb.view1");
         ArrayList<Long> selectedPartitionIds
                 = Lists.newArrayList(20200112L, 20200113L, 20200114L);
@@ -1161,17 +676,16 @@ public class OlapQueryCacheTest {
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey, "SELECT `testCluster:testDb`.`view1`.`eventdate` AS `eventdate`, "
-                + "`testCluster:testDb`.`view1`.`__count_1` AS `__count_1` FROM `testCluster:testDb`.`view1`|"
+        Assert.assertEquals(cacheKey, "SELECT `testDb`.`view1`.`eventdate` AS `eventdate`, "
+                + "`testDb`.`view1`.`__count_1` AS `__count_1` FROM `testDb`.`view1`|"
                 + "SELECT `eventdate` AS `eventdate`, count(`userid`) AS `__count_1` FROM "
-                + "`testCluster:testDb`.`appevent` WHERE `eventdate` >= '2020-01-12' AND "
-                + "`eventdate` <= '2020-01-14' GROUP BY `eventdate`");
+                + "`testDb`.`appevent` WHERE ((`eventdate` >= '2020-01-12') AND "
+                + "(`eventdate` <= '2020-01-14')) GROUP BY `eventdate`");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
     public void testSqlCacheKeyWithViewForNereids() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSqlByNereids("SELECT * from testDb.view1");
         ArrayList<Long> selectedPartitionIds
                 = Lists.newArrayList(20200112L, 20200113L, 20200114L);
@@ -1183,14 +697,13 @@ public class OlapQueryCacheTest {
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
         Assert.assertEquals(cacheKey, "SELECT * from testDb.view1|SELECT `eventdate` AS `eventdate`, "
-                + "count(`userid`) AS `__count_1` FROM `testCluster:testDb`.`appevent` "
-                + "WHERE `eventdate` >= '2020-01-12' AND `eventdate` <= '2020-01-14' GROUP BY `eventdate`");
+                + "count(`userid`) AS `__count_1` FROM `testDb`.`appevent` "
+                + "WHERE ((`eventdate` >= '2020-01-12') AND (`eventdate` <= '2020-01-14')) GROUP BY `eventdate`");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
     public void testSqlCacheKeyWithSubSelectView() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "select origin.eventdate as eventdate, origin.userid as userid\n"
                         + "from (\n"
@@ -1209,17 +722,16 @@ public class OlapQueryCacheTest {
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
         Assert.assertEquals(cacheKey, "SELECT `origin`.`eventdate` AS `eventdate`, "
-                + "`origin`.`userid` AS `userid` FROM (SELECT `view2`.`eventdate` AS `eventdate`, "
-                + "`view2`.`userid` AS `userid` FROM `testCluster:testDb`.`view2` view2 "
-                + "WHERE `view2`.`eventdate` >= '2020-01-12' AND `view2`.`eventdate` <= '2020-01-14') origin|"
-                + "SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testCluster:testDb`.`appevent`");
+                + "`origin`.`userid` AS `userid` FROM (SELECT `view2`.`eventdate` `eventdate`, "
+                + "`view2`.`userid` `userid` FROM `testDb`.`view2` view2 "
+                + "WHERE ((`view2`.`eventdate` >= '2020-01-12') AND (`view2`.`eventdate` <= '2020-01-14'))) origin|"
+                + "SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testDb`.`appevent`");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
 
     @Test
     public void testSqlCacheKeyWithSubSelectViewForNereids() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSqlByNereids(
                 "select origin.eventdate as eventdate, origin.userid as userid\n"
                         + "from (\n"
@@ -1242,74 +754,12 @@ public class OlapQueryCacheTest {
                 + "    select view2.eventdate as eventdate, view2.userid as userid \n"
                 + "    from testDb.view2 view2 \n"
                 + "    where view2.eventdate >=\"2020-01-12\" and view2.eventdate <= \"2020-01-14\"\n"
-                + ") origin|SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testCluster:testDb`.`appevent`");
+                + ") origin|SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testDb`.`appevent`");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
-    public void testPartitionCacheKeyWithView() {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql("SELECT * from testDb.view3");
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L); //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-            Assert.assertEquals(cache.getSqlWithViewStmt(), "SELECT `testCluster:testDb`.`view3`.`eventdate` "
-                    + "AS `eventdate`, `testCluster:testDb`.`view3`.`__count_1` AS `__count_1` "
-                    + "FROM `testCluster:testDb`.`view3`|SELECT `eventdate` AS `eventdate`, count(`userid`) "
-                    + "AS `__count_1` FROM `testCluster:testDb`.`appevent` WHERE `eventdate` >= '2020-01-12' "
-                    + "AND `eventdate` <= '2020-01-15' GROUP BY `eventdate`");
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
-    public void testPartitionCacheKeyWithSubSelectView() {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "select origin.eventdate as eventdate, origin.cnt as cnt\n"
-                        + "from (\n"
-                        + "    SELECT eventdate, COUNT(userid) as cnt \n"
-                        + "    FROM view2 \n"
-                        + "    WHERE eventdate>=\"2020-01-12\" and eventdate<=\"2020-01-15\" GROUP BY eventdate\n"
-                        + ") origin"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createEventScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L); //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);      //assert cache model first
-
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-            Assert.assertEquals(cache.getSqlWithViewStmt(),
-                    "SELECT `origin`.`eventdate` AS `eventdate`, `origin`.`cnt` AS `cnt` "
-                            + "FROM (SELECT <slot 4> `eventdate` AS `eventdate`, <slot 5> count(`userid`) AS `cnt` "
-                            + "FROM `testDb`.`view2` GROUP BY `eventdate`) origin|SELECT `eventdate` AS `eventdate`, "
-                            + "`userid` AS `userid` FROM `testCluster:testDb`.`appevent`");
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
-    }
-
-    @Test
     public void testSqlCacheKeyWithNestedView() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql("SELECT * from testDb.view4");
         ArrayList<Long> selectedPartitionIds
                 = Lists.newArrayList(20200112L, 20200113L, 20200114L);
@@ -1320,17 +770,16 @@ public class OlapQueryCacheTest {
 
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
-        Assert.assertEquals(cacheKey, "SELECT `testCluster:testDb`.`view4`.`eventdate` AS `eventdate`, "
-                + "`testCluster:testDb`.`view4`.`__count_1` AS `__count_1` FROM `testCluster:testDb`.`view4`|"
+        Assert.assertEquals(cacheKey, "SELECT `testDb`.`view4`.`eventdate` AS `eventdate`, "
+                + "`testDb`.`view4`.`__count_1` AS `__count_1` FROM `testDb`.`view4`|"
                 + "SELECT `eventdate` AS `eventdate`, count(`userid`) AS `__count_1` FROM `testDb`.`view2` "
-                + "WHERE `eventdate` >= '2020-01-12' AND `eventdate` <= '2020-01-14' GROUP BY `eventdate`|"
-                + "SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testCluster:testDb`.`appevent`");
+                + "WHERE ((`eventdate` >= '2020-01-12') AND (`eventdate` <= '2020-01-14')) GROUP BY `eventdate`|"
+                + "SELECT `eventdate` AS `eventdate`, `userid` AS `userid` FROM `testDb`.`appevent`");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
     public void testSqlCacheKeyWithNestedViewForNereids() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSqlByNereids("SELECT * from testDb.view4");
         ArrayList<Long> selectedPartitionIds
                 = Lists.newArrayList(20200112L, 20200113L, 20200114L);
@@ -1342,15 +791,14 @@ public class OlapQueryCacheTest {
         SqlCache sqlCache = (SqlCache) ca.getCache();
         String cacheKey = sqlCache.getSqlWithViewStmt();
         Assert.assertEquals(cacheKey, "SELECT * from testDb.view4|SELECT `eventdate` AS `eventdate`, "
-                + "count(`userid`) AS `__count_1` FROM `testDb`.`view2` WHERE `eventdate` >= '2020-01-12' AND "
-                + "`eventdate` <= '2020-01-14' GROUP BY `eventdate`|SELECT `eventdate` AS `eventdate`, "
-                + "`userid` AS `userid` FROM `testCluster:testDb`.`appevent`");
+                + "count(`userid`) AS `__count_1` FROM `testDb`.`view2` WHERE ((`eventdate` >= '2020-01-12') "
+                + "AND (`eventdate` <= '2020-01-14')) GROUP BY `eventdate`|SELECT `eventdate` AS `eventdate`, "
+                + "`userid` AS `userid` FROM `testDb`.`appevent`");
         Assert.assertEquals(selectedPartitionIds.size(), sqlCache.getSumOfPartitionNum());
     }
 
     @Test
     public void testCacheLocalViewMultiOperand() {
-        Env.getCurrentSystemInfo();
         StatementBase parseStmt = parseSql(
                 "SELECT COUNT(userid)\n"
                         + "FROM (\n"
@@ -1369,50 +817,5 @@ public class OlapQueryCacheTest {
         ca.checkCacheMode(0);
         Assert.assertEquals(ca.getCacheMode(), CacheMode.Sql);
         Assert.assertEquals(selectedPartitionIds.size() * 3, ((SqlCache) ca.getCache()).getSumOfPartitionNum());
-    }
-
-    @Test
-    // test that some partitions do not exist in the table
-    public void testNotExistPartitionSql() {
-        Env.getCurrentSystemInfo();
-        StatementBase parseStmt = parseSql(
-                "SELECT `date`, COUNT(id) FROM `order` WHERE `date`>=20200110 and `date`<=20200115 GROUP BY date"
-        );
-        ArrayList<Long> selectedPartitionIds
-                = Lists.newArrayList(20200112L, 20200113L, 20200114L, 20200115L);
-        List<ScanNode> scanNodes = Lists.newArrayList(createOrderScanNode(selectedPartitionIds));
-        CacheAnalyzer ca = new CacheAnalyzer(context, parseStmt, scanNodes);
-        ca.checkCacheMode(1579053661000L);                              //2020-1-15 10:01:01
-        Assert.assertEquals(ca.getCacheMode(), CacheMode.Partition);    //assert cache model first
-        try {
-            PartitionCache cache = (PartitionCache) ca.getCache();
-            cache.rewriteSelectStmt(null);
-            Assert.assertEquals(cache.getNokeyStmt().getWhereClause(), null);
-
-            PartitionRange range = cache.getPartitionRange();
-            boolean flag = range.analytics();
-            Assert.assertEquals(flag, true);
-
-            int size = range.getPartitionSingleList().size();
-            LOG.warn("Rewrite partition range size={}", size);
-            Assert.assertEquals(size, 4);
-
-            String sql;
-            range.setCacheFlag(20200112L);    //get data from cache
-            range.setCacheFlag(20200113L);    //get data from cache
-
-            hitRange = range.buildDiskPartitionRange(newRangeList);
-            Assert.assertEquals(hitRange, Cache.HitRange.Left);
-            Assert.assertEquals(newRangeList.size(), 2);
-            Assert.assertEquals(newRangeList.get(0).getCacheKey().realValue(), 20200114);
-            Assert.assertEquals(newRangeList.get(1).getCacheKey().realValue(), 20200115);
-
-            cache.rewriteSelectStmt(newRangeList);
-            sql = ca.getRewriteStmt().getWhereClause().toSql();
-            Assert.assertEquals(sql, "`date` >= 20200114 AND `date` <= 20200115");
-        } catch (Exception e) {
-            LOG.warn("ex={}", e);
-            Assert.fail(e.getMessage());
-        }
     }
 }

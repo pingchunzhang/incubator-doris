@@ -18,6 +18,7 @@
 package org.apache.doris.nereids.trees.plans.logical;
 
 import org.apache.doris.nereids.memo.GroupExpression;
+import org.apache.doris.nereids.properties.DataTrait;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
 import org.apache.doris.nereids.trees.expressions.NamedExpression;
@@ -154,6 +155,10 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
                 children.get(0));
     }
 
+    public LogicalRepeat<CHILD_TYPE> withGroupSets(List<List<Expression>> groupingSets) {
+        return new LogicalRepeat<>(groupingSets, outputExpressions, child());
+    }
+
     public LogicalRepeat<CHILD_TYPE> withGroupSetsAndOutput(List<List<Expression>> groupingSets,
             List<NamedExpression> outputExpressionList) {
         return new LogicalRepeat<>(groupingSets, outputExpressionList, child());
@@ -176,5 +181,25 @@ public class LogicalRepeat<CHILD_TYPE extends Plan> extends LogicalUnary<CHILD_T
     public boolean canBindVirtualSlot() {
         return bound() && outputExpressions.stream()
                 .noneMatch(output -> output.containsType(VirtualSlotReference.class));
+    }
+
+    @Override
+    public void computeUnique(DataTrait.Builder builder) {
+        // don't generate unique slot
+    }
+
+    @Override
+    public void computeUniform(DataTrait.Builder builder) {
+        builder.addUniformSlot(child(0).getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeEqualSet(DataTrait.Builder builder) {
+        builder.addEqualSet(child().getLogicalProperties().getTrait());
+    }
+
+    @Override
+    public void computeFd(DataTrait.Builder builder) {
+        builder.addFuncDepsDG(child().getLogicalProperties().getTrait());
     }
 }

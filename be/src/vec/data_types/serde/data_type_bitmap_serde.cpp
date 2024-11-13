@@ -33,17 +33,14 @@ namespace doris {
 namespace vectorized {
 class IColumn;
 
-Status DataTypeBitMapSerDe::deserialize_column_from_json_vector(IColumn& column,
-                                                                std::vector<Slice>& slices,
-                                                                int* num_deserialized,
-                                                                const FormatOptions& options,
-                                                                int nesting_level) const {
+Status DataTypeBitMapSerDe::deserialize_column_from_json_vector(
+        IColumn& column, std::vector<Slice>& slices, int* num_deserialized,
+        const FormatOptions& options) const {
     DESERIALIZE_COLUMN_FROM_JSON_VECTOR()
     return Status::OK();
 }
 Status DataTypeBitMapSerDe::deserialize_one_cell_from_json(IColumn& column, Slice& slice,
-                                                           const FormatOptions& options,
-                                                           int nesting_level) const {
+                                                           const FormatOptions& options) const {
     auto& data_column = assert_cast<ColumnBitmap&>(column);
     auto& data = data_column.get_data();
 
@@ -108,13 +105,14 @@ void DataTypeBitMapSerDe::read_one_cell_from_jsonb(IColumn& column, const JsonbV
 template <bool is_binary_format>
 Status DataTypeBitMapSerDe::_write_column_to_mysql(const IColumn& column,
                                                    MysqlRowBuffer<is_binary_format>& result,
-                                                   int row_idx, bool col_const) const {
+                                                   int row_idx, bool col_const,
+                                                   const FormatOptions& options) const {
     auto& data_column = assert_cast<const ColumnBitmap&>(column);
     if (_return_object_as_string) {
         const auto col_index = index_check_const(row_idx, col_const);
         BitmapValue bitmapValue = data_column.get_element(col_index);
         size_t size = bitmapValue.getSizeInBytes();
-        std::unique_ptr<char[]> buf = std::make_unique<char[]>(size);
+        std::unique_ptr<char[]> buf = std::make_unique_for_overwrite<char[]>(size);
         bitmapValue.write_to(buf.get());
         if (0 != result.push_string(buf.get(), size)) {
             return Status::InternalError("pack mysql buffer failed.");
@@ -129,17 +127,20 @@ Status DataTypeBitMapSerDe::_write_column_to_mysql(const IColumn& column,
 
 Status DataTypeBitMapSerDe::write_column_to_mysql(const IColumn& column,
                                                   MysqlRowBuffer<true>& row_buffer, int row_idx,
-                                                  bool col_const) const {
-    return _write_column_to_mysql(column, row_buffer, row_idx, col_const);
+                                                  bool col_const,
+                                                  const FormatOptions& options) const {
+    return _write_column_to_mysql(column, row_buffer, row_idx, col_const, options);
 }
 
 Status DataTypeBitMapSerDe::write_column_to_mysql(const IColumn& column,
                                                   MysqlRowBuffer<false>& row_buffer, int row_idx,
-                                                  bool col_const) const {
-    return _write_column_to_mysql(column, row_buffer, row_idx, col_const);
+                                                  bool col_const,
+                                                  const FormatOptions& options) const {
+    return _write_column_to_mysql(column, row_buffer, row_idx, col_const, options);
 }
 
-Status DataTypeBitMapSerDe::write_column_to_orc(const IColumn& column, const NullMap* null_map,
+Status DataTypeBitMapSerDe::write_column_to_orc(const std::string& timezone, const IColumn& column,
+                                                const NullMap* null_map,
                                                 orc::ColumnVectorBatch* orc_col_batch, int start,
                                                 int end,
                                                 std::vector<StringRef>& buffer_list) const {

@@ -24,7 +24,6 @@ import org.apache.doris.catalog.Partition;
 import org.apache.doris.catalog.Table;
 import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.Config;
-import org.apache.doris.common.DdlException;
 import org.apache.doris.common.ErrorCode;
 import org.apache.doris.common.ErrorReport;
 import org.apache.doris.common.FeNameFormat;
@@ -50,7 +49,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 // EXPORT statement, export data to dirs by broker.
 //
@@ -58,25 +56,31 @@ import java.util.stream.Collectors;
 //      EXPORT TABLE table_name [PARTITION (name1[, ...])]
 //          TO 'export_target_path'
 //          [PROPERTIES("key"="value")]
-//          BY BROKER 'broker_name' [( $broker_attrs)]
+//          WITH BROKER 'broker_name' [( $broker_attrs)]
 @Getter
-public class ExportStmt extends StatementBase {
+public class ExportStmt extends StatementBase implements NotFallbackInParser {
     public static final String PARALLELISM = "parallelism";
     public static final String LABEL = "label";
+    public static final String DATA_CONSISTENCY = "data_consistency";
+    public static final String COMPRESS_TYPE = "compress_type";
 
     private static final String DEFAULT_COLUMN_SEPARATOR = "\t";
     private static final String DEFAULT_LINE_DELIMITER = "\n";
     private static final String DEFAULT_PARALLELISM = "1";
+    private static final Integer DEFAULT_TIMEOUT = 7200;
 
     private static final ImmutableSet<String> PROPERTIES_SET = new ImmutableSet.Builder<String>()
             .add(LABEL)
             .add(PARALLELISM)
+            .add(DATA_CONSISTENCY)
             .add(LoadStmt.KEY_IN_PARAM_COLUMNS)
             .add(OutFileClause.PROP_MAX_FILE_SIZE)
             .add(OutFileClause.PROP_DELETE_EXISTING_FILES)
             .add(PropertyAnalyzer.PROPERTIES_COLUMN_SEPARATOR)
             .add(PropertyAnalyzer.PROPERTIES_LINE_DELIMITER)
+            .add(PropertyAnalyzer.PROPERTIES_TIMEOUT)
             .add("format")
+            .add(COMPRESS_TYPE)
             .build();
 
     private TableName tblName;
@@ -97,8 +101,13 @@ public class ExportStmt extends StatementBase {
 
     private Integer parallelism;
 
+    private Integer timeout;
+
     private String maxFileSize;
     private String deleteExistingFiles;
+    private String withBom;
+    private String dataConsistency = ExportJob.CONSISTENT_PARTITION;
+    private String compressionType;
     private SessionVariable sessionVariables;
 
     private String qualifiedUser;
@@ -118,10 +127,14 @@ public class ExportStmt extends StatementBase {
         this.brokerDesc = brokerDesc;
         this.columnSeparator = DEFAULT_COLUMN_SEPARATOR;
         this.lineDelimiter = DEFAULT_LINE_DELIMITER;
+        this.timeout = DEFAULT_TIMEOUT;
 
-        Optional<SessionVariable> optionalSessionVariable = Optional.ofNullable(
-                ConnectContext.get().getSessionVariable());
-        this.sessionVariables = optionalSessionVariable.orElse(VariableMgr.getDefaultSessionVariable());
+        // ConnectionContext may not exist when in replay thread
+        if (ConnectContext.get() != null) {
+            this.sessionVariables = VariableMgr.cloneSessionVariable(ConnectContext.get().getSessionVariable());
+        } else {
+            this.sessionVariables = VariableMgr.cloneSessionVariable(VariableMgr.getDefaultSessionVariable());
+        }
     }
 
     @Override
@@ -153,13 +166,13 @@ public class ExportStmt extends StatementBase {
         }
 
         // check auth
-        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(),
-                                                                tblName.getDb(), tblName.getTbl(),
-                                                                PrivPredicate.SELECT)) {
+        if (!Env.getCurrentEnv().getAccessManager().checkTblPriv(ConnectContext.get(), tblName.getCtl(),
+                tblName.getDb(), tblName.getTbl(),
+                PrivPredicate.SELECT)) {
             ErrorReport.reportAnalysisException(ErrorCode.ERR_TABLEACCESS_DENIED_ERROR, "EXPORT",
-                                                ConnectContext.get().getQualifiedUser(),
-                                                ConnectContext.get().getRemoteIP(),
-                                                tblName.getDb() + ": " + tblName.getTbl());
+                    ConnectContext.get().getQualifiedUser(),
+                    ConnectContext.get().getRemoteIP(),
+                    tblName.getDb() + ": " + tblName.getTbl());
         }
         qualifiedUser = ConnectContext.get().getQualifiedUser();
         userIdentity = ConnectContext.get().getCurrentUserIdentity();
@@ -173,7 +186,7 @@ public class ExportStmt extends StatementBase {
         }
 
         // check path is valid
-        StorageBackend.checkPath(path, brokerDesc.getStorageType());
+        StorageBackend.checkPath(path, brokerDesc.getStorageType(), null);
         if (brokerDesc.getStorageType() == StorageBackend.StorageType.BROKER) {
             BrokerMgr brokerMgr = analyzer.getEnv().getBrokerMgr();
             if (!brokerMgr.containsBroker(brokerDesc.getName())) {
@@ -193,7 +206,7 @@ public class ExportStmt extends StatementBase {
     }
 
     private void setJob() throws UserException {
-        exportJob = new ExportJob();
+        exportJob = new ExportJob(Env.getCurrentEnv().getNextId());
 
         Database db = Env.getCurrentInternalCatalog().getDbOrDdlException(this.tblName.getDb());
         exportJob.setDbId(db.getId());
@@ -220,6 +233,9 @@ public class ExportStmt extends StatementBase {
         exportJob.setParallelism(this.parallelism);
         exportJob.setMaxFileSize(this.maxFileSize);
         exportJob.setDeleteExistingFiles(this.deleteExistingFiles);
+        exportJob.setWithBom(this.withBom);
+        exportJob.setDataConsistency(this.dataConsistency);
+        exportJob.setCompressType(this.compressionType);
 
         if (columns != null) {
             Splitter split = Splitter.on(',').trimResults().omitEmptyStrings();
@@ -232,8 +248,10 @@ public class ExportStmt extends StatementBase {
         // set sessions
         exportJob.setQualifiedUser(this.qualifiedUser);
         exportJob.setUserIdentity(this.userIdentity);
-        exportJob.setSessionVariables(this.sessionVariables);
-        exportJob.setTimeoutSecond(this.sessionVariables.getQueryTimeoutS());
+        SessionVariable clonedSessionVariable = VariableMgr.cloneSessionVariable(Optional.ofNullable(
+                ConnectContext.get().getSessionVariable()).orElse(VariableMgr.getDefaultSessionVariable()));
+        exportJob.setSessionVariables(clonedSessionVariable);
+        exportJob.setTimeoutSecond(this.timeout);
 
         exportJob.setOrigStmt(this.getOrigStmt());
     }
@@ -254,7 +272,7 @@ public class ExportStmt extends StatementBase {
         table.readLock();
         try {
             // check table
-            if (!table.isPartitioned()) {
+            if (!table.isPartitionedTable()) {
                 throw new AnalysisException("Table[" + tblName.getTbl() + "] is not partitioned.");
             }
             Table.TableType tblType = table.getType();
@@ -307,11 +325,6 @@ public class ExportStmt extends StatementBase {
         // "" means user specified zero columns
         this.columns = properties.getOrDefault(LoadStmt.KEY_IN_PARAM_COLUMNS, null);
 
-        // check columns are exits
-        if (columns != null) {
-            checkColumns();
-        }
-
         // format
         this.format = properties.getOrDefault(LoadStmt.KEY_IN_PARAM_FORMAT_TYPE, "csv").toLowerCase();
 
@@ -321,6 +334,15 @@ public class ExportStmt extends StatementBase {
             this.parallelism = Integer.parseInt(parallelismString);
         } catch (NumberFormatException e) {
             throw new UserException("The value of parallelism is invalid!");
+        }
+
+        // timeout
+        String timeoutString = properties.getOrDefault(PropertyAnalyzer.PROPERTIES_TIMEOUT,
+                String.valueOf(DEFAULT_TIMEOUT));
+        try {
+            this.timeout = Integer.parseInt(timeoutString);
+        } catch (NumberFormatException e) {
+            throw new UserException("The value of timeout is invalid!");
         }
 
         // max_file_size
@@ -335,24 +357,25 @@ public class ExportStmt extends StatementBase {
             // generate a random label
             this.label = "export_" + UUID.randomUUID();
         }
-    }
 
-    private void checkColumns() throws DdlException {
-        if (this.columns.isEmpty()) {
-            throw new DdlException("columns can not be empty");
-        }
-        Database db = Env.getCurrentInternalCatalog().getDbOrDdlException(this.tblName.getDb());
-        Table table = db.getTableOrDdlException(this.tblName.getTbl());
-        List<String> tableColumns = table.getBaseSchema().stream().map(column -> column.getName())
-                .collect(Collectors.toList());
-        Splitter split = Splitter.on(',').trimResults().omitEmptyStrings();
+        // with bom
+        this.withBom = properties.getOrDefault(OutFileClause.PROP_WITH_BOM, "false");
 
-        List<String> columnsSpecified = split.splitToList(this.columns.toLowerCase());
-        for (String columnName : columnsSpecified) {
-            if (!tableColumns.contains(columnName)) {
-                throw new DdlException("unknown column [" + columnName + "] in table [" + this.tblName.getTbl() + "]");
+        // data consistency
+        if (properties.containsKey(DATA_CONSISTENCY)) {
+            String dataConsistencyStr = properties.get(DATA_CONSISTENCY);
+            if (ExportJob.CONSISTENT_NONE.equalsIgnoreCase(dataConsistencyStr)) {
+                this.dataConsistency = ExportJob.CONSISTENT_NONE;
+            } else if (ExportJob.CONSISTENT_PARTITION.equalsIgnoreCase(dataConsistencyStr)) {
+                this.dataConsistency = ExportJob.CONSISTENT_PARTITION;
+            } else {
+                throw new AnalysisException("The value of data_consistency is invalid, please use `"
+                        + ExportJob.CONSISTENT_PARTITION + "`/`" + ExportJob.CONSISTENT_NONE + "`");
             }
         }
+
+        // compress_type
+        this.compressionType = properties.getOrDefault(COMPRESS_TYPE, "");
     }
 
     @Override
@@ -398,5 +421,10 @@ public class ExportStmt extends StatementBase {
     @Override
     public String toString() {
         return toSql();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.EXPORT;
     }
 }

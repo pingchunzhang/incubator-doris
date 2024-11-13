@@ -58,6 +58,7 @@ public class MaterializedViewFunctionTest {
         UtFrameUtils.createDorisCluster(runningDir);
         dorisAssert = new DorisAssert();
         dorisAssert.withDatabase(HR_DB_NAME).useDatabase(HR_DB_NAME);
+        dorisAssert.getSessionVariable().setEnableSyncMvCostBasedRewrite(false);
     }
 
     @Before
@@ -773,7 +774,7 @@ public class MaterializedViewFunctionTest {
         String createUserTagMVSql = "create materialized view " + USER_TAG_MV_NAME + " as select user_id, "
                 + "`" + FunctionSet.HLL_UNION + "`(" + FunctionSet.HLL_HASH + "(tag_id)) from " + USER_TAG_TABLE_NAME + " group by user_id;";
         dorisAssert.withMaterializedView(createUserTagMVSql);
-        String query = "select ndv(tag_id) from " + USER_TAG_TABLE_NAME + ";";
+        String query = "select /*+ SET_VAR(enable_fallback_to_original_planner=false) */ndv(tag_id) from " + USER_TAG_TABLE_NAME + ";";
         dorisAssert.query(query).explainContains(USER_TAG_MV_NAME, "hll_union_agg");
     }
 
@@ -782,7 +783,7 @@ public class MaterializedViewFunctionTest {
         String createUserTagMVSql = "create materialized view " + USER_TAG_MV_NAME + " as select user_id, "
                 + "`" + FunctionSet.HLL_UNION + "`(" + FunctionSet.HLL_HASH + "(tag_id)) from " + USER_TAG_TABLE_NAME + " group by user_id;";
         dorisAssert.withMaterializedView(createUserTagMVSql);
-        String query = "select approx_count_distinct(tag_id) from " + USER_TAG_TABLE_NAME + ";";
+        String query = "select /*+ SET_VAR(enable_fallback_to_original_planner=false) */ approx_count_distinct(tag_id) from " + USER_TAG_TABLE_NAME + ";";
         dorisAssert.query(query).explainContains(USER_TAG_MV_NAME, "hll_union_agg");
     }
 

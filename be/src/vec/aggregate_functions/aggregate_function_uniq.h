@@ -28,7 +28,6 @@
 #include <type_traits>
 #include <vector>
 
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/columns/column.h"
@@ -37,7 +36,6 @@
 #include "vec/common/assert_cast.h"
 #include "vec/common/hash_table/hash.h"
 #include "vec/common/hash_table/phmap_fwd_decl.h"
-#include "vec/common/sip_hash.h"
 #include "vec/common/string_ref.h"
 #include "vec/common/uint128.h"
 #include "vec/core/types.h"
@@ -65,21 +63,21 @@ template <typename T>
 struct AggregateFunctionUniqExactData {
     static constexpr bool is_string_key = std::is_same_v<T, String>;
     using Key = std::conditional_t<is_string_key, UInt128, T>;
-    using Hash = std::conditional_t<is_string_key, UInt128TrivialHash, HashCRC32<Key>>;
+    using Hash = HashCRC32<Key>;
 
     using Set = flat_hash_set<Key, Hash>;
 
+    // TODO: replace SipHash with xxhash to speed up
     static UInt128 ALWAYS_INLINE get_key(const StringRef& value) {
-        UInt128 key;
-        SipHash hash;
-        hash.update(value.data, value.size);
-        hash.get128(key.low, key.high);
-        return key;
+        auto hash_value = XXH_INLINE_XXH128(value.data, value.size, 0);
+        return UInt128 {hash_value.high64, hash_value.low64};
     }
 
     Set set;
 
-    static String get_name() { return "uniqExact"; }
+    static String get_name() { return "multi_distinct"; }
+
+    void reset() { set.clear(); }
 };
 
 namespace detail {
@@ -94,9 +92,12 @@ struct OneAdder {
             StringRef value = column.get_data_at(row_num);
             data.set.insert(Data::get_key(value));
         } else if constexpr (IsDecimalNumber<T>) {
-            data.set.insert(assert_cast<const ColumnDecimal<T>&>(column).get_data()[row_num]);
+            data.set.insert(
+                    assert_cast<const ColumnDecimal<T>&, TypeCheckOnRelease::DISABLE>(column)
+                            .get_data()[row_num]);
         } else {
-            data.set.insert(assert_cast<const ColumnVector<T>&>(column).get_data()[row_num]);
+            data.set.insert(assert_cast<const ColumnVector<T>&, TypeCheckOnRelease::DISABLE>(column)
+                                    .get_data()[row_num]);
         }
     }
 };
@@ -116,7 +117,9 @@ public:
 
     DataTypePtr get_return_type() const override { return std::make_shared<DataTypeInt64>(); }
 
-    void add(AggregateDataPtr __restrict place, const IColumn** columns, size_t row_num,
+    void reset(AggregateDataPtr __restrict place) const override { this->data(place).reset(); }
+
+    void add(AggregateDataPtr __restrict place, const IColumn** columns, ssize_t row_num,
              Arena*) const override {
         detail::OneAdder<T, Data>::add(this->data(place), *columns[0], row_num);
     }
@@ -138,7 +141,7 @@ public:
     }
 
     void add_batch(size_t batch_size, AggregateDataPtr* places, size_t place_offset,
-                   const IColumn** columns, Arena* arena, bool /*agg_many*/) const override {
+                   const IColumn** columns, Arena*, bool /*agg_many*/) const override {
         std::vector<KeyType> keys_container;
         const KeyType* keys = get_keys(keys_container, *columns[0], batch_size);
 
@@ -172,7 +175,7 @@ public:
     }
 
     void add_batch_single_place(size_t batch_size, AggregateDataPtr place, const IColumn** columns,
-                                Arena* arena) const override {
+                                Arena*) const override {
         std::vector<KeyType> keys_container;
         const KeyType* keys = get_keys(keys_container, *columns[0], batch_size);
         auto& set = this->data(place).set;
@@ -194,7 +197,7 @@ public:
     }
 
     void deserialize_and_merge(AggregateDataPtr __restrict place, AggregateDataPtr __restrict rhs,
-                               BufferReadable& buf, Arena* arena) const override {
+                               BufferReadable& buf, Arena*) const override {
         auto& set = this->data(place).set;
         UInt64 size;
         read_var_uint(size, buf);
@@ -209,7 +212,7 @@ public:
     }
 
     void deserialize(AggregateDataPtr __restrict place, BufferReadable& buf,
-                     Arena* arena) const override {
+                     Arena*) const override {
         auto& set = this->data(place).set;
         UInt64 size;
         read_var_uint(size, buf);

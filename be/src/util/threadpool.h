@@ -256,6 +256,13 @@ public:
         return _total_queued_tasks;
     }
 
+    std::vector<int> debug_info() {
+        std::lock_guard<std::mutex> l(_lock);
+        std::vector<int> arr = {_num_threads, static_cast<int>(_threads.size()), _min_threads,
+                                _max_threads};
+        return arr;
+    }
+
 private:
     friend class ThreadPoolBuilder;
     friend class ThreadPoolToken;
@@ -487,7 +494,7 @@ private:
     ThreadPool::ExecutionMode _mode;
 
     // Pointer to the token's thread pool.
-    ThreadPool* _pool;
+    ThreadPool* _pool = nullptr;
 
     // Token state machine.
     State _state;

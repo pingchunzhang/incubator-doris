@@ -233,6 +233,11 @@ suite("cast") {
         sql """select cast(k5 as time) ct from test order by ct;"""
         exception "cannot cast"
     }
+    test {
+        sql "select cast(12 as decimalv3(2,1))"
+        exception "Arithmetic overflow"
+    }
+
     // date
     test {
         sql """select cast(k10 as time) ct from test order by ct;"""
@@ -243,4 +248,24 @@ suite("cast") {
         sql """select cast(k11 as time) ct from test order by ct;"""
         exception "cannot cast"
     }
+
+    sql "select cast(1 as signed)"
+    sql "select cast(1 as signed int)"
+    sql "select cast(1 as unsigned)"
+    sql "select cast(1 as unsigned integer)"
+
+    // ip
+
+    sql """drop table if exists ip_test"""
+    sql """
+        create table if not exists ip_test (a ipv6, b ipv4)  properties ("replication_num" = "1");
+    """
+    sql """
+        insert into ip_test values('d916:b163:3ce8:e0f3:b953:fa0c:ab21:1ff9', "172.20.48.119");
+    """
+
+    sql """sync"""
+
+    sql """select ipv6_string_to_num(a), ipv4_string_to_num(b) from ip_test"""
+    sql """drop table if exists ip_test"""
 }

@@ -55,12 +55,22 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
     }
 
     def check_path_exists = { dir_path ->
+        List<List<Object>> backends =  sql """ show backends """
+        assertTrue(backends.size() > 0)
         File path = new File(dir_path)
         if (!path.exists()) {
             assert path.mkdirs()
         } else {
             throw new IllegalStateException("""${dir_path} already exists! """)
         }
+        if (backends.size() > 1) {
+            for (List<Object> backend : backends) {
+                def be_host = backend[1]
+                def cmd="""mkdir -p ${dir_path}"""
+                sshExec("root", be_host, cmd.toString())
+            }
+        }
+
     }
     def check_file_amounts = { dir_path, amount ->
         File path = new File(dir_path)
@@ -76,9 +86,9 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
             path.delete();
         }
     }
-    def waiting_export = { export_label ->
+    def waiting_export = { ctlName, dbName, export_label ->
         while (true) {
-            def res = sql """ show export where label = "${export_label}" """
+            def res = sql """ show export from ${ctlName}.${dbName} where label = "${export_label}" """
             logger.info("export state: " + res[0][2])
             if (res[0][2] == "FINISHED") {
                 break;
@@ -103,7 +113,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
     String driver_url = "https://${bucket}.${s3_endpoint}/regression/jdbc_driver/mysql-connector-java-8.0.25.jar"
 
     if (enabled != null && enabled.equalsIgnoreCase("true")) {
-        String catalog_name = "mysql_jdbc_catalog";
+        String catalog_name = "test_export_external_table";
         String internal_db_name = "regression_test_external_table_p0_export";
         String ex_db_name = "doris_test";
         String mysql_port = context.config.otherConfigs.get("mysql_57_port");
@@ -169,7 +179,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)
@@ -226,10 +236,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                 );
             """
 
-            sql """ switch ${catalog_name} """
-            sql """ use ${ex_db_name} """
-
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)
@@ -285,7 +292,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)
@@ -342,7 +349,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)
@@ -398,7 +405,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "format" = "orc"
                 );
             """
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)
@@ -453,7 +460,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "format" = "parquet"
                 );
             """
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)
@@ -510,7 +517,7 @@ suite("test_export_external_table", "p0,external,mysql,external_docker,external_
                     "column_separator"=","
                 );
             """
-            waiting_export.call(label)
+            waiting_export.call(catalog_name, ex_db_name, label)
             
             // check file amounts
             check_file_amounts.call("${outFilePath}", 1)

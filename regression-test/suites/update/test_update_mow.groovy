@@ -16,6 +16,8 @@
 // under the License.
 
 suite("test_update_mow", "p0") {
+    sql "set enable_nereids_planner=true"
+    sql "set enable_fallback_to_original_planner=false"
     def tbName1 = "test_update_mow_1"
     def tbName2 = "test_update_mow_2"
     def tbName3 = "test_update_mow_3"

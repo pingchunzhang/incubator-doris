@@ -15,10 +15,13 @@
 # specific language governing permissions and limitations
 # under the License.
 
+import contextlib
 import docker
-import json
+import jsonpickle
 import logging
 import os
+import pwd
+import socket
 import subprocess
 import time
 import yaml
@@ -53,6 +56,10 @@ def set_enable_log(enabled):
 
 def is_enable_log():
     return ENABLE_LOG
+
+
+def set_log_verbose():
+    get_logger().setLevel(logging.DEBUG)
 
 
 def get_logger(name=None):
@@ -167,29 +174,48 @@ def get_doris_running_containers(cluster_name):
     }
 
 
+def remove_docker_network(cluster_name):
+    client = docker.client.from_env()
+    for network in client.networks.list(
+            names=[cluster_name + "_" + with_doris_prefix(cluster_name)]):
+        network.remove()
+
+
 def is_dir_empty(dir):
     return False if os.listdir(dir) else True
 
 
-def exec_shell_command(command, ignore_errors=False):
+def exec_shell_command(command, ignore_errors=False, output_real_time=False):
     LOG.info("Exec command: {}".format(command))
     p = subprocess.Popen(command,
                          shell=True,
                          stdout=subprocess.PIPE,
                          stderr=subprocess.STDOUT)
-    out = p.communicate()[0].decode('utf-8')
+    out = ''
+    exitcode = None
+    if output_real_time:
+        while p.poll() is None:
+            s = p.stdout.readline().decode('utf-8')
+            if ENABLE_LOG and s.rstrip():
+                print(s.rstrip())
+            out += s
+        exitcode = p.wait()
+    else:
+        out = p.communicate()[0].decode('utf-8')
+        exitcode = p.returncode
+        if ENABLE_LOG and out:
+            print(out)
     if not ignore_errors:
-        assert p.returncode == 0, out
-    if ENABLE_LOG and out:
-        print(out)
-    return p.returncode, out
+        assert exitcode == 0, out
+    return exitcode, out
 
 
 def exec_docker_compose_command(compose_file,
                                 command,
                                 options=None,
                                 nodes=None,
-                                user_command=None):
+                                user_command=None,
+                                output_real_time=False):
     if nodes != None and not nodes:
         return 0, "Skip"
 
@@ -198,7 +224,7 @@ def exec_docker_compose_command(compose_file,
         " ".join([node.service_name() for node in nodes]) if nodes else "",
         user_command if user_command else "")
 
-    return exec_shell_command(compose_cmd)
+    return exec_shell_command(compose_cmd, output_real_time=output_real_time)
 
 
 def get_docker_subnets_prefix16():
@@ -254,6 +280,12 @@ def copy_image_directory(image, image_dir, local_dir):
         entrypoint="cp -r  {}  /opt/mount/".format(image_dir))
 
 
+def is_socket_avail(ip, port):
+    with contextlib.closing(socket.socket(socket.AF_INET,
+                                          socket.SOCK_STREAM)) as sock:
+        return sock.connect_ex((ip, port)) == 0
+
+
 def enable_dir_with_rw_perm(dir):
     if not os.path.exists(dir):
         return
@@ -262,6 +294,20 @@ def enable_dir_with_rw_perm(dir):
                           remove=True,
                           volumes=["{}:/opt/mount".format(dir)],
                           entrypoint="chmod a+rw -R {}".format("/opt/mount"))
+
+
+def get_path_owner(path):
+    try:
+        return pwd.getpwuid(os.stat(path).st_uid).pw_name
+    except:
+        return ""
+
+
+def get_path_uid(path):
+    try:
+        return os.stat(path).st_uid
+    except:
+        return ""
 
 
 def read_compose_file(file):
@@ -275,8 +321,12 @@ def write_compose_file(file, compose):
 
 
 def pretty_json(json_data):
-    return json.dumps(json_data, indent=4, sort_keys=True)
+    return jsonpickle.dumps(json_data, indent=4)
 
 
 def is_true(val):
     return str(val) == "true" or str(val) == "1"
+
+
+def escape_null(val):
+    return "" if val == "\\N" else val

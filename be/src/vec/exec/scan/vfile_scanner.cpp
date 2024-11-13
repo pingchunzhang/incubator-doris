@@ -31,15 +31,11 @@
 #include <tuple>
 #include <utility>
 
-#include "vec/data_types/data_type_factory.hpp"
-#include "vec/exec/format/wal/wal_reader.h"
-
-// IWYU pragma: no_include <opentelemetry/common/threadlocal.h>
 #include "common/compiler_util.h" // IWYU pragma: keep
 #include "common/config.h"
 #include "common/logging.h"
 #include "common/object_pool.h"
-#include "io/cache/block/block_file_cache_profile.h"
+#include "io/cache/block_file_cache_profile.h"
 #include "runtime/descriptors.h"
 #include "runtime/runtime_state.h"
 #include "runtime/types.h"
@@ -53,9 +49,11 @@
 #include "vec/core/columns_with_type_and_name.h"
 #include "vec/core/field.h"
 #include "vec/data_types/data_type.h"
+#include "vec/data_types/data_type_factory.hpp"
 #include "vec/data_types/data_type_nullable.h"
 #include "vec/data_types/data_type_number.h"
 #include "vec/data_types/data_type_string.h"
+#include "vec/exec/format/arrow/arrow_stream_reader.h"
 #include "vec/exec/format/avro/avro_jni_reader.h"
 #include "vec/exec/format/csv/csv_reader.h"
 #include "vec/exec/format/json/new_json_reader.h"
@@ -63,10 +61,13 @@
 #include "vec/exec/format/parquet/vparquet_reader.h"
 #include "vec/exec/format/table/hudi_jni_reader.h"
 #include "vec/exec/format/table/iceberg_reader.h"
+#include "vec/exec/format/table/lakesoul_jni_reader.h"
 #include "vec/exec/format/table/max_compute_jni_reader.h"
+#include "vec/exec/format/table/paimon_jni_reader.h"
 #include "vec/exec/format/table/paimon_reader.h"
 #include "vec/exec/format/table/transactional_hive_reader.h"
-#include "vec/exec/scan/new_file_scan_node.h"
+#include "vec/exec/format/table/trino_connector_jni_reader.h"
+#include "vec/exec/format/wal/wal_reader.h"
 #include "vec/exec/scan/vscan_node.h"
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
@@ -87,55 +88,29 @@ class ShardedKVCache;
 namespace doris::vectorized {
 using namespace ErrorCode;
 
-VFileScanner::VFileScanner(RuntimeState* state, NewFileScanNode* parent, int64_t limit,
-                           const TFileScanRange& scan_range, RuntimeProfile* profile,
-                           ShardedKVCache* kv_cache)
-        : VScanner(state, static_cast<VScanNode*>(parent), limit, profile),
-          _ranges(scan_range.ranges),
-          _next_range(0),
-          _cur_reader(nullptr),
-          _cur_reader_eof(false),
-          _kv_cache(kv_cache),
-          _strict_mode(false) {
-    if (scan_range.params.__isset.strict_mode) {
-        _strict_mode = scan_range.params.strict_mode;
-    }
-
-    if (state->get_query_ctx() != nullptr &&
-        state->get_query_ctx()->file_scan_range_params_map.count(parent->id()) > 0) {
-        _params = &(state->get_query_ctx()->file_scan_range_params_map[parent->id()]);
-    } else {
-        CHECK(scan_range.__isset.params);
-        _params = &(scan_range.params);
-    }
-
-    // For load scanner, there are input and output tuple.
-    // For query scanner, there is only output tuple
-    _input_tuple_desc = state->desc_tbl().get_tuple_descriptor(_params->src_tuple_id);
-    _real_tuple_desc = _input_tuple_desc == nullptr ? _output_tuple_desc : _input_tuple_desc;
-    _is_load = (_input_tuple_desc != nullptr);
-}
-
-VFileScanner::VFileScanner(RuntimeState* state, pipeline::FileScanLocalState* local_state,
-                           int64_t limit, const TFileScanRange& scan_range, RuntimeProfile* profile,
-                           ShardedKVCache* kv_cache)
+VFileScanner::VFileScanner(
+        RuntimeState* state, pipeline::FileScanLocalState* local_state, int64_t limit,
+        std::shared_ptr<vectorized::SplitSourceConnector> split_source, RuntimeProfile* profile,
+        ShardedKVCache* kv_cache,
+        std::unordered_map<std::string, ColumnValueRangeType>* colname_to_value_range,
+        const std::unordered_map<std::string, int>* colname_to_slot_id)
         : VScanner(state, local_state, limit, profile),
-          _ranges(scan_range.ranges),
-          _next_range(0),
+          _split_source(split_source),
           _cur_reader(nullptr),
           _cur_reader_eof(false),
+          _colname_to_value_range(colname_to_value_range),
           _kv_cache(kv_cache),
-          _strict_mode(false) {
-    if (scan_range.params.__isset.strict_mode) {
-        _strict_mode = scan_range.params.strict_mode;
-    }
-
+          _strict_mode(false),
+          _col_name_to_slot_id(colname_to_slot_id) {
     if (state->get_query_ctx() != nullptr &&
         state->get_query_ctx()->file_scan_range_params_map.count(local_state->parent_id()) > 0) {
         _params = &(state->get_query_ctx()->file_scan_range_params_map[local_state->parent_id()]);
     } else {
-        CHECK(scan_range.__isset.params);
-        _params = &(scan_range.params);
+        // old fe thrift protocol
+        _params = _split_source->get_params();
+    }
+    if (_params->__isset.strict_mode) {
+        _strict_mode = _params->strict_mode;
     }
 
     // For load scanner, there are input and output tuple.
@@ -145,44 +120,21 @@ VFileScanner::VFileScanner(RuntimeState* state, pipeline::FileScanLocalState* lo
     _is_load = (_input_tuple_desc != nullptr);
 }
 
-Status VFileScanner::prepare(
-        const VExprContextSPtrs& conjuncts,
-        std::unordered_map<std::string, ColumnValueRangeType>* colname_to_value_range,
-        const std::unordered_map<std::string, int>* colname_to_slot_id) {
-    RETURN_IF_ERROR(VScanner::prepare(_state, conjuncts));
-    _colname_to_value_range = colname_to_value_range;
-    _col_name_to_slot_id = colname_to_slot_id;
-    if (get_parent() != nullptr) {
-        _get_block_timer = ADD_TIMER(_parent->_scanner_profile, "FileScannerGetBlockTime");
-        _open_reader_timer = ADD_TIMER(_parent->_scanner_profile, "FileScannerOpenReaderTime");
-        _cast_to_input_block_timer =
-                ADD_TIMER(_parent->_scanner_profile, "FileScannerCastInputBlockTime");
-        _fill_path_columns_timer =
-                ADD_TIMER(_parent->_scanner_profile, "FileScannerFillPathColumnTime");
-        _fill_missing_columns_timer =
-                ADD_TIMER(_parent->_scanner_profile, "FileScannerFillMissingColumnTime");
-        _pre_filter_timer = ADD_TIMER(_parent->_scanner_profile, "FileScannerPreFilterTimer");
-        _convert_to_output_block_timer =
-                ADD_TIMER(_parent->_scanner_profile, "FileScannerConvertOuputBlockTime");
-        _empty_file_counter = ADD_COUNTER(_parent->_scanner_profile, "EmptyFileNum", TUnit::UNIT);
-        _file_counter = ADD_COUNTER(_parent->_scanner_profile, "FileNumber", TUnit::UNIT);
-    } else {
-        _get_block_timer = ADD_TIMER(_local_state->scanner_profile(), "FileScannerGetBlockTime");
-        _open_reader_timer =
-                ADD_TIMER(_local_state->scanner_profile(), "FileScannerOpenReaderTime");
-        _cast_to_input_block_timer =
-                ADD_TIMER(_local_state->scanner_profile(), "FileScannerCastInputBlockTime");
-        _fill_path_columns_timer =
-                ADD_TIMER(_local_state->scanner_profile(), "FileScannerFillPathColumnTime");
-        _fill_missing_columns_timer =
-                ADD_TIMER(_local_state->scanner_profile(), "FileScannerFillMissingColumnTime");
-        _pre_filter_timer = ADD_TIMER(_local_state->scanner_profile(), "FileScannerPreFilterTimer");
-        _convert_to_output_block_timer =
-                ADD_TIMER(_local_state->scanner_profile(), "FileScannerConvertOuputBlockTime");
-        _empty_file_counter =
-                ADD_COUNTER(_local_state->scanner_profile(), "EmptyFileNum", TUnit::UNIT);
-        _file_counter = ADD_COUNTER(_local_state->scanner_profile(), "FileNumber", TUnit::UNIT);
-    }
+Status VFileScanner::prepare(RuntimeState* state, const VExprContextSPtrs& conjuncts) {
+    RETURN_IF_ERROR(VScanner::prepare(state, conjuncts));
+    _get_block_timer = ADD_TIMER(_local_state->scanner_profile(), "FileScannerGetBlockTime");
+    _open_reader_timer = ADD_TIMER(_local_state->scanner_profile(), "FileScannerOpenReaderTime");
+    _cast_to_input_block_timer =
+            ADD_TIMER(_local_state->scanner_profile(), "FileScannerCastInputBlockTime");
+    _fill_missing_columns_timer =
+            ADD_TIMER(_local_state->scanner_profile(), "FileScannerFillMissingColumnTime");
+    _pre_filter_timer = ADD_TIMER(_local_state->scanner_profile(), "FileScannerPreFilterTimer");
+    _convert_to_output_block_timer =
+            ADD_TIMER(_local_state->scanner_profile(), "FileScannerConvertOuputBlockTime");
+    _empty_file_counter = ADD_COUNTER(_local_state->scanner_profile(), "EmptyFileNum", TUnit::UNIT);
+    _not_found_file_counter =
+            ADD_COUNTER(_local_state->scanner_profile(), "NotFoundFileNum", TUnit::UNIT);
+    _file_counter = ADD_COUNTER(_local_state->scanner_profile(), "FileNumber", TUnit::UNIT);
 
     _file_cache_statistics.reset(new io::FileCacheStatistics());
     _io_ctx.reset(new io::IOContext());
@@ -222,7 +174,9 @@ Status VFileScanner::prepare(
 }
 
 Status VFileScanner::_process_conjuncts_for_dict_filter() {
-    for (auto& conjunct : _conjuncts) {
+    _slot_id_to_filter_conjuncts.clear();
+    _not_single_slot_filter_conjuncts.clear();
+    for (auto& conjunct : _push_down_conjuncts) {
         auto impl = conjunct->root()->get_impl();
         // If impl is not null, which means this a conjuncts from runtime filter.
         auto cur_expr = impl ? impl : conjunct->root();
@@ -250,6 +204,22 @@ Status VFileScanner::_process_conjuncts_for_dict_filter() {
     return Status::OK();
 }
 
+Status VFileScanner::_process_late_arrival_conjuncts() {
+    if (_push_down_conjuncts.size() < _conjuncts.size()) {
+        _push_down_conjuncts.clear();
+        _push_down_conjuncts.resize(_conjuncts.size());
+        for (size_t i = 0; i != _conjuncts.size(); ++i) {
+            RETURN_IF_ERROR(_conjuncts[i]->clone(_state, _push_down_conjuncts[i]));
+        }
+        RETURN_IF_ERROR(_process_conjuncts_for_dict_filter());
+        _discard_conjuncts();
+    }
+    if (_applied_rf_num == _total_rf_num) {
+        _local_state->scanner_profile()->add_info_string("ApplyAllRuntimeFilters", "True");
+    }
+    return Status::OK();
+}
+
 void VFileScanner::_get_slot_ids(VExpr* expr, std::vector<int>* slot_ids) {
     for (auto& child_expr : expr->children()) {
         if (child_expr->is_slot_ref()) {
@@ -261,10 +231,26 @@ void VFileScanner::_get_slot_ids(VExpr* expr, std::vector<int>* slot_ids) {
 }
 
 Status VFileScanner::open(RuntimeState* state) {
+    RETURN_IF_CANCELLED(state);
     RETURN_IF_ERROR(VScanner::open(state));
-    RETURN_IF_ERROR(_init_expr_ctxes());
+    RETURN_IF_ERROR(_split_source->get_next(&_first_scan_range, &_current_range));
+    if (_first_scan_range) {
+        RETURN_IF_ERROR(_init_expr_ctxes());
+    } else {
+        // there's no scan range in split source. stop scanner directly.
+        _scanner_eof = true;
+    }
 
     return Status::OK();
+}
+
+Status VFileScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eof) {
+    Status st = _get_block_wrapped(state, block, eof);
+    if (!st.ok()) {
+        // add cur path in error msg for easy debugging
+        return std::move(st.prepend("cur path: " + get_current_scan_range_name() + ". "));
+    }
+    return st;
 }
 
 // For query:
@@ -286,10 +272,21 @@ Status VFileScanner::open(RuntimeState* state) {
 // _fill_columns_from_path      -     -    -  -                 x                x      -
 // _fill_missing_columns        -     -    -  x                 -                x      -
 // _convert_to_output_block     -     -    -  -                 -                -      x
-Status VFileScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eof) {
+Status VFileScanner::_get_block_wrapped(RuntimeState* state, Block* block, bool* eof) {
     do {
+        RETURN_IF_CANCELLED(state);
         if (_cur_reader == nullptr || _cur_reader_eof) {
-            RETURN_IF_ERROR(_get_next_reader());
+            // The file may not exist because the file list is got from meta cache,
+            // And the file may already be removed from storage.
+            // Just ignore not found files.
+            Status st = _get_next_reader();
+            if (st.is<ErrorCode::NOT_FOUND>() && config::ignore_not_found_file_in_external_table) {
+                _cur_reader_eof = true;
+                COUNTER_UPDATE(_not_found_file_counter, 1);
+                continue;
+            } else if (!st) {
+                return st;
+            }
         }
 
         if (_scanner_eof) {
@@ -308,10 +305,6 @@ Status VFileScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eo
             // Some of column in block may not be filled (column not exist in file)
             RETURN_IF_ERROR(
                     _cur_reader->get_next_block(_src_block_ptr, &read_rows, &_cur_reader_eof));
-        }
-        if (_params->format_type == TFileFormatType::FORMAT_WAL) {
-            block->swap(*_src_block_ptr);
-            break;
         }
         // use read_rows instead of _src_block_ptr->rows(), because the first column of _src_block_ptr
         // may not be filled after calling `get_next_block()`, so _src_block_ptr->rows() may return wrong result.
@@ -336,8 +329,8 @@ Status VFileScanner::_get_block_impl(RuntimeState* state, Block* block, bool* eo
                 // or not found in the file column schema.
                 RETURN_IF_ERROR(_truncate_char_or_varchar_columns(block));
             }
-            break;
         }
+        break;
     } while (true);
 
     // Update filtered rows and unselected rows for load, reset counter.
@@ -394,6 +387,14 @@ Status VFileScanner::_init_src_block(Block* block) {
     for (auto& slot : _input_tuple_desc->slots()) {
         DataTypePtr data_type;
         auto it = _name_to_col_type.find(slot->col_name());
+        if (slot->is_skip_bitmap_col()) {
+            _skip_bitmap_col_idx = idx;
+        }
+        if (_params->__isset.sequence_map_col) {
+            if (_params->sequence_map_col == slot->col_name()) {
+                _sequence_map_col_uid = slot->col_unique_id();
+            }
+        }
         if (it == _name_to_col_type.end()) {
             // not exist in file, using type from _input_tuple_desc
             RETURN_IF_CATCH_EXCEPTION(data_type = DataTypeFactory::instance().create_data_type(
@@ -407,6 +408,15 @@ Status VFileScanner::_init_src_block(Block* block) {
                 ColumnWithTypeAndName(std::move(data_column), data_type, slot->col_name()));
         _src_block_name_to_idx.emplace(slot->col_name(), idx++);
     }
+    if (_params->__isset.sequence_map_col) {
+        for (const auto& slot : _output_tuple_desc->slots()) {
+            // When the target table has seqeunce map column, _input_tuple_desc will not contains __DORIS_SEQUENCE_COL__,
+            // so we should get its column unique id from _output_tuple_desc
+            if (slot->is_sequence_col()) {
+                _sequence_col_uid = slot->col_unique_id();
+            }
+        }
+    }
     _src_block_ptr = &_src_block;
     _src_block_init = true;
     return Status::OK();
@@ -418,7 +428,7 @@ Status VFileScanner::_cast_to_input_block(Block* block) {
     }
     SCOPED_TIMER(_cast_to_input_block_timer);
     // cast primitive type(PT0) to primitive type(PT1)
-    size_t idx = 0;
+    uint32_t idx = 0;
     for (auto& slot_desc : _input_tuple_desc->slots()) {
         if (_name_to_col_type.find(slot_desc->col_name()) == _name_to_col_type.end()) {
             // skip columns which does not exist in file
@@ -432,11 +442,12 @@ Status VFileScanner::_cast_to_input_block(Block* block) {
         auto return_type = slot_desc->get_data_type_ptr();
         // remove nullable here, let the get_function decide whether nullable
         auto data_type = vectorized::DataTypeFactory::instance().create_data_type(
-                remove_nullable(return_type)->get_type_id());
+                remove_nullable(return_type)->get_type_as_type_descriptor());
         ColumnsWithTypeAndName arguments {
                 arg, {data_type->create_column(), data_type, slot_desc->col_name()}};
-        auto func_cast =
-                SimpleFunctionFactory::instance().get_function("CAST", arguments, return_type);
+        auto func_cast = SimpleFunctionFactory::instance().get_function(
+                "CAST", arguments, return_type,
+                {.enable_decimal256 = runtime_state()->enable_decimal256()});
         idx = _src_block_name_to_idx[slot_desc->col_name()];
         RETURN_IF_ERROR(
                 func_cast->execute(nullptr, *_src_block_ptr, {idx}, idx, arg.column->size()));
@@ -446,14 +457,26 @@ Status VFileScanner::_cast_to_input_block(Block* block) {
 }
 
 Status VFileScanner::_fill_columns_from_path(size_t rows) {
-    for (auto& kv : *_partition_columns) {
+    DataTypeSerDe::FormatOptions _text_formatOptions;
+    for (auto& kv : _partition_col_descs) {
         auto doris_column = _src_block_ptr->get_by_name(kv.first).column;
         IColumn* col_ptr = const_cast<IColumn*>(doris_column.get());
         auto& [value, slot_desc] = kv.second;
-        if (!_text_converter->write_vec_column(slot_desc, col_ptr, const_cast<char*>(value.c_str()),
-                                               value.size(), true, false, rows)) {
+        auto _text_serde = slot_desc->get_data_type_ptr()->get_serde();
+        Slice slice(value.data(), value.size());
+        int num_deserialized = 0;
+        if (_text_serde->deserialize_column_from_fixed_json(*col_ptr, slice, rows,
+                                                            &num_deserialized,
+                                                            _text_formatOptions) != Status::OK()) {
             return Status::InternalError("Failed to fill partition column: {}={}",
                                          slot_desc->col_name(), value);
+        }
+        if (num_deserialized != rows) {
+            return Status::InternalError(
+                    "Failed to fill partition column: {}={} ."
+                    "Number of rows expected to be written : {}, number of rows actually written : "
+                    "{}",
+                    slot_desc->col_name(), value, num_deserialized, rows);
         }
     }
     return Status::OK();
@@ -465,7 +488,7 @@ Status VFileScanner::_fill_missing_columns(size_t rows) {
     }
 
     SCOPED_TIMER(_fill_missing_columns_timer);
-    for (auto& kv : *_missing_columns) {
+    for (auto& kv : _missing_col_descs) {
         if (kv.second == nullptr) {
             // no default column, fill with null
             auto nullable_column = reinterpret_cast<vectorized::ColumnNullable*>(
@@ -520,7 +543,6 @@ Status VFileScanner::_convert_to_output_block(Block* block) {
     if (!_is_load) {
         return Status::OK();
     }
-
     SCOPED_TIMER(_convert_to_output_block_timer);
     // The block is passed from scanner context's free blocks,
     // which is initialized by output columns
@@ -537,6 +559,30 @@ Status VFileScanner::_convert_to_output_block(Block* block) {
     MutableBlock mutable_output_block =
             VectorizedUtils::build_mutable_mem_reuse_block(block, *_dest_row_desc);
     auto& mutable_output_columns = mutable_output_block.mutable_columns();
+
+    std::vector<BitmapValue>* skip_bitmaps {nullptr};
+    if (_should_process_skip_bitmap_col()) {
+        auto* skip_bitmap_nullable_col_ptr =
+                assert_cast<ColumnNullable*>(_src_block_ptr->get_by_position(_skip_bitmap_col_idx)
+                                                     .column->assume_mutable()
+                                                     .get());
+        skip_bitmaps = &(assert_cast<ColumnBitmap*>(
+                                 skip_bitmap_nullable_col_ptr->get_nested_column_ptr().get())
+                                 ->get_data());
+        // NOTE:
+        // - If the table has sequence type column, __DORIS_SEQUENCE_COL__ will be put in _input_tuple_desc, so whether
+        //   __DORIS_SEQUENCE_COL__ will be marked in skip bitmap depends on whether it's specified in that row
+        // - If the table has sequence map column, __DORIS_SEQUENCE_COL__ will not be put in _input_tuple_desc,
+        //   so __DORIS_SEQUENCE_COL__ will be ommited if it't specified in a row and will not be marked in skip bitmap.
+        //   So we should mark __DORIS_SEQUENCE_COL__ in skip bitmap here if the corresponding sequence map column us marked
+        if (_sequence_map_col_uid != -1) {
+            for (int j = 0; j < rows; ++j) {
+                if ((*skip_bitmaps)[j].contains(_sequence_map_col_uid)) {
+                    (*skip_bitmaps)[j].add(_sequence_col_uid);
+                }
+            }
+        }
+    }
 
     // for (auto slot_desc : _output_tuple_desc->slots()) {
     for (int i = 0; i < mutable_output_columns.size(); ++i) {
@@ -559,48 +605,45 @@ Status VFileScanner::_convert_to_output_block(Block* block) {
         // because of src_slot_desc is always be nullable, so the column_ptr after do dest_expr
         // is likely to be nullable
         if (LIKELY(column_ptr->is_nullable())) {
-            const ColumnNullable* nullable_column =
+            const auto* nullable_column =
                     reinterpret_cast<const vectorized::ColumnNullable*>(column_ptr.get());
             for (int i = 0; i < rows; ++i) {
                 if (filter_map[i] && nullable_column->is_null_at(i)) {
-                    if (_strict_mode && (_src_slot_descs_order_by_dest[dest_index]) &&
-                        !_src_block_ptr->get_by_position(_dest_slot_to_src_slot_index[dest_index])
-                                 .column->is_null_at(i)) {
-                        RETURN_IF_ERROR(_state->append_error_msg_to_file(
+                    // skip checks for non-mentioned columns in flexible partial update
+                    if (skip_bitmaps == nullptr ||
+                        !skip_bitmaps->at(i).contains(slot_desc->col_unique_id())) {
+                        // clang-format off
+                        if (_strict_mode && (_src_slot_descs_order_by_dest[dest_index]) &&
+                            !_src_block_ptr->get_by_position(_dest_slot_to_src_slot_index[dest_index]).column->is_null_at(i)) {
+                            RETURN_IF_ERROR(_state->append_error_msg_to_file(
                                 [&]() -> std::string {
-                                    return _src_block_ptr->dump_one_line(i,
-                                                                         _num_of_columns_from_file);
+                                    return _src_block_ptr->dump_one_line(i, _num_of_columns_from_file);
                                 },
                                 [&]() -> std::string {
-                                    auto raw_value = _src_block_ptr->get_by_position(ctx_idx)
-                                                             .column->get_data_at(i);
+                                    auto raw_value =
+                                            _src_block_ptr->get_by_position(_dest_slot_to_src_slot_index[dest_index]).column->get_data_at(i);
                                     std::string raw_string = raw_value.to_string();
                                     fmt::memory_buffer error_msg;
-                                    fmt::format_to(error_msg,
-                                                   "column({}) value is incorrect while strict "
-                                                   "mode is {}, "
-                                                   "src value is {}",
-                                                   slot_desc->col_name(), _strict_mode, raw_string);
+                                    fmt::format_to(error_msg,"column({}) value is incorrect while strict mode is {}, src value is {}",
+                                            slot_desc->col_name(), _strict_mode, raw_string);
                                     return fmt::to_string(error_msg);
                                 },
                                 &_scanner_eof));
-                        filter_map[i] = false;
-                    } else if (!slot_desc->is_nullable()) {
-                        RETURN_IF_ERROR(_state->append_error_msg_to_file(
+                            filter_map[i] = false;
+                        } else if (!slot_desc->is_nullable()) {
+                            RETURN_IF_ERROR(_state->append_error_msg_to_file(
                                 [&]() -> std::string {
-                                    return _src_block_ptr->dump_one_line(i,
-                                                                         _num_of_columns_from_file);
+                                    return _src_block_ptr->dump_one_line(i, _num_of_columns_from_file);
                                 },
                                 [&]() -> std::string {
                                     fmt::memory_buffer error_msg;
-                                    fmt::format_to(error_msg,
-                                                   "column({}) values is null while columns is not "
-                                                   "nullable",
-                                                   slot_desc->col_name());
+                                    fmt::format_to(error_msg, "column({}) values is null while columns is not nullable", slot_desc->col_name());
                                     return fmt::to_string(error_msg);
                                 },
                                 &_scanner_eof));
-                        filter_map[i] = false;
+                            filter_map[i] = false;
+                        }
+                        // clang-format on
                     }
                 }
             }
@@ -664,6 +707,11 @@ Status VFileScanner::_truncate_char_or_varchar_columns(Block* block) {
 void VFileScanner::_truncate_char_or_varchar_column(Block* block, int idx, int len) {
     auto int_type = std::make_shared<DataTypeInt32>();
     size_t num_columns_without_result = block->columns();
+    const ColumnNullable* col_nullable =
+            assert_cast<const ColumnNullable*>(block->get_by_position(idx).column.get());
+    const ColumnPtr& string_column_ptr = col_nullable->get_nested_column_ptr();
+    ColumnPtr null_map_column_ptr = col_nullable->get_null_map_column_ptr();
+    block->replace_by_position(idx, std::move(string_column_ptr));
     block->insert({int_type->create_column_const(block->rows(), to_field(1)), int_type,
                    "const 1"}); // pos is 1
     block->insert({int_type->create_column_const(block->rows(), to_field(len)), int_type,
@@ -674,28 +722,34 @@ void VFileScanner::_truncate_char_or_varchar_column(Block* block, int idx, int l
     temp_arguments[1] = num_columns_without_result;     // pos
     temp_arguments[2] = num_columns_without_result + 1; // len
     size_t result_column_id = num_columns_without_result + 2;
+
     SubstringUtil::substring_execute(*block, temp_arguments, result_column_id, block->rows());
-    block->replace_by_position(idx, block->get_by_position(result_column_id).column);
+    auto res = ColumnNullable::create(block->get_by_position(result_column_id).column,
+                                      null_map_column_ptr);
+    block->replace_by_position(idx, std::move(res));
     Block::erase_useless_column(block, num_columns_without_result);
 }
 
 Status VFileScanner::_get_next_reader() {
     while (true) {
         if (_cur_reader) {
-            _cur_reader->close();
+            _cur_reader->collect_profile_before_close();
+            RETURN_IF_ERROR(_cur_reader->close());
+            _state->update_num_finished_scan_range(1);
         }
         _cur_reader.reset(nullptr);
         _src_block_init = false;
-        if (_next_range >= _ranges.size()) {
+        bool has_next = _first_scan_range;
+        if (!_first_scan_range) {
+            RETURN_IF_ERROR(_split_source->get_next(&has_next, &_current_range));
+        }
+        _first_scan_range = false;
+        if (!has_next || _should_stop) {
             _scanner_eof = true;
-            _state->update_num_finished_scan_range(1);
             return Status::OK();
         }
-        if (_next_range != 0) {
-            _state->update_num_finished_scan_range(1);
-        }
 
-        const TFileRangeDesc& range = _ranges[_next_range++];
+        const TFileRangeDesc& range = _current_range;
         _current_range_path = range.path;
 
         // create reader for specific format
@@ -704,23 +758,37 @@ Status VFileScanner::_get_next_reader() {
         // JNI reader can only push down column value range
         bool push_down_predicates =
                 !_is_load && _params->format_type != TFileFormatType::FORMAT_JNI;
-        if (format_type == TFileFormatType::FORMAT_JNI && range.__isset.table_format_params &&
-            range.table_format_params.table_format_type == "hudi") {
-            if (range.table_format_params.hudi_params.delta_logs.empty()) {
+        if (format_type == TFileFormatType::FORMAT_JNI && range.__isset.table_format_params) {
+            if (range.table_format_params.table_format_type == "hudi" &&
+                range.table_format_params.hudi_params.delta_logs.empty()) {
                 // fall back to native reader if there is no log file
                 format_type = TFileFormatType::FORMAT_PARQUET;
+            } else if (range.table_format_params.table_format_type == "paimon" &&
+                       !range.table_format_params.paimon_params.__isset.paimon_split) {
+                // use native reader
+                auto format = range.table_format_params.paimon_params.file_format;
+                if (format == "orc") {
+                    format_type = TFileFormatType::FORMAT_ORC;
+                } else if (format == "parquet") {
+                    format_type = TFileFormatType::FORMAT_PARQUET;
+                } else {
+                    return Status::InternalError("Not supported paimon file format: {}", format);
+                }
             }
         }
         bool need_to_get_parsed_schema = false;
         switch (format_type) {
         case TFileFormatType::FORMAT_JNI: {
-            if (_real_tuple_desc->table_desc()->table_type() ==
-                ::doris::TTableType::type::MAX_COMPUTE_TABLE) {
-                const MaxComputeTableDescriptor* mc_desc =
-                        static_cast<const MaxComputeTableDescriptor*>(
-                                _real_tuple_desc->table_desc());
+            if (range.__isset.table_format_params &&
+                range.table_format_params.table_format_type == "max_compute") {
+                const auto* mc_desc = static_cast<const MaxComputeTableDescriptor*>(
+                        _real_tuple_desc->table_desc());
+                if (!mc_desc->init_status()) {
+                    return mc_desc->init_status();
+                }
                 std::unique_ptr<MaxComputeJniReader> mc_reader = MaxComputeJniReader::create_unique(
-                        mc_desc, _file_slot_descs, range, _state, _profile);
+                        mc_desc, range.table_format_params.max_compute_params, _file_slot_descs,
+                        range, _state, _profile);
                 init_status = mc_reader->init_reader(_colname_to_value_range);
                 _cur_reader = std::move(mc_reader);
             } else if (range.__isset.table_format_params &&
@@ -736,6 +804,19 @@ Status VFileScanner::_get_next_reader() {
                                                            _file_slot_descs, _state, _profile);
                 init_status =
                         ((HudiJniReader*)_cur_reader.get())->init_reader(_colname_to_value_range);
+            } else if (range.__isset.table_format_params &&
+                       range.table_format_params.table_format_type == "lakesoul") {
+                _cur_reader =
+                        LakeSoulJniReader::create_unique(range.table_format_params.lakesoul_params,
+                                                         _file_slot_descs, _state, _profile);
+                init_status = ((LakeSoulJniReader*)_cur_reader.get())
+                                      ->init_reader(_colname_to_value_range);
+            } else if (range.__isset.table_format_params &&
+                       range.table_format_params.table_format_type == "trino_connector") {
+                _cur_reader = TrinoConnectorJniReader::create_unique(_file_slot_descs, _state,
+                                                                     _profile, range);
+                init_status = ((TrinoConnectorJniReader*)(_cur_reader.get()))
+                                      ->init_reader(_colname_to_value_range);
             }
             break;
         }
@@ -743,56 +824,76 @@ Status VFileScanner::_get_next_reader() {
             std::unique_ptr<ParquetReader> parquet_reader = ParquetReader::create_unique(
                     _profile, *_params, range, _state->query_options().batch_size,
                     const_cast<cctz::time_zone*>(&_state->timezone_obj()), _io_ctx.get(), _state,
-                    config::max_external_file_meta_cache_num <= 0
-                            ? nullptr
-                            : ExecEnv::GetInstance()->file_meta_cache(),
+                    _should_enable_file_meta_cache() ? ExecEnv::GetInstance()->file_meta_cache()
+                                                     : nullptr,
                     _state->query_options().enable_parquet_lazy_mat);
             {
                 SCOPED_TIMER(_open_reader_timer);
                 RETURN_IF_ERROR(parquet_reader->open());
             }
-            if (push_down_predicates && _push_down_conjuncts.empty() && !_conjuncts.empty()) {
-                _push_down_conjuncts.resize(_conjuncts.size());
-                for (size_t i = 0; i != _conjuncts.size(); ++i) {
-                    RETURN_IF_ERROR(_conjuncts[i]->clone(_state, _push_down_conjuncts[i]));
-                }
-                _discard_conjuncts();
+            if (push_down_predicates) {
+                RETURN_IF_ERROR(_process_late_arrival_conjuncts());
             }
             if (range.__isset.table_format_params &&
                 range.table_format_params.table_format_type == "iceberg") {
-                std::unique_ptr<IcebergTableReader> iceberg_reader =
-                        IcebergTableReader::create_unique(std::move(parquet_reader), _profile,
-                                                          _state, *_params, range, _kv_cache,
-                                                          _io_ctx.get(), _get_push_down_count());
+                std::unique_ptr<IcebergParquetReader> iceberg_reader =
+                        IcebergParquetReader::create_unique(std::move(parquet_reader), _profile,
+                                                            _state, *_params, range, _kv_cache,
+                                                            _io_ctx.get());
                 init_status = iceberg_reader->init_reader(
                         _file_col_names, _col_id_name_map, _colname_to_value_range,
                         _push_down_conjuncts, _real_tuple_desc, _default_val_row_desc.get(),
                         _col_name_to_slot_id, &_not_single_slot_filter_conjuncts,
                         &_slot_id_to_filter_conjuncts);
-                RETURN_IF_ERROR(iceberg_reader->init_row_filters(range));
                 _cur_reader = std::move(iceberg_reader);
-            } else {
+            } else if (range.__isset.table_format_params &&
+                       range.table_format_params.table_format_type == "paimon") {
                 std::vector<std::string> place_holder;
                 init_status = parquet_reader->init_reader(
                         _file_col_names, place_holder, _colname_to_value_range,
                         _push_down_conjuncts, _real_tuple_desc, _default_val_row_desc.get(),
                         _col_name_to_slot_id, &_not_single_slot_filter_conjuncts,
                         &_slot_id_to_filter_conjuncts);
+                std::unique_ptr<PaimonParquetReader> paimon_reader =
+                        PaimonParquetReader::create_unique(std::move(parquet_reader), _profile,
+                                                           *_params);
+                RETURN_IF_ERROR(paimon_reader->init_row_filters(range, _io_ctx.get()));
+                _cur_reader = std::move(paimon_reader);
+            } else {
+                bool hive_parquet_use_column_names = true;
+
+                if (range.__isset.table_format_params &&
+                    range.table_format_params.table_format_type == "hive" && _state != nullptr)
+                        [[likely]] {
+                    hive_parquet_use_column_names =
+                            _state->query_options().hive_parquet_use_column_names;
+                }
+
+                std::vector<std::string> place_holder;
+                init_status = parquet_reader->init_reader(
+                        _file_col_names, place_holder, _colname_to_value_range,
+                        _push_down_conjuncts, _real_tuple_desc, _default_val_row_desc.get(),
+                        _col_name_to_slot_id, &_not_single_slot_filter_conjuncts,
+                        &_slot_id_to_filter_conjuncts, true, hive_parquet_use_column_names);
                 _cur_reader = std::move(parquet_reader);
             }
             need_to_get_parsed_schema = true;
             break;
         }
         case TFileFormatType::FORMAT_ORC: {
+            std::vector<orc::TypeKind>* unsupported_pushdown_types = nullptr;
+            if (range.__isset.table_format_params &&
+                range.table_format_params.table_format_type == "paimon") {
+                static std::vector<orc::TypeKind> paimon_unsupport_type =
+                        std::vector<orc::TypeKind> {orc::TypeKind::CHAR};
+                unsupported_pushdown_types = &paimon_unsupport_type;
+            }
             std::unique_ptr<OrcReader> orc_reader = OrcReader::create_unique(
                     _profile, _state, *_params, range, _state->query_options().batch_size,
-                    _state->timezone(), _io_ctx.get(), _state->query_options().enable_orc_lazy_mat);
-            if (push_down_predicates && _push_down_conjuncts.empty() && !_conjuncts.empty()) {
-                _push_down_conjuncts.resize(_conjuncts.size());
-                for (size_t i = 0; i != _conjuncts.size(); ++i) {
-                    RETURN_IF_ERROR(_conjuncts[i]->clone(_state, _push_down_conjuncts[i]));
-                }
-                _discard_conjuncts();
+                    _state->timezone(), _io_ctx.get(), _state->query_options().enable_orc_lazy_mat,
+                    unsupported_pushdown_types);
+            if (push_down_predicates) {
+                RETURN_IF_ERROR(_process_late_arrival_conjuncts());
             }
             if (range.__isset.table_format_params &&
                 range.table_format_params.table_format_type == "transactional_hive") {
@@ -804,13 +905,43 @@ Status VFileScanner::_get_next_reader() {
                         _file_col_names, _colname_to_value_range, _push_down_conjuncts,
                         _real_tuple_desc, _default_val_row_desc.get(),
                         &_not_single_slot_filter_conjuncts, &_slot_id_to_filter_conjuncts);
-                RETURN_IF_ERROR(tran_orc_reader->init_row_filters(range));
+                RETURN_IF_ERROR(tran_orc_reader->init_row_filters(range, _io_ctx.get()));
                 _cur_reader = std::move(tran_orc_reader);
-            } else {
+            } else if (range.__isset.table_format_params &&
+                       range.table_format_params.table_format_type == "iceberg") {
+                std::unique_ptr<IcebergOrcReader> iceberg_reader =
+                        IcebergOrcReader::create_unique(std::move(orc_reader), _profile, _state,
+                                                        *_params, range, _kv_cache, _io_ctx.get());
+
+                init_status = iceberg_reader->init_reader(
+                        _file_col_names, _col_id_name_map, _colname_to_value_range,
+                        _push_down_conjuncts, _real_tuple_desc, _default_val_row_desc.get(),
+                        _col_name_to_slot_id, &_not_single_slot_filter_conjuncts,
+                        &_slot_id_to_filter_conjuncts);
+                _cur_reader = std::move(iceberg_reader);
+            } else if (range.__isset.table_format_params &&
+                       range.table_format_params.table_format_type == "paimon") {
                 init_status = orc_reader->init_reader(
                         &_file_col_names, _colname_to_value_range, _push_down_conjuncts, false,
                         _real_tuple_desc, _default_val_row_desc.get(),
                         &_not_single_slot_filter_conjuncts, &_slot_id_to_filter_conjuncts);
+                std::unique_ptr<PaimonOrcReader> paimon_reader =
+                        PaimonOrcReader::create_unique(std::move(orc_reader), _profile, *_params);
+                RETURN_IF_ERROR(paimon_reader->init_row_filters(range, _io_ctx.get()));
+                _cur_reader = std::move(paimon_reader);
+            } else {
+                bool hive_orc_use_column_names = true;
+
+                if (range.__isset.table_format_params &&
+                    range.table_format_params.table_format_type == "hive" && _state != nullptr)
+                        [[likely]] {
+                    hive_orc_use_column_names = _state->query_options().hive_orc_use_column_names;
+                }
+                init_status = orc_reader->init_reader(
+                        &_file_col_names, _colname_to_value_range, _push_down_conjuncts, false,
+                        _real_tuple_desc, _default_val_row_desc.get(),
+                        &_not_single_slot_filter_conjuncts, &_slot_id_to_filter_conjuncts,
+                        hive_orc_use_column_names);
                 _cur_reader = std::move(orc_reader);
             }
             need_to_get_parsed_schema = true;
@@ -847,30 +978,44 @@ Status VFileScanner::_get_next_reader() {
         }
         case TFileFormatType::FORMAT_WAL: {
             _cur_reader.reset(new WalReader(_state));
-            init_status = ((WalReader*)(_cur_reader.get()))->init_reader();
+            init_status = ((WalReader*)(_cur_reader.get()))->init_reader(_output_tuple_desc);
+            break;
+        }
+        case TFileFormatType::FORMAT_ARROW: {
+            _cur_reader = ArrowStreamReader::create_unique(_state, _profile, &_counter, *_params,
+                                                           range, _file_slot_descs, _io_ctx.get());
+            init_status = ((ArrowStreamReader*)(_cur_reader.get()))->init_reader();
             break;
         }
         default:
             return Status::InternalError("Not supported file format: {}", _params->format_type);
         }
 
+        if (_cur_reader == nullptr) {
+            return Status::InternalError("Failed to create reader for  file format: {}",
+                                         _params->format_type);
+        }
+        COUNTER_UPDATE(_file_counter, 1);
+        // The VFileScanner for external table may try to open not exist files,
+        // Because FE file cache for external table may out of date.
+        // So, NOT_FOUND for VFileScanner is not a fail case.
+        // Will remove this after file reader refactor.
         if (init_status.is<END_OF_FILE>()) {
             COUNTER_UPDATE(_empty_file_counter, 1);
             continue;
-        } else if (!init_status.ok()) {
-            if (init_status.is<ErrorCode::NOT_FOUND>()) {
-                COUNTER_UPDATE(_empty_file_counter, 1);
-                LOG(INFO) << "failed to find file: " << range.path;
-                return init_status;
+        } else if (init_status.is<ErrorCode::NOT_FOUND>()) {
+            if (config::ignore_not_found_file_in_external_table) {
+                COUNTER_UPDATE(_not_found_file_counter, 1);
+                continue;
             }
-            return Status::InternalError("failed to init reader for file {}, err: {}", range.path,
-                                         init_status.to_string());
+            return Status::InternalError("failed to find reader, err: {}", init_status.to_string());
+        } else if (!init_status.ok()) {
+            return Status::InternalError("failed to init reader, err: {}", init_status.to_string());
         }
-        COUNTER_UPDATE(_file_counter, 1);
 
         _name_to_col_type.clear();
         _missing_cols.clear();
-        static_cast<void>(_cur_reader->get_columns(&_name_to_col_type, &_missing_cols));
+        RETURN_IF_ERROR(_cur_reader->get_columns(&_name_to_col_type, &_missing_cols));
         _cur_reader->set_push_down_agg_type(_get_push_down_agg_type());
         RETURN_IF_ERROR(_generate_fill_columns());
         if (VLOG_NOTICE_IS_ON && !_missing_cols.empty() && _is_load) {
@@ -903,11 +1048,10 @@ Status VFileScanner::_get_next_reader() {
 }
 
 Status VFileScanner::_generate_fill_columns() {
-    _partition_columns.reset(
-            new std::unordered_map<std::string, std::tuple<std::string, const SlotDescriptor*>>());
-    _missing_columns.reset(new std::unordered_map<std::string, VExprContextSPtr>());
+    _partition_col_descs.clear();
+    _missing_col_descs.clear();
 
-    const TFileRangeDesc& range = _ranges.at(_next_range - 1);
+    const TFileRangeDesc& range = _current_range;
     if (range.__isset.columns_from_path && !_partition_slot_descs.empty()) {
         for (const auto& slot_desc : _partition_slot_descs) {
             if (slot_desc) {
@@ -920,10 +1064,10 @@ Status VFileScanner::_generate_fill_columns() {
                 const char* data = column_from_path.c_str();
                 size_t size = column_from_path.size();
                 if (size == 4 && memcmp(data, "null", 4) == 0) {
-                    data = TextConverter::NULL_STR;
+                    data = const_cast<char*>("\\N");
                 }
-                _partition_columns->emplace(slot_desc->col_name(),
-                                            std::make_tuple(data, slot_desc));
+                _partition_col_descs.emplace(slot_desc->col_name(),
+                                             std::make_tuple(data, slot_desc));
             }
         }
     }
@@ -942,21 +1086,14 @@ Status VFileScanner::_generate_fill_columns() {
                 return Status::InternalError("failed to find default value expr for slot: {}",
                                              slot_desc->col_name());
             }
-            _missing_columns->emplace(slot_desc->col_name(), it->second);
+            _missing_col_descs.emplace(slot_desc->col_name(), it->second);
         }
     }
 
-    RETURN_IF_ERROR(_cur_reader->set_fill_columns(*_partition_columns, *_missing_columns));
-    if (_cur_reader->fill_all_columns()) {
-        _partition_columns.reset(nullptr);
-        _missing_columns.reset(nullptr);
-    }
-    return Status::OK();
+    return _cur_reader->set_fill_columns(_partition_col_descs, _missing_col_descs);
 }
 
 Status VFileScanner::_init_expr_ctxes() {
-    DCHECK(!_ranges.empty());
-
     std::map<SlotId, int> full_src_index_map;
     std::map<SlotId, SlotDescriptor*> full_src_slot_map;
     std::map<std::string, int> partition_name_to_key_index_map;
@@ -972,8 +1109,8 @@ Status VFileScanner::_init_expr_ctxes() {
     // All ranges in _ranges vector should have identical columns_from_path_keys
     // because they are all file splits for the same external table.
     // So here use the first element of _ranges to fill the partition_name_to_key_index_map
-    if (_ranges[0].__isset.columns_from_path_keys) {
-        std::vector<std::string> key_map = _ranges[0].columns_from_path_keys;
+    if (_current_range.__isset.columns_from_path_keys) {
+        std::vector<std::string> key_map = _current_range.columns_from_path_keys;
         if (!key_map.empty()) {
             for (size_t i = 0; i < key_map.size(); i++) {
                 partition_name_to_key_index_map.emplace(key_map[i], i);
@@ -1065,10 +1202,6 @@ Status VFileScanner::_init_expr_ctxes() {
             }
         }
     }
-    // TODO: It should can move to scan node to process.
-    if (!_conjuncts.empty()) {
-        static_cast<void>(_process_conjuncts_for_dict_filter());
-    }
     return Status::OK();
 }
 
@@ -1077,17 +1210,32 @@ Status VFileScanner::close(RuntimeState* state) {
         return Status::OK();
     }
 
-    if (config::enable_file_cache && _state->query_options().enable_file_cache) {
-        io::FileCacheProfileReporter cache_profile(_profile);
-        cache_profile.update(_file_cache_statistics.get());
-    }
-
     if (_cur_reader) {
-        _cur_reader->close();
+        RETURN_IF_ERROR(_cur_reader->close());
     }
 
     RETURN_IF_ERROR(VScanner::close(state));
     return Status::OK();
+}
+
+void VFileScanner::try_stop() {
+    VScanner::try_stop();
+    if (_io_ctx) {
+        _io_ctx->should_stop = true;
+    }
+}
+
+void VFileScanner::_collect_profile_before_close() {
+    VScanner::_collect_profile_before_close();
+    if (config::enable_file_cache && _state->query_options().enable_file_cache &&
+        _profile != nullptr) {
+        io::FileCacheProfileReporter cache_profile(_profile);
+        cache_profile.update(_file_cache_statistics.get());
+    }
+
+    if (_cur_reader != nullptr) {
+        _cur_reader->collect_profile_before_close();
+    }
 }
 
 } // namespace doris::vectorized

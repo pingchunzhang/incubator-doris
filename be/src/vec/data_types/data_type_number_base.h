@@ -98,31 +98,36 @@ public:
         return TypeDescriptor(INVALID_TYPE);
     }
 
-    TPrimitiveType::type get_type_as_tprimitive_type() const override {
+    doris::FieldType get_storage_field_type() const override {
+        // Doris does not support uint8 at present, use uint8 as boolean type
+        if constexpr (std::is_same_v<TypeId<T>, TypeId<UInt8>>) {
+            return doris::FieldType::OLAP_FIELD_TYPE_BOOL;
+        }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Int8>>) {
-            return TPrimitiveType::TINYINT;
+            return doris::FieldType::OLAP_FIELD_TYPE_TINYINT;
         }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Int16>>) {
-            return TPrimitiveType::SMALLINT;
+            return doris::FieldType::OLAP_FIELD_TYPE_SMALLINT;
         }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Int32>>) {
-            return TPrimitiveType::INT;
+            return doris::FieldType::OLAP_FIELD_TYPE_INT;
         }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Int64>>) {
-            return TPrimitiveType::BIGINT;
+            return doris::FieldType::OLAP_FIELD_TYPE_BIGINT;
         }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Int128>>) {
-            return TPrimitiveType::LARGEINT;
+            return doris::FieldType::OLAP_FIELD_TYPE_LARGEINT;
         }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Float32>>) {
-            return TPrimitiveType::FLOAT;
+            return doris::FieldType::OLAP_FIELD_TYPE_FLOAT;
         }
         if constexpr (std::is_same_v<TypeId<T>, TypeId<Float64>>) {
-            return TPrimitiveType::DOUBLE;
+            return doris::FieldType::OLAP_FIELD_TYPE_DOUBLE;
         }
         LOG(FATAL) << "__builtin_unreachable";
         __builtin_unreachable();
     }
+
     Field get_default() const override;
 
     Field get_field(const TExprNode& node) const override;
@@ -130,8 +135,8 @@ public:
     int64_t get_uncompressed_serialized_bytes(const IColumn& column,
                                               int be_exec_version) const override;
     char* serialize(const IColumn& column, char* buf, int be_exec_version) const override;
-    const char* deserialize(const char* buf, IColumn* column, int be_exec_version) const override;
-
+    const char* deserialize(const char* buf, MutableColumnPtr* column,
+                            int be_exec_version) const override;
     MutableColumnPtr create_column() const override;
 
     bool get_is_parametric() const override { return false; }
@@ -151,12 +156,41 @@ public:
 
     void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const override;
     std::string to_string(const IColumn& column, size_t row_num) const override;
+    std::string to_string(const T& value) const;
     Status from_string(ReadBuffer& rb, IColumn* column) const override;
     bool is_null_literal() const override { return _is_null_literal; }
     void set_null_literal(bool flag) { _is_null_literal = flag; }
-    DataTypeSerDeSPtr get_serde() const override {
-        return std::make_shared<DataTypeNumberSerDe<T>>();
+    DataTypeSerDeSPtr get_serde(int nesting_level = 1) const override {
+        return std::make_shared<DataTypeNumberSerDe<T>>(nesting_level);
     };
+
+protected:
+    template <typename Derived>
+    void to_string_batch_impl(const IColumn& column, ColumnString& column_to) const {
+        // column may be column const
+        const auto& col_ptr = column.get_ptr();
+        const auto& [column_ptr, is_const] = unpack_if_const(col_ptr);
+        if (is_const) {
+            _to_string_batch_impl<Derived, true>(column_ptr, column_to);
+        } else {
+            _to_string_batch_impl<Derived, false>(column_ptr, column_to);
+        }
+    }
+
+    template <typename Derived, bool is_const>
+    void _to_string_batch_impl(const ColumnPtr& column_ptr, ColumnString& column_to) const {
+        auto& col_vec = assert_cast<const ColumnVector<T>&>(*column_ptr);
+        const auto size = col_vec.size();
+        auto& chars = column_to.get_chars();
+        auto& offsets = column_to.get_offsets();
+        offsets.resize(size);
+        chars.reserve(static_cast<const Derived*>(this)->number_length() * size);
+        for (int row_num = 0; row_num < size; row_num++) {
+            auto num = is_const ? col_vec.get_element(0) : col_vec.get_element(row_num);
+            static_cast<const Derived*>(this)->push_number(chars, num);
+            offsets[row_num] = chars.size();
+        }
+    }
 
 private:
     bool _is_null_literal = false;

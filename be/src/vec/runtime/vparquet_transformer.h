@@ -30,6 +30,7 @@
 #include "vfile_format_transformer.h"
 
 namespace doris {
+#include "common/compile_check_begin.h"
 namespace io {
 class FileWriter;
 } // namespace io
@@ -60,8 +61,8 @@ public:
     void set_written_len(int64_t written_len);
 
 private:
-    doris::io::FileWriter* _file_writer; // not owned
-    int64_t _cur_pos = 0;                // current write position
+    doris::io::FileWriter* _file_writer = nullptr; // not owned
+    int64_t _cur_pos = 0;                          // current write position
     bool _is_closed = false;
     int64_t _written_len = 0;
 };
@@ -89,12 +90,19 @@ public:
 // a wrapper of parquet output stream
 class VParquetTransformer final : public VFileFormatTransformer {
 public:
-    VParquetTransformer(doris::io::FileWriter* file_writer,
+    VParquetTransformer(RuntimeState* state, doris::io::FileWriter* file_writer,
+                        const VExprContextSPtrs& output_vexpr_ctxs,
+                        std::vector<std::string> column_names,
+                        TParquetCompressionType::type compression_type,
+                        bool parquet_disable_dictionary, TParquetVersion::type parquet_version,
+                        bool output_object_data, const std::string* iceberg_schema_json = nullptr);
+
+    VParquetTransformer(RuntimeState* state, doris::io::FileWriter* file_writer,
                         const VExprContextSPtrs& output_vexpr_ctxs,
                         const std::vector<TParquetSchema>& parquet_schemas,
-                        const TParquetCompressionType::type& compression_type,
-                        const bool& parquet_disable_dictionary,
-                        const TParquetVersion::type& parquet_version, bool output_object_data);
+                        TParquetCompressionType::type compression_type,
+                        bool parquet_disable_dictionary, TParquetVersion::type parquet_version,
+                        bool output_object_data, const std::string* iceberg_schema_json = nullptr);
 
     ~VParquetTransformer() override = default;
 
@@ -117,10 +125,15 @@ private:
     std::unique_ptr<parquet::arrow::FileWriter> _writer;
     std::shared_ptr<arrow::Schema> _arrow_schema;
 
-    const std::vector<TParquetSchema>& _parquet_schemas;
-    const TParquetCompressionType::type& _compression_type;
-    const bool& _parquet_disable_dictionary;
-    const TParquetVersion::type& _parquet_version;
+    std::vector<std::string> _column_names;
+    const std::vector<TParquetSchema>* _parquet_schemas = nullptr;
+    const TParquetCompressionType::type _compression_type;
+    const bool _parquet_disable_dictionary;
+    const TParquetVersion::type _parquet_version;
+    const std::string* _iceberg_schema_json;
+    uint64_t _write_size = 0;
 };
 
 } // namespace doris::vectorized
+
+#include "common/compile_check_end.h"

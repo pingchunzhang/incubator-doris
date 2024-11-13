@@ -33,6 +33,8 @@
 #include "common/exception.h"
 #include "common/status.h"
 #include "runtime/define_primitive_type.h"
+#include "vec/columns/column_const.h"
+#include "vec/columns/column_string.h"
 #include "vec/common/cow.h"
 #include "vec/core/types.h"
 #include "vec/data_types/serde/data_type_serde.h"
@@ -55,6 +57,10 @@ class Field;
 
 using DataTypePtr = std::shared_ptr<const IDataType>;
 using DataTypes = std::vector<DataTypePtr>;
+constexpr auto SERIALIZED_MEM_SIZE_LIMIT = 256;
+inline size_t upper_int32(size_t size) {
+    return size_t((3 + size) / 4.0);
+}
 
 /** Properties of data type.
   * Contains methods for serialization/deserialization.
@@ -78,15 +84,17 @@ public:
     virtual TypeIndex get_type_id() const = 0;
 
     virtual TypeDescriptor get_type_as_type_descriptor() const = 0;
-    virtual TPrimitiveType::type get_type_as_tprimitive_type() const = 0;
+    virtual doris::FieldType get_storage_field_type() const = 0;
 
     virtual void to_string(const IColumn& column, size_t row_num, BufferWritable& ostr) const;
     virtual std::string to_string(const IColumn& column, size_t row_num) const;
+
+    virtual void to_string_batch(const IColumn& column, ColumnString& column_to) const;
     // only for compound type now.
     virtual Status from_string(ReadBuffer& rb, IColumn* column) const;
 
     // get specific serializer or deserializer
-    virtual DataTypeSerDeSPtr get_serde() const = 0;
+    virtual DataTypeSerDeSPtr get_serde(int nesting_level = 1) const = 0;
 
 protected:
     virtual String do_get_name() const;
@@ -107,11 +115,6 @@ public:
     virtual Field get_default() const = 0;
 
     virtual Field get_field(const TExprNode& node) const = 0;
-
-    /** Directly insert default value into a column. Default implementation use method IColumn::insert_default.
-      * This should be overridden if data type default value differs from column default value (example: Enum data types).
-      */
-    virtual void insert_default_into(IColumn& column) const;
 
     /// Checks that two instances belong to the same type
     virtual bool equals(const IDataType& rhs) const = 0;
@@ -147,20 +150,6 @@ public:
       * The same for nullable of comparable types: they are comparable (but not totally-comparable).
       */
     virtual bool is_comparable() const { return false; }
-    /** Values of data type can be summed (possibly with overflow, within the same data type).
-      * Example: numbers, even nullable. Not Date/DateTime. Not Enum.
-      * Enums can be passed to aggregate function 'sum', but the result is Int64, not Enum, so they are not summable.
-      */
-    virtual bool is_summable() const { return false; }
-
-    /** Can be used in operations like bit and, bit shift, bit not, etc.
-      */
-    virtual bool can_be_used_in_bit_operations() const { return false; }
-
-    /** Can be used in boolean context (WHERE, HAVING).
-      * UInt8, maybe nullable.
-      */
-    virtual bool can_be_used_in_boolean_context() const { return false; }
 
     /** Numbers, Enums, Date, DateTime. Not nullable.
       */
@@ -209,16 +198,8 @@ public:
 
     virtual bool is_nullable() const { return false; }
 
-    /** Is this type can represent only NULL value? (It also implies is_nullable)
-      */
-    virtual bool only_null() const { return false; }
-
     /* the data type create from type_null, NULL literal*/
     virtual bool is_null_literal() const { return false; }
-
-    /** If this data type cannot be wrapped in Nullable data type.
-      */
-    virtual bool can_be_inside_nullable() const { return false; }
 
     virtual bool low_cardinality() const { return false; }
 
@@ -231,7 +212,7 @@ public:
     virtual int64_t get_uncompressed_serialized_bytes(const IColumn& column,
                                                       int be_exec_version) const = 0;
     virtual char* serialize(const IColumn& column, char* buf, int be_exec_version) const = 0;
-    virtual const char* deserialize(const char* buf, IColumn* column,
+    virtual const char* deserialize(const char* buf, MutableColumnPtr* column,
                                     int be_exec_version) const = 0;
 
     virtual void to_pb_column_meta(PColumnMeta* col_meta) const;
@@ -284,10 +265,12 @@ struct WhichDataType {
 
     bool is_decimal32() const { return idx == TypeIndex::Decimal32; }
     bool is_decimal64() const { return idx == TypeIndex::Decimal64; }
-    bool is_decimal128() const { return idx == TypeIndex::Decimal128; }
-    bool is_decimal128i() const { return idx == TypeIndex::Decimal128I; }
+    bool is_decimal128v2() const { return idx == TypeIndex::Decimal128V2; }
+    bool is_decimal128v3() const { return idx == TypeIndex::Decimal128V3; }
+    bool is_decimal256() const { return idx == TypeIndex::Decimal256; }
     bool is_decimal() const {
-        return is_decimal32() || is_decimal64() || is_decimal128() || is_decimal128i();
+        return is_decimal32() || is_decimal64() || is_decimal128v2() || is_decimal128v3() ||
+               is_decimal256();
     }
 
     bool is_float32() const { return idx == TypeIndex::Float32; }
@@ -300,6 +283,10 @@ struct WhichDataType {
     bool is_date_time_v2() const { return idx == TypeIndex::DateTimeV2; }
     bool is_date_or_datetime() const { return is_date() || is_date_time(); }
     bool is_date_v2_or_datetime_v2() const { return is_date_v2() || is_date_time_v2(); }
+
+    bool is_ipv4() const { return idx == TypeIndex::IPv4; }
+    bool is_ipv6() const { return idx == TypeIndex::IPv6; }
+    bool is_ip() const { return is_ipv4() || is_ipv6(); }
 
     bool is_string() const { return idx == TypeIndex::String; }
     bool is_fixed_string() const { return idx == TypeIndex::FixedString; }
@@ -323,42 +310,36 @@ struct WhichDataType {
 
 /// IDataType helpers (alternative for IDataType virtual methods with single point of truth)
 
-inline bool is_date(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_date();
-}
-inline bool is_date_v2(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_date_v2();
-}
-inline bool is_date_time_v2(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_date_time_v2();
-}
-inline bool is_date_or_datetime(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_date_or_datetime();
-}
-inline bool is_date_v2_or_datetime_v2(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_date_v2_or_datetime_v2();
-}
-inline bool is_decimal(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_decimal();
-}
-inline bool is_decimal_v2(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_decimal128();
-}
-inline bool is_tuple(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_tuple();
-}
-inline bool is_array(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_array();
-}
-inline bool is_map(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_map();
-}
-inline bool is_struct(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_struct();
-}
-inline bool is_nothing(const DataTypePtr& data_type) {
-    return WhichDataType(data_type).is_nothing();
-}
+#define IS_DATATYPE(name, method)                         \
+    inline bool is_##name(const DataTypePtr& data_type) { \
+        return WhichDataType(data_type).is_##method();    \
+    }
+
+IS_DATATYPE(uint8, uint8)
+IS_DATATYPE(uint16, uint16)
+IS_DATATYPE(uint32, uint32)
+IS_DATATYPE(uint64, uint64)
+IS_DATATYPE(uint128, uint128)
+IS_DATATYPE(int8, int8)
+IS_DATATYPE(int16, int16)
+IS_DATATYPE(int32, int32)
+IS_DATATYPE(int64, int64)
+IS_DATATYPE(int128, int128)
+IS_DATATYPE(date, date)
+IS_DATATYPE(date_v2, date_v2)
+IS_DATATYPE(date_time_v2, date_time_v2)
+IS_DATATYPE(date_or_datetime, date_or_datetime)
+IS_DATATYPE(date_v2_or_datetime_v2, date_v2_or_datetime_v2)
+IS_DATATYPE(decimal, decimal)
+IS_DATATYPE(decimal_v2, decimal128v2)
+IS_DATATYPE(tuple, tuple)
+IS_DATATYPE(array, array)
+IS_DATATYPE(map, map)
+IS_DATATYPE(struct, struct)
+IS_DATATYPE(ipv4, ipv4)
+IS_DATATYPE(ipv6, ipv6)
+IS_DATATYPE(ip, ip)
+IS_DATATYPE(nothing, nothing)
 
 template <typename T>
 bool is_uint8(const T& data_type) {
@@ -430,5 +411,14 @@ inline bool is_complex_type(const DataTypePtr& data_type) {
     return which.is_array() || which.is_map() || which.is_struct();
 }
 
+inline bool is_variant_type(const DataTypePtr& data_type) {
+    return WhichDataType(data_type).is_variant_type();
+}
+
+// write const_flag and row_num to buf, and return real_need_copy_num
+char* serialize_const_flag_and_row_num(const IColumn** column, char* buf,
+                                       size_t* real_need_copy_num);
+const char* deserialize_const_flag_and_row_num(const char* buf, MutableColumnPtr* column,
+                                               size_t* real_have_saved_num);
 } // namespace vectorized
 } // namespace doris

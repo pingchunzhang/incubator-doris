@@ -40,8 +40,9 @@ public class InitCatalogLog implements Writable {
         PAIMON,
         MAX_COMPUTE,
         HUDI,
-        DELTALAKE,
+        LAKESOUL,
         TEST,
+        TRINO_CONNECTOR,
         UNKNOWN;
     }
 

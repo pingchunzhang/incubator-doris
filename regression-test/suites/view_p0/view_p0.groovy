@@ -37,7 +37,7 @@ suite("view_p0") {
     """
     
     qt_sql "select * from test_varchar_view;"
-    qt_sql "select cast( id as varchar(*)) from test_view_table;"
+    qt_sql "select cast( id as varchar(65533)) from test_view_table;"
     
     // array view
     sql """DROP TABLE IF EXISTS test_array_tbl_1"""
@@ -135,5 +135,40 @@ suite("view_p0") {
 
     sql """CREATE VIEW IF NOT EXISTS `test_view_abc`(`a`) AS WITH T1 AS (SELECT 1 AS 'a'), T2 AS (SELECT 2 AS 'a') SELECT T1.a FROM T1 UNION ALL SELECT T2.a FROM T2;"""
 
-    sql "drop view if exists test_view_abc;" 
+    sql "drop view if exists test_view_abc;"
+
+    sql "drop view if exists test_view_aes;"
+    sql """CREATE VIEW IF NOT EXISTS `test_view_aes`
+           AS
+           SELECT aes_decrypt(from_base64("EXp7k7M9Zv1mIwPpno28Hg=="), '17IMZrGdwWf2Piy8', 'II2HLtihr5TQpQgR', 'AES_128_CBC');
+    """
+    qt_select_aes "SELECT * FROM test_view_aes;"
+    qt_show_aes "SHOW CREATE VIEW test_view_aes;"
+    sql "drop view if exists test_view_aes;"
+
+    sql """DROP TABLE IF EXISTS test_view_table2"""
+    
+    sql """ 
+        CREATE TABLE test_view_table2 (
+            c_date varchar(50)
+        ) 
+        ENGINE=OLAP
+        UNIQUE KEY(`c_date`)
+        distributed by hash(c_date) properties('replication_num'='1');
+    """
+
+    sql """ drop view if exists test_view_table2_view;"""
+    sql """CREATE VIEW `test_view_table2_view` 
+            AS
+            SELECT 
+                date_format(c_date,'%Y-%m-%d') AS `CREATE_DATE`
+            FROM 
+                test_view_table2
+            GROUP BY  
+                date_format(c_date, '%Y-%m-%d');
+    """
+
+    sql """select * from test_view_table2_view;"""
+    sql """ drop view if exists test_view_table2_view;"""
+    sql """DROP TABLE IF EXISTS test_view_table2"""
 }

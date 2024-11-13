@@ -23,11 +23,9 @@ import org.apache.doris.thrift.TColumnRef;
 import org.apache.doris.thrift.TExprNode;
 import org.apache.doris.thrift.TExprNodeType;
 
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import java.util.Optional;
 
 public class ColumnRefExpr extends Expr {
-    private static final Logger LOG = LogManager.getLogger(ColumnRefExpr.class);
     private String columnName;
     private int columnId;
     private boolean isNullable;
@@ -55,8 +53,11 @@ public class ColumnRefExpr extends Expr {
     }
 
     @Override
-    protected String getExprName() {
-        return Utils.normalizeName(getName(), DEFAULT_EXPR_NAME);
+    public String getExprName() {
+        if (!this.exprName.isPresent()) {
+            this.exprName = Optional.of(Utils.normalizeName(getName(), DEFAULT_EXPR_NAME));
+        }
+        return this.exprName.get();
     }
 
     public void setName(String name) {
@@ -113,5 +114,10 @@ public class ColumnRefExpr extends Expr {
 
     public String debugString() {
         return columnName + " (" + columnId + ")id";
+    }
+
+    @Override
+    public boolean supportSerializable() {
+        return false;
     }
 }

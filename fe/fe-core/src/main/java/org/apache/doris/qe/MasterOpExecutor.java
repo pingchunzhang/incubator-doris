@@ -17,28 +17,35 @@
 
 package org.apache.doris.qe;
 
+import org.apache.doris.analysis.LiteralExpr;
 import org.apache.doris.analysis.RedirectStatus;
 import org.apache.doris.catalog.Env;
+import org.apache.doris.common.AnalysisException;
 import org.apache.doris.common.ClientPool;
+import org.apache.doris.common.Config;
 import org.apache.doris.common.DdlException;
-import org.apache.doris.common.telemetry.Telemetry;
+import org.apache.doris.common.ErrorCode;
 import org.apache.doris.thrift.FrontendService;
+import org.apache.doris.thrift.TExpr;
+import org.apache.doris.thrift.TExprNode;
+import org.apache.doris.thrift.TGroupCommitInfo;
 import org.apache.doris.thrift.TMasterOpRequest;
 import org.apache.doris.thrift.TMasterOpResult;
 import org.apache.doris.thrift.TNetworkAddress;
 import org.apache.doris.thrift.TUniqueId;
 
+import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
-import io.opentelemetry.api.trace.Span;
-import io.opentelemetry.context.Context;
-import io.opentelemetry.context.Scope;
+import com.google.common.collect.Maps;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TException;
 import org.apache.thrift.transport.TTransportException;
 
 import java.nio.ByteBuffer;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 
 public class MasterOpExecutor {
@@ -49,6 +56,8 @@ public class MasterOpExecutor {
     private final OriginStatement originStmt;
     private final ConnectContext ctx;
     private TMasterOpResult result;
+
+    private TNetworkAddress masterAddr;
 
     private int waitTimeoutMs;
     // the total time of thrift connectTime add readTime and writeTime
@@ -77,16 +86,14 @@ public class MasterOpExecutor {
     }
 
     public void execute() throws Exception {
-        Span forwardSpan =
-                ctx.getTracer().spanBuilder("forward").setParent(Context.current())
-                        .startSpan();
-        try (Scope ignored = forwardSpan.makeCurrent()) {
-            result = forward(buildStmtForwardParams());
-        } catch (Exception e) {
-            forwardSpan.recordException(e);
-            throw e;
-        } finally {
-            forwardSpan.end();
+        result = forward(buildStmtForwardParams());
+        if (ctx.isTxnModel()) {
+            if (result.isSetTxnLoadInfo()) {
+                ctx.getTxnEntry().setTxnLoadInfoInObserver(result.getTxnLoadInfo());
+            } else {
+                ctx.setTxnEntry(null);
+                LOG.info("set txn entry to null");
+            }
         }
         waitOnReplaying();
     }
@@ -96,19 +103,51 @@ public class MasterOpExecutor {
         waitOnReplaying();
     }
 
+    public long getGroupCommitLoadBeId(long tableId, String cluster) throws Exception {
+        result = forward(buildGetGroupCommitLoadBeIdParmas(tableId, cluster));
+        waitOnReplaying();
+        return result.groupCommitLoadBeId;
+    }
+
+    public void updateLoadData(long tableId, long receiveData) throws Exception {
+        result = forward(buildUpdateLoadDataParams(tableId, receiveData));
+        waitOnReplaying();
+    }
+
+    public void cancel() throws Exception {
+        TUniqueId queryId = ctx.queryId();
+        if (queryId == null) {
+            return;
+        }
+        Preconditions.checkNotNull(masterAddr, "query with id %s is not forwarded to master", queryId);
+        TMasterOpRequest request = new TMasterOpRequest();
+        request.setCancelQeury(true);
+        request.setQueryId(queryId);
+        request.setDb(ctx.getDatabase());
+        request.setUser(ctx.getQualifiedUser());
+        request.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
+        request.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
+        // just make the protocol happy
+        request.setSql("");
+        result = forward(masterAddr, request);
+        waitOnReplaying();
+    }
+
     private void waitOnReplaying() throws DdlException {
         LOG.info("forwarding to master get result max journal id: {}", result.maxJournalId);
         ctx.getEnv().getJournalObservable().waitOn(result.maxJournalId, waitTimeoutMs);
     }
 
-    // Send request to Master
     private TMasterOpResult forward(TMasterOpRequest params) throws Exception {
-        if (!ctx.getEnv().isReady()) {
-            throw new Exception("Node catalog is not ready, please wait for a while.");
-        }
         String masterHost = ctx.getEnv().getMasterHost();
         int masterRpcPort = ctx.getEnv().getMasterRpcPort();
-        TNetworkAddress thriftAddress = new TNetworkAddress(masterHost, masterRpcPort);
+        masterAddr = new TNetworkAddress(masterHost, masterRpcPort);
+        return forward(masterAddr, params);
+    }
+
+    // Send request to Master
+    private TMasterOpResult forward(TNetworkAddress thriftAddress, TMasterOpRequest params) throws Exception {
+        ctx.getEnv().checkReadyOrThrow();
 
         FrontendService.Client client;
         try {
@@ -158,12 +197,11 @@ public class MasterOpExecutor {
         }
     }
 
-    private TMasterOpRequest buildStmtForwardParams() {
+    private TMasterOpRequest buildStmtForwardParams() throws AnalysisException {
         TMasterOpRequest params = new TMasterOpRequest();
-        //node ident
+        // node ident
         params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
         params.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
-        params.setCluster(ctx.getClusterName());
         params.setSql(originStmt.originStmt);
         params.setStmtIdx(originStmt.idx);
         params.setUser(ctx.getQualifiedUser());
@@ -174,34 +212,78 @@ public class MasterOpExecutor {
         params.setStmtId(ctx.getStmtId());
         params.setCurrentUserIdent(ctx.getCurrentUserIdentity().toThrift());
 
+        if (Config.isCloudMode()) {
+            String cluster = "";
+            try {
+                cluster = ctx.getCloudCluster(false);
+            } catch (Exception e) {
+                LOG.warn("failed to get cloud compute group", e);
+            }
+            if (!Strings.isNullOrEmpty(cluster)) {
+                params.setCloudCluster(cluster);
+            }
+        }
+
         // query options
         params.setQueryOptions(ctx.getSessionVariable().getQueryOptionVariables());
         // session variables
         params.setSessionVariables(ctx.getSessionVariable().getForwardVariables());
-
-        // create a trace carrier
-        Map<String, String> traceCarrier = new HashMap<>();
-        // Inject the request with the current context
-        Telemetry.getOpenTelemetry().getPropagators().getTextMapPropagator()
-                .inject(Context.current(), traceCarrier, (carrier, key, value) -> carrier.put(key, value));
-        // carrier send tracing to master
-        params.setTraceCarrier(traceCarrier);
-
+        params.setUserVariables(getForwardUserVariables(ctx.getUserVars()));
         if (null != ctx.queryId()) {
             params.setQueryId(ctx.queryId());
+        }
+        // set transaction load info
+        if (ctx.isTxnModel()) {
+            params.setTxnLoadInfo(ctx.getTxnEntry().getTxnLoadInfoInObserver());
         }
         return params;
     }
 
     private TMasterOpRequest buildSyncJournalParmas() {
         final TMasterOpRequest params = new TMasterOpRequest();
-        //node ident
+        // node ident
         params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
         params.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
         params.setSyncJournalOnly(true);
+        params.setDb(ctx.getDatabase());
+        params.setUser(ctx.getQualifiedUser());
         // just make the protocol happy
-        params.setDb("");
-        params.setUser("");
+        params.setSql("");
+        return params;
+    }
+
+    private TMasterOpRequest buildGetGroupCommitLoadBeIdParmas(long tableId, String cluster) {
+        final TGroupCommitInfo groupCommitParams = new TGroupCommitInfo();
+        groupCommitParams.setGetGroupCommitLoadBeId(true);
+        groupCommitParams.setGroupCommitLoadTableId(tableId);
+        groupCommitParams.setCluster(cluster);
+
+        final TMasterOpRequest params = new TMasterOpRequest();
+        // node ident
+        params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
+        params.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
+        params.setGroupCommitInfo(groupCommitParams);
+        params.setDb(ctx.getDatabase());
+        params.setUser(ctx.getQualifiedUser());
+        // just make the protocol happy
+        params.setSql("");
+        return params;
+    }
+
+    private TMasterOpRequest buildUpdateLoadDataParams(long tableId, long receiveData) {
+        final TGroupCommitInfo groupCommitParams = new TGroupCommitInfo();
+        groupCommitParams.setUpdateLoadData(true);
+        groupCommitParams.setTableId(tableId);
+        groupCommitParams.setReceiveData(receiveData);
+
+        final TMasterOpRequest params = new TMasterOpRequest();
+        // node ident
+        params.setClientNodeHost(Env.getCurrentEnv().getSelfNode().getHost());
+        params.setClientNodePort(Env.getCurrentEnv().getSelfNode().getPort());
+        params.setGroupCommitInfo(groupCommitParams);
+        params.setDb(ctx.getDatabase());
+        params.setUser(ctx.getQualifiedUser());
+        // just make the protocol happy
         params.setSql("");
         return params;
     }
@@ -232,6 +314,23 @@ public class MasterOpExecutor {
         }
     }
 
+    public int getProxyStatusCode() {
+        if (result == null || !result.isSetStatusCode()) {
+            return ErrorCode.ERR_UNKNOWN_ERROR.getCode();
+        }
+        return result.getStatusCode();
+    }
+
+    public String getProxyErrMsg() {
+        if (result == null) {
+            return ErrorCode.ERR_UNKNOWN_ERROR.getErrorMsg();
+        }
+        if (!result.isSetErrMessage()) {
+            return "";
+        }
+        return result.getErrMessage();
+    }
+
     public ShowResultSet getProxyResultSet() {
         if (result == null) {
             return null;
@@ -241,6 +340,10 @@ public class MasterOpExecutor {
         } else {
             return null;
         }
+    }
+
+    public List<ByteBuffer> getQueryResultBufList() {
+        return result.isSetQueryResultBufList() ? result.getQueryResultBufList() : Collections.emptyList();
     }
 
     public void setResult(TMasterOpResult result) {
@@ -254,7 +357,9 @@ public class MasterOpExecutor {
                         .put(TTransportException.UNKNOWN, "Unknown exception")
                         .put(TTransportException.NOT_OPEN, "Connection is not open")
                         .put(TTransportException.ALREADY_OPEN, "Connection has already opened up")
-                        .put(TTransportException.TIMED_OUT, "Connection timeout")
+                        .put(TTransportException.TIMED_OUT,
+                                "Connection timeout, please check network state or enlarge session variable:"
+                                        + "`query_timeout`/`insert_timeout`")
                         .put(TTransportException.END_OF_FILE, "EOF")
                         .put(TTransportException.CORRUPTED_DATA, "Corrupted data")
                         .build();
@@ -262,12 +367,23 @@ public class MasterOpExecutor {
         private final String msg;
 
         public ForwardToMasterException(String msg, TTransportException exception) {
-            this.msg = msg + ", cause: " + TYPE_MSG_MAP.get(exception.getType());
+            this.msg = msg + ", cause: " + TYPE_MSG_MAP.get(exception.getType()) + ", " + exception.getMessage();
         }
 
         @Override
         public String getMessage() {
             return msg;
         }
+    }
+
+    private Map<String, TExprNode> getForwardUserVariables(Map<String, LiteralExpr> userVariables) {
+        Map<String, TExprNode> forwardVariables = Maps.newHashMap();
+        for (Map.Entry<String, LiteralExpr> entry : userVariables.entrySet()) {
+            LiteralExpr literalExpr = entry.getValue();
+            TExpr tExpr = literalExpr.treeToThrift();
+            TExprNode tExprNode = tExpr.nodes.get(0);
+            forwardVariables.put(entry.getKey(), tExprNode);
+        }
+        return forwardVariables;
     }
 }

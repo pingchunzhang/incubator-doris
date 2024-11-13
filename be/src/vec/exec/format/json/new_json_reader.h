@@ -33,12 +33,12 @@
 #include <vector>
 
 #include "common/status.h"
+#include "exec/decompressor.h"
 #include "exec/line_reader.h"
 #include "exprs/json_functions.h"
 #include "io/file_factory.h"
 #include "io/fs/file_reader_writer_fwd.h"
 #include "util/runtime_profile.h"
-#include "vec/common/hash_table/hash_map.h"
 #include "vec/common/string_ref.h"
 #include "vec/core/types.h"
 #include "vec/exec/format/generic_reader.h"
@@ -94,6 +94,9 @@ public:
     Status get_parsed_schema(std::vector<std::string>* col_names,
                              std::vector<TypeDescriptor>* col_types) override;
 
+protected:
+    void _collect_profile_before_close() override;
+
 private:
     Status _get_range_params();
     void _init_system_properties();
@@ -135,22 +138,36 @@ private:
     Status _append_error_msg(const rapidjson::Value& objectValue, std::string error_msg,
                              std::string col_name, bool* valid);
 
-    std::string _print_json_value(const rapidjson::Value& value);
+    static std::string _print_json_value(const rapidjson::Value& value);
 
     Status _read_one_message(std::unique_ptr<uint8_t[]>* file_buf, size_t* read_size);
 
     // simdjson, replace none simdjson function if it is ready
     Status _simdjson_init_reader();
-    Status _simdjson_parse_json(bool* is_empty_row, bool* eof);
-    Status _simdjson_parse_json_doc(size_t* size, bool* eof);
+    Status _simdjson_parse_json(size_t* size, bool* is_empty_row, bool* eof,
+                                simdjson::error_code* error);
+    Status _get_json_value(size_t* size, bool* eof, simdjson::error_code* error,
+                           bool* is_empty_row);
+    Status _judge_empty_row(size_t size, bool eof, bool* is_empty_row);
+
+    Status _handle_simdjson_error(simdjson::simdjson_error& error, Block& block, size_t num_rows,
+                                  bool* eof);
 
     Status _simdjson_handle_simple_json(RuntimeState* state, Block& block,
                                         const std::vector<SlotDescriptor*>& slot_descs,
                                         bool* is_empty_row, bool* eof);
 
+    Status _simdjson_handle_simple_json_write_columns(
+            Block& block, const std::vector<SlotDescriptor*>& slot_descs, bool* is_empty_row,
+            bool* eof);
+
     Status _simdjson_handle_flat_array_complex_json(RuntimeState* state, Block& block,
                                                     const std::vector<SlotDescriptor*>& slot_descs,
                                                     bool* is_empty_row, bool* eof);
+
+    Status _simdjson_handle_flat_array_complex_json_write_columns(
+            Block& block, const std::vector<SlotDescriptor*>& slot_descs, bool* is_empty_row,
+            bool* eof);
 
     Status _simdjson_handle_nested_complex_json(RuntimeState* state, Block& block,
                                                 const std::vector<SlotDescriptor*>& slot_descs,
@@ -182,19 +199,28 @@ private:
     Status _fill_missing_column(SlotDescriptor* slot_desc, vectorized::IColumn* column_ptr,
                                 bool* valid);
 
-    RuntimeState* _state;
-    RuntimeProfile* _profile;
-    ScannerCounter* _counter;
+    // fe will add skip_bitmap_col to _file_slot_descs iff the target olap table has skip_bitmap_col
+    // and the current load is a flexible partial update
+    // flexible partial update can not be used when user specify jsonpaths, so we just fill the skip bitmap
+    // in `_simdjson_handle_simple_json` and `_vhandle_simple_json` (which will be used when jsonpaths is not specified)
+    bool _should_process_skip_bitmap_col() const { return skip_bitmap_col_idx != -1; }
+    void _append_empty_skip_bitmap_value(Block& block, size_t cur_row_count);
+    void _process_skip_bitmap_mark(SlotDescriptor* slot_desc, IColumn* column_ptr, Block& block,
+                                   size_t cur_row_count, bool* valid);
+    RuntimeState* _state = nullptr;
+    RuntimeProfile* _profile = nullptr;
+    ScannerCounter* _counter = nullptr;
     const TFileScanRangeParams& _params;
     const TFileRangeDesc& _range;
     io::FileSystemProperties _system_properties;
     io::FileDescription _file_description;
     const std::vector<SlotDescriptor*>& _file_slot_descs;
 
-    std::shared_ptr<io::FileSystem> _file_system;
     io::FileReaderSPtr _file_reader;
     std::unique_ptr<LineReader> _line_reader;
     bool _reader_eof;
+    std::unique_ptr<Decompressor> _decompressor;
+    TFileCompressType::type _file_compress_type;
 
     // When we fetch range doesn't start from 0 will always skip the first line
     bool _skip_first_line;
@@ -214,6 +240,7 @@ private:
 
     std::vector<std::vector<JsonPath>> _parsed_jsonpaths;
     std::vector<JsonPath> _parsed_json_root;
+    bool _parsed_from_json_root = false; // to avoid parsing json root multiple times
 
     char _value_buffer[4 * 1024 * 1024]; // 4MB
     char _parse_buffer[512 * 1024];      // 512KB
@@ -226,26 +253,28 @@ private:
     rapidjson::Value* _json_doc; // _json_doc equals _final_json_doc iff not set `json_root`
     std::unordered_map<std::string, int> _name_map;
 
-    bool* _scanner_eof;
+    bool* _scanner_eof = nullptr;
 
     size_t _current_offset;
 
-    io::IOContext* _io_ctx;
+    io::IOContext* _io_ctx = nullptr;
 
-    RuntimeProfile::Counter* _bytes_read_counter;
-    RuntimeProfile::Counter* _read_timer;
-    RuntimeProfile::Counter* _file_read_timer;
+    RuntimeProfile::Counter* _bytes_read_counter = nullptr;
+    RuntimeProfile::Counter* _read_timer = nullptr;
+    RuntimeProfile::Counter* _file_read_timer = nullptr;
 
     // ======SIMD JSON======
     // name mapping
     /// Hash table match `field name -> position in the block`. NOTE You can use perfect hash map.
-    using NameMap = HashMap<StringRef, size_t, StringRefHash>;
+    using NameMap = phmap::flat_hash_map<StringRef, size_t, StringRefHash>;
     NameMap _slot_desc_index;
     /// Cached search results for previous row (keyed as index in JSON object) - used as a hint.
-    std::vector<NameMap::LookupResult> _prev_positions;
+    std::vector<NameMap::iterator> _prev_positions;
     /// Set of columns which already met in row. Exception is thrown if there are more than one column with the same name.
     std::vector<UInt8> _seen_columns;
     // simdjson
+    std::unique_ptr<uint8_t[]> _json_str_ptr;
+    const uint8_t* _json_str = nullptr;
     static constexpr size_t _init_buffer_size = 1024 * 1024 * 8;
     size_t _padded_size = _init_buffer_size + simdjson::SIMDJSON_PADDING;
     size_t _original_doc_size = 0;
@@ -258,10 +287,11 @@ private:
     // array_iter pointed to _array
     simdjson::ondemand::array_iterator _array_iter;
     simdjson::ondemand::array _array;
-    std::unique_ptr<JSONDataParser<SimdJSONParser>> _json_parser;
-    std::unique_ptr<simdjson::ondemand::parser> _ondemand_json_parser = nullptr;
+    std::unique_ptr<simdjson::ondemand::parser> _ondemand_json_parser;
     // column to default value string map
     std::unordered_map<std::string, std::string> _col_default_value_map;
+
+    int32_t skip_bitmap_col_idx {-1};
 };
 
 } // namespace vectorized

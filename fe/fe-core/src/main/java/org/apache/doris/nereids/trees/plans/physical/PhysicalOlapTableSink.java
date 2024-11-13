@@ -21,11 +21,12 @@ import org.apache.doris.catalog.Column;
 import org.apache.doris.catalog.Database;
 import org.apache.doris.catalog.DistributionInfo;
 import org.apache.doris.catalog.HashDistributionInfo;
+import org.apache.doris.catalog.KeysType;
 import org.apache.doris.catalog.OlapTable;
 import org.apache.doris.catalog.RandomDistributionInfo;
+import org.apache.doris.common.Config;
 import org.apache.doris.nereids.exceptions.AnalysisException;
 import org.apache.doris.nereids.memo.GroupExpression;
-import org.apache.doris.nereids.properties.DistributionSpecHash.ShuffleType;
 import org.apache.doris.nereids.properties.LogicalProperties;
 import org.apache.doris.nereids.properties.PhysicalProperties;
 import org.apache.doris.nereids.trees.expressions.Expression;
@@ -34,25 +35,23 @@ import org.apache.doris.nereids.trees.expressions.Slot;
 import org.apache.doris.nereids.trees.plans.Plan;
 import org.apache.doris.nereids.trees.plans.PlanType;
 import org.apache.doris.nereids.trees.plans.algebra.Sink;
+import org.apache.doris.nereids.trees.plans.commands.info.DMLCommandType;
 import org.apache.doris.nereids.trees.plans.visitor.PlanVisitor;
 import org.apache.doris.nereids.util.Utils;
 import org.apache.doris.statistics.Statistics;
 
-import avro.shaded.com.google.common.base.Preconditions;
+import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Lists;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
-import java.util.Set;
-import java.util.stream.Collectors;
 
 /**
  * physical olap table sink for insert command
  */
-public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink<CHILD_TYPE> implements Sink {
+public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalTableSink<CHILD_TYPE> implements Sink {
 
     private final Database database;
     private final OlapTable targetTable;
@@ -60,28 +59,36 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
     private final List<Long> partitionIds;
     private final boolean singleReplicaLoad;
     private final boolean isPartialUpdate;
-    private final boolean isFromNativeInsertStmt;
+    private final DMLCommandType dmlCommandType;
+    private final List<Expression> partitionExprList;
+    private final Map<Long, Expression> syncMvWhereClauses;
+    private final List<Slot> targetTableSlots;
 
     /**
      * Constructor
      */
-    public PhysicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols, List<Long> partitionIds,
-            List<NamedExpression> outputExprs, boolean singleReplicaLoad,
-            boolean isPartialUpdate, boolean isFromNativeInsertStmt,
-            Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties, CHILD_TYPE child) {
-        this(database, targetTable, cols, partitionIds, outputExprs,
-                singleReplicaLoad, isPartialUpdate, isFromNativeInsertStmt,
-                groupExpression, logicalProperties, PhysicalProperties.GATHER, null, child);
+    public PhysicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols,
+            List<Long> partitionIds, List<NamedExpression> outputExprs, boolean singleReplicaLoad,
+            boolean isPartialUpdate, DMLCommandType dmlCommandType,
+            List<Expression> partitionExprList, Map<Long, Expression> syncMvWhereClauses,
+            List<Slot> targetTableSlots, Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties, CHILD_TYPE child) {
+        this(database, targetTable, cols, partitionIds, outputExprs, singleReplicaLoad,
+                isPartialUpdate, dmlCommandType, partitionExprList, syncMvWhereClauses,
+                targetTableSlots, groupExpression, logicalProperties, PhysicalProperties.GATHER,
+                null, child);
     }
 
     /**
      * Constructor
      */
-    public PhysicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols, List<Long> partitionIds,
-            List<NamedExpression> outputExprs, boolean singleReplicaLoad,
-            boolean isPartialUpdate, boolean isFromNativeInsertStmt,
-            Optional<GroupExpression> groupExpression, LogicalProperties logicalProperties,
-            PhysicalProperties physicalProperties, Statistics statistics, CHILD_TYPE child) {
+    public PhysicalOlapTableSink(Database database, OlapTable targetTable, List<Column> cols,
+            List<Long> partitionIds, List<NamedExpression> outputExprs, boolean singleReplicaLoad,
+            boolean isPartialUpdate, DMLCommandType dmlCommandType,
+            List<Expression> partitionExprList, Map<Long, Expression> syncMvWhereClauses,
+            List<Slot> targetTableSlots, Optional<GroupExpression> groupExpression,
+            LogicalProperties logicalProperties, PhysicalProperties physicalProperties,
+            Statistics statistics, CHILD_TYPE child) {
         super(PlanType.PHYSICAL_OLAP_TABLE_SINK, outputExprs, groupExpression,
                 logicalProperties, physicalProperties, statistics, child);
         this.database = Objects.requireNonNull(database, "database != null in PhysicalOlapTableSink");
@@ -90,7 +97,10 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
         this.partitionIds = Utils.copyRequiredList(partitionIds);
         this.singleReplicaLoad = singleReplicaLoad;
         this.isPartialUpdate = isPartialUpdate;
-        this.isFromNativeInsertStmt = isFromNativeInsertStmt;
+        this.dmlCommandType = dmlCommandType;
+        this.partitionExprList = partitionExprList;
+        this.syncMvWhereClauses = syncMvWhereClauses;
+        this.targetTableSlots = targetTableSlots;
     }
 
     public Database getDatabase() {
@@ -117,16 +127,29 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
         return isPartialUpdate;
     }
 
-    public boolean isFromNativeInsertStmt() {
-        return isFromNativeInsertStmt;
+    public DMLCommandType getDmlCommandType() {
+        return dmlCommandType;
+    }
+
+    public List<Expression> getPartitionExprList() {
+        return partitionExprList;
+    }
+
+    public Map<Long, Expression> getSyncMvWhereClauses() {
+        return syncMvWhereClauses;
+    }
+
+    public List<Slot> getTargetTableSlots() {
+        return targetTableSlots;
     }
 
     @Override
     public Plan withChildren(List<Plan> children) {
         Preconditions.checkArgument(children.size() == 1, "PhysicalOlapTableSink only accepts one child");
         return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
-                singleReplicaLoad, isPartialUpdate, isFromNativeInsertStmt, groupExpression,
-                        getLogicalProperties(), physicalProperties, statistics, children.get(0));
+                singleReplicaLoad, isPartialUpdate, dmlCommandType, partitionExprList,
+                syncMvWhereClauses, targetTableSlots, groupExpression, getLogicalProperties(),
+                physicalProperties, statistics, children.get(0));
     }
 
     @Override
@@ -140,7 +163,7 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
         PhysicalOlapTableSink<?> that = (PhysicalOlapTableSink<?>) o;
         return singleReplicaLoad == that.singleReplicaLoad
                 && isPartialUpdate == that.isPartialUpdate
-                && isFromNativeInsertStmt == that.isFromNativeInsertStmt
+                && dmlCommandType == that.dmlCommandType
                 && Objects.equals(database, that.database)
                 && Objects.equals(targetTable, that.targetTable)
                 && Objects.equals(cols, that.cols)
@@ -150,7 +173,7 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
     @Override
     public int hashCode() {
         return Objects.hash(database, targetTable, cols, partitionIds, singleReplicaLoad,
-                isPartialUpdate, isFromNativeInsertStmt);
+                isPartialUpdate, dmlCommandType);
     }
 
     @Override
@@ -163,21 +186,8 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
                 "partitionIds", partitionIds,
                 "singleReplicaLoad", singleReplicaLoad,
                 "isPartialUpdate", isPartialUpdate,
-                "isFromNativeInsertStmt", isFromNativeInsertStmt
+                "dmlCommandType", dmlCommandType
         );
-    }
-
-    @Override
-    public List<Slot> getOutput() {
-        return computeOutput();
-    }
-
-    /**
-     * override function of AbstractPlan.
-     */
-    @Override
-    public Set<Slot> getOutputSet() {
-        return ImmutableSet.copyOf(getOutput());
     }
 
     @Override
@@ -192,48 +202,46 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
 
     @Override
     public Plan withGroupExpression(Optional<GroupExpression> groupExpression) {
-        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, singleReplicaLoad,
-                isPartialUpdate, isFromNativeInsertStmt, groupExpression, getLogicalProperties(), child());
+        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                singleReplicaLoad, isPartialUpdate, dmlCommandType, partitionExprList,
+                syncMvWhereClauses, targetTableSlots, groupExpression, getLogicalProperties(),
+                child());
     }
 
     @Override
     public Plan withGroupExprLogicalPropChildren(Optional<GroupExpression> groupExpression,
             Optional<LogicalProperties> logicalProperties, List<Plan> children) {
-        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, singleReplicaLoad,
-                isPartialUpdate, isFromNativeInsertStmt, groupExpression, logicalProperties.get(), children.get(0));
+        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                singleReplicaLoad, isPartialUpdate, dmlCommandType, partitionExprList,
+                syncMvWhereClauses, targetTableSlots, groupExpression, logicalProperties.get(),
+                children.get(0));
     }
 
     @Override
-    public PhysicalPlan withPhysicalPropertiesAndStats(PhysicalProperties physicalProperties, Statistics statistics) {
-        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, singleReplicaLoad,
-                isPartialUpdate, isFromNativeInsertStmt, groupExpression, getLogicalProperties(),
-                        physicalProperties, statistics, child());
+    public PhysicalPlan withPhysicalPropertiesAndStats(PhysicalProperties physicalProperties,
+            Statistics statistics) {
+        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                singleReplicaLoad, isPartialUpdate, dmlCommandType, partitionExprList,
+                syncMvWhereClauses, targetTableSlots, groupExpression, getLogicalProperties(),
+                physicalProperties, statistics, child());
     }
 
     /**
      * get output physical properties
      */
     public PhysicalProperties getRequirePhysicalProperties() {
-        if (targetTable.isPartitioned()) {
+        if (targetTable.isPartitionDistributed()) {
             DistributionInfo distributionInfo = targetTable.getDefaultDistributionInfo();
             if (distributionInfo instanceof HashDistributionInfo) {
-                HashDistributionInfo hashDistributionInfo
-                        = ((HashDistributionInfo) targetTable.getDefaultDistributionInfo());
-                List<Column> distributedColumns = hashDistributionInfo.getDistributionColumns();
-                List<Integer> columnIndexes = Lists.newArrayList();
-                int idx = 0;
-                for (int i = 0; i < targetTable.getFullSchema().size(); ++i) {
-                    if (targetTable.getFullSchema().get(i).equals(distributedColumns.get(idx))) {
-                        columnIndexes.add(i);
-                        idx++;
-                        if (idx == distributedColumns.size()) {
-                            break;
-                        }
+                // Do not enable shuffle for duplicate key tables when its tablet num is less than threshold.
+                if (targetTable.getKeysType() == KeysType.DUP_KEYS) {
+                    final long partitionNums = Math.max(targetTable.getPartitionInfo().getAllPartitions().size(), 1);
+                    final long tabletNums = partitionNums * distributionInfo.getBucketNum();
+                    if (tabletNums < Config.min_tablets_for_dup_table_shuffle) {
+                        return PhysicalProperties.ANY;
                     }
                 }
-                return PhysicalProperties.createHash(columnIndexes.stream()
-                        .map(colIdx -> child().getOutput().get(colIdx).getExprId())
-                        .collect(Collectors.toList()), ShuffleType.NATURAL);
+                return PhysicalProperties.TABLET_ID_SHUFFLE;
             } else if (distributionInfo instanceof RandomDistributionInfo) {
                 return PhysicalProperties.ANY;
             } else {
@@ -246,8 +254,9 @@ public class PhysicalOlapTableSink<CHILD_TYPE extends Plan> extends PhysicalSink
 
     @Override
     public PhysicalOlapTableSink<Plan> resetLogicalProperties() {
-        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs, singleReplicaLoad,
-                isPartialUpdate, isFromNativeInsertStmt, groupExpression,
-                        null, physicalProperties, statistics, child());
+        return new PhysicalOlapTableSink<>(database, targetTable, cols, partitionIds, outputExprs,
+                singleReplicaLoad, isPartialUpdate, dmlCommandType, partitionExprList,
+                syncMvWhereClauses, targetTableSlots, groupExpression, null, physicalProperties,
+                statistics, child());
     }
 }

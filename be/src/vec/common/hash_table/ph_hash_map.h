@@ -22,9 +22,7 @@
 #include <boost/noncopyable.hpp>
 #include <span>
 
-#include "vec/aggregate_functions/aggregate_function.h"
 #include "vec/common/hash_table/hash.h"
-#include "vec/common/hash_table/hash_table_utils.h"
 #include "vec/common/hash_table/phmap_fwd_decl.h"
 
 template <typename Key, typename Mapped>
@@ -32,8 +30,7 @@ ALWAYS_INLINE inline auto lookup_result_get_mapped(std::pair<const Key, Mapped>*
     return &(it->second);
 }
 
-template <typename Key, typename Mapped, typename HashMethod = DefaultHash<Key>,
-          bool PartitionedHashTable = false>
+template <typename Key, typename Mapped, typename HashMethod = DefaultHash<Key>>
 class PHHashMap : private boost::noncopyable {
 public:
     using Self = PHHashMap;
@@ -43,6 +40,7 @@ public:
 
     using key_type = Key;
     using mapped_type = Mapped;
+    using Value = Mapped;
     using value_type = std::pair<const Key, Mapped>;
 
     using LookupResult = std::pair<const Key, Mapped>*;
@@ -60,9 +58,6 @@ public:
     PHHashMap& operator=(PHHashMap&& rhs) {
         _hash_map.clear();
         _hash_map = std::move(rhs._hash_map);
-        std::swap(_need_partition, rhs._need_partition);
-        std::swap(_partitioned_threshold, rhs._partitioned_threshold);
-
         return *this;
     }
 
@@ -103,8 +98,6 @@ public:
 
         auto get_ptr() const { return this; }
         size_t get_hash() const { return base_iterator->get_hash(); }
-
-        size_t get_collision_chain_length() const { return 0; }
     };
 
     class iterator : public iterator_base<iterator, false> {
@@ -134,19 +127,11 @@ public:
             inserted = true;
             ctor(key_holder, nullptr);
         });
-
-        if constexpr (PartitionedHashTable) {
-            _check_if_need_partition();
-        }
     }
 
     template <typename KeyHolder, typename Func>
     void ALWAYS_INLINE lazy_emplace(KeyHolder&& key_holder, LookupResult& it, Func&& f) {
         it = &*_hash_map.lazy_emplace(key_holder, [&](const auto& ctor) { f(ctor, key_holder); });
-
-        if constexpr (PartitionedHashTable) {
-            _check_if_need_partition();
-        }
     }
 
     template <typename KeyHolder>
@@ -161,10 +146,6 @@ public:
                 ctor(key, mapped_type());
             }
         });
-
-        if constexpr (PartitionedHashTable) {
-            _check_if_need_partition();
-        }
     }
 
     template <typename KeyHolder, typename Func>
@@ -172,16 +153,10 @@ public:
                                     Func&& f) {
         it = &*_hash_map.lazy_emplace_with_hash(key, hash_value,
                                                 [&](const auto& ctor) { f(ctor, key, key); });
-
-        if constexpr (PartitionedHashTable) {
-            _check_if_need_partition();
-        }
     }
 
-    void ALWAYS_INLINE insert(const Key& key, size_t hash_value, const Mapped& value) {
-        auto it = &*_hash_map.lazy_emplace_with_hash(key, hash_value,
-                                                     [&](const auto& ctor) { ctor(key, value); });
-        it->second = value;
+    void ALWAYS_INLINE insert(const Key& key, const Mapped& value) {
+        _hash_map.lazy_emplace(key, [&](const auto& ctor) { ctor(key, value); });
     }
 
     template <typename KeyHolder>
@@ -203,12 +178,6 @@ public:
         _hash_map.prefetch_hash(hash_value);
     }
 
-    /// Call func(const Key &, Mapped &) for each hash map element.
-    template <typename Func>
-    void for_each_value(Func&& func) {
-        for (auto& v : *this) func(v.get_first(), v.get_second());
-    }
-
     /// Call func(Mapped &) for each hash map element.
     template <typename Func>
     void for_each_mapped(Func&& func) {
@@ -219,8 +188,6 @@ public:
         const auto capacity = _hash_map.capacity();
         return capacity * sizeof(typename HashMapImpl::slot_type);
     }
-
-    size_t get_buffer_size_in_cells() const { return _hash_map.capacity(); }
 
     bool add_elem_size_overflow(size_t row) const {
         const auto capacity = _hash_map.capacity();
@@ -235,43 +202,12 @@ public:
     }
     bool has_null_key_data() const { return false; }
 
-    bool need_partition() { return _need_partition; }
-
-    void set_partitioned_threshold(int threshold) { _partitioned_threshold = threshold; }
-
-    bool check_if_need_partition(size_t bucket_count) {
-        if constexpr (PartitionedHashTable) {
-            return _partitioned_threshold > 0 && bucket_count >= _partitioned_threshold;
-        } else {
-            return false;
-        }
-    }
-
     bool empty() const { return _hash_map.empty(); }
 
     void clear_and_shrink() { _hash_map.clear(); }
 
-    void expanse_for_add_elem(size_t num_elem) { _hash_map.reserve(num_elem); }
+    void reserve(size_t num_elem) { _hash_map.reserve(num_elem); }
 
 private:
-    void _check_if_need_partition() {
-        if (UNLIKELY(check_if_need_partition(_hash_map.size() + 1))) {
-            _need_partition = add_elem_size_overflow(1);
-        }
-    }
-
     HashMapImpl _hash_map;
-    // the bucket count threshold above which it's converted to partioned hash table
-    // > 0: enable convert dynamically
-    // 0: convert is disabled
-    int _partitioned_threshold = 0;
-    // if need resize and bucket count after resize will be >= _partitioned_threshold,
-    // this flag is set to true, and resize does not actually happen,
-    // PartitionedHashTable will convert this hash table to partitioned hash table
-    bool _need_partition;
-};
-
-template <typename Key, typename Mapped, typename Hash, bool PartitionedHashTable>
-struct HashTableTraits<PHHashMap<Key, Mapped, Hash, PartitionedHashTable>> {
-    static constexpr bool is_phmap = true;
 };

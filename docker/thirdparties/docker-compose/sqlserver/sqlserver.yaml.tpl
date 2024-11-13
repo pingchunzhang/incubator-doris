@@ -18,7 +18,7 @@
 version: '3'
 services:
   doris--sqlserver_2022:
-    image: "mcr.microsoft.com/mssql/server:2022-latest"
+    image: "doristhirdpartydocker/mssql-server:2022-latest"
     container_name: "doris--sqlserver_2022"
     ports:
       - ${DOCKER_SQLSERVER_EXTERNAL_PORT}:1433
@@ -62,11 +62,16 @@ services:
       - SA_PASSWORD=Doris123456
     networks:
       - doris--sqlserver_2022
-  hello-world:
-      image: hello-world
-      depends_on:
-        doris--sqlserver_2022:
-          condition: service_healthy
-
+  doris--sqlserver-hello-world:
+    image: hello-world
+    depends_on:
+      doris--sqlserver_2022:
+        condition: service_healthy
+    networks:
+      - doris--sqlserver_2022
 networks:
   doris--sqlserver_2022:
+    ipam:
+      driver: default
+      config:
+        - subnet: 168.42.0.0/24

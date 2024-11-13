@@ -18,6 +18,8 @@
 suite("test_cast") {
     sql 'set enable_nereids_planner=true'
     sql 'set enable_fallback_to_original_planner=false'
+    sql "set disable_nereids_rules=PRUNE_EMPTY_PARTITION"
+
 
     def tbl = "test_cast"
 
@@ -93,5 +95,24 @@ suite("test_cast") {
     test {
         sql "select cast(true as date);"
         result([[null]])
+    }
+    sql """ DROP TABLE IF EXISTS table_decimal38_4;"""
+    sql """
+        CREATE TABLE IF NOT EXISTS table_decimal38_4 (
+            `k0` decimal(38, 4)
+        )
+        DISTRIBUTED BY HASH(`k0`) BUCKETS 5 properties("replication_num" = "1");
+        """
+
+    sql """ DROP TABLE IF EXISTS table_decimal27_9;"""
+    sql """
+        CREATE TABLE IF NOT EXISTS table_decimal27_9 (
+            `k0` decimal(27, 9)
+        )
+        DISTRIBUTED BY HASH(`k0`) BUCKETS 5 properties("replication_num" = "1");
+        """
+    explain {
+        sql """select k0 from table_decimal38_4 union all select k0 from table_decimal27_9;"""
+        contains """AS decimalv3(38,4)"""
     }
 }

@@ -20,9 +20,9 @@
 #include "vec/exec/scan/vmeta_scanner.h"
 
 namespace doris::pipeline {
-
+#include "common/compile_check_begin.h"
 Status MetaScanLocalState::_init_scanners(std::list<vectorized::VScannerSPtr>* scanners) {
-    if (Base::_eos_dependency->read_blocked_by() == nullptr) {
+    if (Base::_eos) {
         return Status::OK();
     }
 
@@ -30,8 +30,7 @@ Status MetaScanLocalState::_init_scanners(std::list<vectorized::VScannerSPtr>* s
 
     for (auto& scan_range : _scan_ranges) {
         std::shared_ptr<vectorized::VMetaScanner> scanner = vectorized::VMetaScanner::create_shared(
-                state(), this, p._tuple_id, scan_range, p._limit_per_scanner, profile(),
-                p._user_identity);
+                state(), this, p._tuple_id, scan_range, p._limit, profile(), p._user_identity);
         RETURN_IF_ERROR(scanner->prepare(state(), _conjuncts));
         scanners->push_back(scanner);
     }
@@ -39,17 +38,18 @@ Status MetaScanLocalState::_init_scanners(std::list<vectorized::VScannerSPtr>* s
     return Status::OK();
 }
 
-void MetaScanLocalState::set_scan_ranges(const std::vector<TScanRangeParams>& scan_ranges) {
+void MetaScanLocalState::set_scan_ranges(RuntimeState* state,
+                                         const std::vector<TScanRangeParams>& scan_ranges) {
     _scan_ranges = scan_ranges;
 }
 
-Status MetaScanLocalState::_process_conjuncts() {
+Status MetaScanLocalState::_process_conjuncts(RuntimeState* state) {
     return Status::OK();
 }
 
-MetaScanOperatorX::MetaScanOperatorX(ObjectPool* pool, const TPlanNode& tnode,
+MetaScanOperatorX::MetaScanOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
                                      const DescriptorTbl& descs)
-        : ScanOperatorX<MetaScanLocalState>(pool, tnode, descs),
+        : ScanOperatorX<MetaScanLocalState>(pool, tnode, operator_id, descs),
           _tuple_id(tnode.meta_scan_node.tuple_id) {
     _output_tuple_id = _tuple_id;
     if (tnode.meta_scan_node.__isset.current_user_ident) {

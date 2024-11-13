@@ -17,14 +17,28 @@
 
 package org.apache.doris.common.util;
 
+import org.apache.doris.common.io.Text;
+import org.apache.doris.persist.gson.GsonUtils;
 import org.apache.doris.thrift.TUnit;
+
+import com.google.gson.annotations.SerializedName;
+
+import java.io.DataInput;
+import java.io.DataOutput;
+import java.io.IOException;
 
 // Counter means indicators field. The counter's name is key, the counter itself is value.
 public class Counter {
+    @SerializedName(value = "value")
     private volatile long value;
+    @SerializedName(value = "type")
     private volatile int type;
-    private volatile boolean remove = false;
+    @SerializedName(value = "level")
     private volatile long level;
+
+    public static Counter read(DataInput input) throws IOException {
+        return GsonUtils.GSON.fromJson(Text.readString(input), Counter.class);
+    }
 
     public long getValue() {
         return value;
@@ -70,6 +84,20 @@ public class Counter {
         this.value += other.value;
     }
 
+    public void minValue(Counter other) {
+        if (other == null) {
+            return;
+        }
+        this.value = Math.min(this.value, other.value);
+    }
+
+    public void maxValue(Counter other) {
+        if (other == null) {
+            return;
+        }
+        this.value = Math.max(this.value, other.value);
+    }
+
     public void divValue(long div) {
         if (div <= 0) {
             return;
@@ -82,15 +110,32 @@ public class Counter {
         return ttype == TUnit.TIME_MS || ttype == TUnit.TIME_NS || ttype == TUnit.TIME_S;
     }
 
-    public void setCanRemove() {
-        this.remove = true;
-    }
-
-    public boolean isRemove() {
-        return this.remove;
-    }
-
     public long getLevel() {
         return this.level;
     }
+
+    public String print() {
+        return RuntimeProfile.printCounter(value, getType());
+    }
+
+    public String toString() {
+        return print();
+    }
+
+    public void write(DataOutput output) throws IOException {
+        Text.writeString(output, GsonUtils.GSON.toJson(this));
+    }
+
+    public boolean equals(Object rhs) {
+        if (this == rhs) {
+            return true;
+        }
+        if (rhs == null || getClass() != rhs.getClass()) {
+            return false;
+        }
+
+        Counter other = (Counter) rhs;
+        return other.value == value && other.type == type && other.level == level;
+    }
+
 }

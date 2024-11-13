@@ -27,14 +27,15 @@ import org.apache.doris.qe.ConnectContext;
 
 import lombok.AllArgsConstructor;
 import lombok.Getter;
+import org.apache.commons.lang3.StringUtils;
 
 /**
  * Drop policy statement.
  * syntax:
- * DROP [ROW] POLICY [IF EXISTS] test_row_policy
+ * DROP [ROW] POLICY [IF EXISTS] test_row_policy ON test_table [FOR user|ROLE role]
  **/
 @AllArgsConstructor
-public class DropPolicyStmt extends DdlStmt {
+public class DropPolicyStmt extends DdlStmt implements NotFallbackInParser {
 
     @Getter
     private final PolicyTypeEnum type;
@@ -45,12 +46,39 @@ public class DropPolicyStmt extends DdlStmt {
     @Getter
     private final String policyName;
 
+    @Getter
+    private final TableName tableName;
+
+    @Getter
+    private final UserIdentity user;
+
+    @Getter
+    private final String roleName;
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
         super.analyze(analyzer);
-        // check auth
-        if (!Env.getCurrentEnv().getAccessManager().checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, "ADMIN");
+        switch (type) {
+            case STORAGE:
+                // check auth
+                if (!Env.getCurrentEnv().getAccessManager()
+                        .checkGlobalPriv(ConnectContext.get(), PrivPredicate.ADMIN)) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+                            PrivPredicate.ADMIN.getPrivs().toString());
+                }
+                break;
+            case ROW:
+            default:
+                tableName.analyze(analyzer);
+                if (user != null) {
+                    user.analyze();
+                }
+                // check auth
+                if (!Env.getCurrentEnv().getAccessManager()
+                        .checkGlobalPriv(ConnectContext.get(), PrivPredicate.GRANT)) {
+                    ErrorReport.reportAnalysisException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR,
+                            PrivPredicate.GRANT.getPrivs().toString());
+                }
         }
     }
 
@@ -62,6 +90,24 @@ public class DropPolicyStmt extends DdlStmt {
             sb.append("IF EXISTS ");
         }
         sb.append(policyName);
+        switch (type) {
+            case STORAGE:
+                break;
+            case ROW:
+            default:
+                sb.append(" ON ").append(tableName.toSql());
+                if (user != null) {
+                    sb.append(" FOR ").append(user.getQualifiedUser());
+                }
+                if (StringUtils.isEmpty(roleName)) {
+                    sb.append(" FOR ROLE ").append(roleName);
+                }
+        }
         return sb.toString();
+    }
+
+    @Override
+    public StmtType stmtType() {
+        return StmtType.DROP;
     }
 }

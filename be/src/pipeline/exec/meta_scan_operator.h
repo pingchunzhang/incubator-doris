@@ -24,11 +24,8 @@
 #include "common/status.h"
 #include "operator.h"
 #include "pipeline/exec/scan_operator.h"
-#include "pipeline/pipeline_x/operator.h"
-#include "vec/exec/scan/vscan_node.h"
 
 namespace doris {
-class ExecNode;
 
 namespace vectorized {
 class NewOlapScanner;
@@ -48,16 +45,18 @@ public:
 private:
     friend class vectorized::NewOlapScanner;
 
-    void set_scan_ranges(const std::vector<TScanRangeParams>& scan_ranges) override;
+    void set_scan_ranges(RuntimeState* state,
+                         const std::vector<TScanRangeParams>& scan_ranges) override;
     Status _init_scanners(std::list<vectorized::VScannerSPtr>* scanners) override;
-    Status _process_conjuncts() override;
+    Status _process_conjuncts(RuntimeState* state) override;
 
     std::vector<TScanRangeParams> _scan_ranges;
 };
 
 class MetaScanOperatorX final : public ScanOperatorX<MetaScanLocalState> {
 public:
-    MetaScanOperatorX(ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs);
+    MetaScanOperatorX(ObjectPool* pool, const TPlanNode& tnode, int operator_id,
+                      const DescriptorTbl& descs);
 
 private:
     friend class MetaScanLocalState;

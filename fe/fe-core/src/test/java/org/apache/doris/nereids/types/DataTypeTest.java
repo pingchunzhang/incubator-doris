@@ -557,14 +557,16 @@ public class DataTypeTest {
         Assertions.assertEquals("smallint", SmallIntType.INSTANCE.simpleString());
         Assertions.assertEquals("int", IntegerType.INSTANCE.simpleString());
         Assertions.assertEquals("bigint", BigIntType.INSTANCE.simpleString());
+        Assertions.assertEquals("signed", BigIntType.SIGNED.simpleString());
         Assertions.assertEquals("largeint", LargeIntType.INSTANCE.simpleString());
+        Assertions.assertEquals("unsigned", LargeIntType.UNSIGNED.simpleString());
         Assertions.assertEquals("fractional", FractionalType.INSTANCE.simpleString());
         Assertions.assertEquals("float", FloatType.INSTANCE.simpleString());
         Assertions.assertEquals("double", DoubleType.INSTANCE.simpleString());
         Assertions.assertEquals("decimal", DecimalV2Type.SYSTEM_DEFAULT.simpleString());
         Assertions.assertEquals("char", new CharType(10).simpleString());
         Assertions.assertEquals("varchar", VarcharType.SYSTEM_DEFAULT.simpleString());
-        Assertions.assertEquals("string", StringType.INSTANCE.simpleString());
+        Assertions.assertEquals("text", StringType.INSTANCE.simpleString());
         Assertions.assertEquals("date", DateType.INSTANCE.simpleString());
         Assertions.assertEquals("datetime", DateTimeType.INSTANCE.simpleString());
     }

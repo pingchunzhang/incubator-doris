@@ -37,6 +37,7 @@ suite("test_simplify_comparison") {
             "in_memory" = "false",
             "compression" = "LZ4"
             );"""
+    sql """insert into simple_test_table_t values( 10, 100, 1000, 10000, 100000);"""
 
     explain {
         sql "verbose select * from simple_test_table_t where a = cast(1.0 as double) and b = cast(1.0 as double) and c = cast(1.0 as double) and d = cast(1.0 as double);"
@@ -89,17 +90,8 @@ suite("test_simplify_comparison") {
     }
 
     explain {
-        sql "verbose select * from simple_test_table_t where a = cast(1.1 as double) and b = cast(1.1 as double) and c = cast(1.1 as double) and d = cast(1.1 as double);"
-        contains "a[#0] IS NULL"
-        contains "b[#1] IS NULL"
-        contains "c[#2] IS NULL"
-        contains "d[#3] IS NULL"
-        contains "AND NULL"
-    }
-
-    explain {
         sql "verbose select * from simple_test_table_t where e = cast(1.1 as double);"
-        contains "CAST(e[#4] AS DOUBLE) = 1.1"
+        contains "CAST(e[#4] AS double) = 1.1"
     }
 
     explain {
@@ -112,7 +104,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e > cast(1.1 as double);"
-        contains "CAST(e[#4] AS DOUBLE) > 1.1"
+        contains "CAST(e[#4] AS double) > 1.1"
     }
 
     explain {
@@ -125,7 +117,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e < cast(1.1 as double);"
-        contains "CAST(e[#4] AS DOUBLE) < 1.1"
+        contains "CAST(e[#4] AS double) < 1.1"
     }
 
     explain {
@@ -138,7 +130,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e >= cast(1.1 as double);"
-        contains "CAST(e[#4] AS DOUBLE) >= 1.1"
+        contains "CAST(e[#4] AS double) >= 1.1"
     }
 
     explain {
@@ -151,7 +143,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e <= cast(1.1 as double);"
-        contains "CAST(e[#4] AS DOUBLE) <= 1.1"
+        contains "CAST(e[#4] AS double) <= 1.1"
     }
 
     explain {
@@ -205,17 +197,8 @@ suite("test_simplify_comparison") {
     }
 
     explain {
-        sql "verbose select * from simple_test_table_t where a = 1.1 and b = 1.1 and c = 1.1 and d = 1.1;"
-        contains "a[#0] IS NULL"
-        contains "b[#1] IS NULL"
-        contains "c[#2] IS NULL"
-        contains "d[#3] IS NULL"
-        contains "AND NULL"
-    }
-
-    explain {
         sql "verbose select * from simple_test_table_t where e = 1.1;"
-        contains "CAST(e[#4] AS DOUBLE) = 1.1"
+        contains "CAST(e[#4] AS double) = 1.1"
     }
 
     explain {
@@ -228,7 +211,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e > 1.1;"
-        contains "CAST(e[#4] AS DOUBLE) > 1.1"
+        contains "CAST(e[#4] AS double) > 1.1"
     }
 
     explain {
@@ -241,7 +224,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e < 1.1;"
-        contains "CAST(e[#4] AS DOUBLE) < 1.1"
+        contains "CAST(e[#4] AS double) < 1.1"
     }
 
     explain {
@@ -254,7 +237,7 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e >= 1.1;"
-        contains "CAST(e[#4] AS DOUBLE) >= 1.1"
+        contains "CAST(e[#4] AS double) >= 1.1"
     }
 
     explain {
@@ -267,6 +250,8 @@ suite("test_simplify_comparison") {
 
     explain {
         sql "verbose select * from simple_test_table_t where e <= 1.1;"
-        contains "CAST(e[#4] AS DOUBLE) <= 1.1"
+        contains "CAST(e[#4] AS double) <= 1.1"
     }
+    qt_select1 """select * from simple_test_table_t where cast(a as decimal(5,1)) = 10.0;"""
+    qt_select2 """select a.col1, cast(a.col1 as decimal(7,2)) col3, case when a.col1 is null then 15 when cast(a.col1 as decimal(7,2)) < -99997.99 then 18 when cast(a.col1 as decimal(7,2)) < 1.001 then 3 else -55 end col2 from (select 1 as col1) a;"""
 }

@@ -24,15 +24,11 @@
 #include "vec/exprs/vexpr.h"
 #include "vec/exprs/vexpr_context.h"
 
-namespace doris {
-class DataSink;
-} // namespace doris
-
 namespace doris::pipeline {
-
-JdbcTableSinkOperatorX::JdbcTableSinkOperatorX(const RowDescriptor& row_desc,
+#include "common/compile_check_begin.h"
+JdbcTableSinkOperatorX::JdbcTableSinkOperatorX(const RowDescriptor& row_desc, int operator_id,
                                                const std::vector<TExpr>& t_output_expr)
-        : DataSinkOperatorX(0), _row_desc(row_desc), _t_output_expr(t_output_expr) {}
+        : DataSinkOperatorX(operator_id, 0), _row_desc(row_desc), _t_output_expr(t_output_expr) {}
 
 Status JdbcTableSinkOperatorX::init(const TDataSink& thrift_sink) {
     RETURN_IF_ERROR(DataSinkOperatorX<JdbcTableSinkLocalState>::init(thrift_sink));
@@ -41,36 +37,19 @@ Status JdbcTableSinkOperatorX::init(const TDataSink& thrift_sink) {
     return Status::OK();
 }
 
-Status JdbcTableSinkOperatorX::prepare(RuntimeState* state) {
-    RETURN_IF_ERROR(DataSinkOperatorX<JdbcTableSinkLocalState>::prepare(state));
-    // Prepare the exprs to run.
-    RETURN_IF_ERROR(vectorized::VExpr::prepare(_output_vexpr_ctxs, state, _row_desc));
-    return Status::OK();
-}
-
 Status JdbcTableSinkOperatorX::open(RuntimeState* state) {
     RETURN_IF_ERROR(DataSinkOperatorX<JdbcTableSinkLocalState>::open(state));
-    // Prepare the exprs to run.
+    RETURN_IF_ERROR(vectorized::VExpr::prepare(_output_vexpr_ctxs, state, _row_desc));
     RETURN_IF_ERROR(vectorized::VExpr::open(_output_vexpr_ctxs, state));
     return Status::OK();
 }
 
-Status JdbcTableSinkOperatorX::sink(RuntimeState* state, vectorized::Block* block,
-                                    SourceState source_state) {
-    CREATE_SINK_LOCAL_STATE_RETURN_IF_ERROR(local_state);
-    SCOPED_TIMER(local_state.profile()->total_time_counter());
-    RETURN_IF_ERROR(local_state.sink(state, block, source_state));
+Status JdbcTableSinkOperatorX::sink(RuntimeState* state, vectorized::Block* block, bool eos) {
+    auto& local_state = get_local_state(state);
+    SCOPED_TIMER(local_state.exec_time_counter());
+    COUNTER_UPDATE(local_state.rows_input_counter(), (int64_t)block->rows());
+    RETURN_IF_ERROR(local_state.sink(state, block, eos));
     return Status::OK();
-}
-
-WriteDependency* JdbcTableSinkOperatorX::wait_for_dependency(RuntimeState* state) {
-    CREATE_SINK_LOCAL_STATE_RETURN_NULL_IF_ERROR(local_state);
-    return local_state.write_blocked_by();
-}
-
-FinishDependency* JdbcTableSinkOperatorX::finish_blocked_by(RuntimeState* state) const {
-    auto& local_state = state->get_sink_local_state(id())->cast<JdbcTableSinkLocalState>();
-    return local_state._finish_dependency->finish_blocked_by();
 }
 
 } // namespace doris::pipeline

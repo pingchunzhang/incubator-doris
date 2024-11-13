@@ -22,6 +22,7 @@ import org.apache.doris.analysis.StorageBackend;
 import org.apache.doris.analysis.StorageBackend.StorageType;
 import org.apache.doris.catalog.HdfsResource;
 import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.FeConstants;
 import org.apache.doris.common.util.URI;
 import org.apache.doris.thrift.TFileType;
 
@@ -60,7 +61,6 @@ public class HdfsTableValuedFunction extends ExternalFileTableValuedFunction {
         // 3. analyze other properties
         for (String key : otherProps.keySet()) {
             if (HdfsResource.HADOOP_FS_NAME.equalsIgnoreCase(key)) {
-                // because HADOOP_FS_NAME contains upper and lower case
                 locationProperties.put(HdfsResource.HADOOP_FS_NAME, otherProps.get(key));
             } else {
                 locationProperties.put(key, otherProps.get(key));
@@ -71,8 +71,10 @@ public class HdfsTableValuedFunction extends ExternalFileTableValuedFunction {
             locationProperties.put(HdfsResource.HADOOP_FS_NAME, uri.getScheme() + "://" + uri.getAuthority());
         }
 
-        // 4. parse file
-        parseFile();
+        if (!FeConstants.runningUnitTest) {
+            // 4. parse file
+            parseFile();
+        }
     }
 
     // =========== implement abstract methods of ExternalFileTableValuedFunction =================

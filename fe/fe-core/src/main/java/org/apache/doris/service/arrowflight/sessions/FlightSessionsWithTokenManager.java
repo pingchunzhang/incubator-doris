@@ -17,6 +17,8 @@
 
 package org.apache.doris.service.arrowflight.sessions;
 
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.util.Util;
 import org.apache.doris.qe.ConnectContext;
 import org.apache.doris.service.ExecuteEnv;
 import org.apache.doris.service.arrowflight.tokens.FlightTokenDetails;
@@ -26,43 +28,55 @@ import org.apache.arrow.flight.CallStatus;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.concurrent.atomic.AtomicInteger;
+
 public class FlightSessionsWithTokenManager implements FlightSessionsManager {
     private static final Logger LOG = LogManager.getLogger(FlightSessionsWithTokenManager.class);
 
     private final FlightTokenManager flightTokenManager;
+    private final AtomicInteger nextConnectionId;
 
     public FlightSessionsWithTokenManager(FlightTokenManager flightTokenManager) {
         this.flightTokenManager = flightTokenManager;
+        this.nextConnectionId = new AtomicInteger(0);
     }
 
     @Override
     public ConnectContext getConnectContext(String peerIdentity) {
-        ConnectContext connectContext = ExecuteEnv.getInstance().getScheduler().getContext(peerIdentity);
-        if (null == connectContext) {
-            connectContext = createConnectContext(peerIdentity);
+        try {
+            ConnectContext connectContext = ExecuteEnv.getInstance().getScheduler().getContext(peerIdentity);
             if (null == connectContext) {
-                flightTokenManager.invalidateToken(peerIdentity);
-                String err = "UserSession expire after access, need reauthorize.";
-                LOG.error(err);
-                throw CallStatus.UNAUTHENTICATED.withDescription(err).toRuntimeException();
+                connectContext = createConnectContext(peerIdentity);
+                return connectContext;
             }
             return connectContext;
+        } catch (Exception e) {
+            LOG.warn("get ConnectContext failed, " + e.getMessage(), e);
+            throw CallStatus.INTERNAL.withDescription(Util.getRootCauseMessage(e)).withCause(e).toRuntimeException();
         }
-        return connectContext;
     }
 
     @Override
     public ConnectContext createConnectContext(String peerIdentity) {
-        try {
-            final FlightTokenDetails flightTokenDetails = flightTokenManager.validateToken(peerIdentity);
-            if (flightTokenDetails.getCreatedSession()) {
-                return null;
-            }
-            return FlightSessionsManager.buildConnectContext(peerIdentity, flightTokenDetails.getUserIdentity(),
-                    flightTokenDetails.getRemoteIp());
-        } catch (IllegalArgumentException e) {
-            LOG.error("Bearer token validation failed.", e);
-            throw CallStatus.UNAUTHENTICATED.toRuntimeException();
+        final FlightTokenDetails flightTokenDetails = flightTokenManager.validateToken(peerIdentity);
+        if (flightTokenDetails.getCreatedSession()) {
+            flightTokenManager.invalidateToken(peerIdentity);
+            throw new IllegalArgumentException("UserSession expire after access, try reconnect, bearer token: "
+                    + peerIdentity + ", a peerIdentity(bearer token) can only create a ConnectContext once. "
+                    + "if ConnectContext is deleted without operation for a long time, it needs to be reconnected "
+                    + "(at the same time obtain a new bearer token).");
         }
+        flightTokenDetails.setCreatedSession(true);
+        ConnectContext connectContext = FlightSessionsManager.buildConnectContext(peerIdentity,
+                flightTokenDetails.getUserIdentity(), flightTokenDetails.getRemoteIp());
+        connectContext.setConnectionId(nextConnectionId.getAndAdd(1));
+        connectContext.resetLoginTime();
+        if (!ExecuteEnv.getInstance().getScheduler().registerConnection(connectContext)) {
+            String err = "Reach limit of connections, increase `qe_max_connection` in fe.conf, or decrease "
+                    + "`arrow_flight_token_cache_size` to evict unused bearer tokens and it connections faster";
+            connectContext.getState().setError(ErrorCode.ERR_TOO_MANY_USER_CONNECTIONS, err);
+            throw new IllegalArgumentException(err);
+        }
+        return connectContext;
     }
 }

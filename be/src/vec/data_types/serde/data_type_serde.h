@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include <rapidjson/document.h>
 #include <stdint.h>
 
 #include <memory>
@@ -31,6 +32,7 @@
 #include "vec/common/pod_array.h"
 #include "vec/common/pod_array_fwd.h"
 #include "vec/common/string_buffer.hpp"
+#include "vec/core/field.h"
 #include "vec/core/types.h"
 #include "vec/io/reader_buffer.h"
 
@@ -45,32 +47,32 @@ namespace orc {
 struct ColumnVectorBatch;
 } // namespace orc
 
-#define SERIALIZE_COLUMN_TO_JSON()                                                          \
-    for (size_t i = start_idx; i < end_idx; ++i) {                                          \
-        if (i != start_idx) {                                                               \
-            bw.write(options.field_delim.data(), options.field_delim.size());               \
-        }                                                                                   \
-        RETURN_IF_ERROR(serialize_one_cell_to_json(column, i, bw, options, nesting_level)); \
-    }                                                                                       \
+#define SERIALIZE_COLUMN_TO_JSON()                                            \
+    for (size_t i = start_idx; i < end_idx; ++i) {                            \
+        if (i != start_idx) {                                                 \
+            bw.write(options.field_delim.data(), options.field_delim.size()); \
+        }                                                                     \
+        RETURN_IF_ERROR(serialize_one_cell_to_json(column, i, bw, options));  \
+    }                                                                         \
     return Status::OK();
 
-#define DESERIALIZE_COLUMN_FROM_JSON_VECTOR()                                                      \
-    for (int i = 0; i < slices.size(); ++i) {                                                      \
-        if (Status st = deserialize_one_cell_from_json(column, slices[i], options, nesting_level); \
-            st != Status::OK()) {                                                                  \
-            return st;                                                                             \
-        }                                                                                          \
-        ++*num_deserialized;                                                                       \
+#define DESERIALIZE_COLUMN_FROM_JSON_VECTOR()                                       \
+    for (int i = 0; i < slices.size(); ++i) {                                       \
+        if (Status st = deserialize_one_cell_from_json(column, slices[i], options); \
+            st != Status::OK()) {                                                   \
+            return st;                                                              \
+        }                                                                           \
+        ++*num_deserialized;                                                        \
     }
 
-#define DESERIALIZE_COLUMN_FROM_HIVE_TEXT_VECTOR()                                      \
-    for (int i = 0; i < slices.size(); ++i) {                                           \
-        if (Status st = deserialize_one_cell_from_hive_text(column, slices[i], options, \
-                                                            nesting_level);             \
-            st != Status::OK()) {                                                       \
-            return st;                                                                  \
-        }                                                                               \
-        ++*num_deserialized;                                                            \
+#define DESERIALIZE_COLUMN_FROM_HIVE_TEXT_VECTOR()                                       \
+    for (int i = 0; i < slices.size(); ++i) {                                            \
+        if (Status st = deserialize_one_cell_from_hive_text(                             \
+                    column, slices[i], options, hive_text_complex_type_delimiter_level); \
+            st != Status::OK()) {                                                        \
+            return st;                                                                   \
+        }                                                                                \
+        ++*num_deserialized;                                                             \
     }
 
 #define REALLOC_MEMORY_FOR_ORC_WRITER()                                                  \
@@ -95,6 +97,7 @@ namespace vectorized {
 class IColumn;
 class Arena;
 class IDataType;
+
 // Deserialize means read from different file format or memory format,
 // for example read from arrow, read from parquet.
 // Serialize means write the column cell or the total column into another
@@ -104,7 +107,6 @@ class IDataType;
 // how many cases or files we has to modify when we add a new type. And also
 // it is very difficult to add a new read file format or write file format because
 // the developer does not know how many datatypes has to deal.
-
 class DataTypeSerDe {
 public:
     // Text serialization/deserialization of data types depend on some settings witch we define
@@ -135,16 +137,40 @@ public:
         bool converted_from_string = false;
 
         char escape_char = 0;
+        /**
+         * flags for each byte to indicate if escape is needed.
+         */
+        bool need_escape[256] = {false};
 
         /**
          * only used for export data
          */
         bool _output_object_data = true;
 
-        [[nodiscard]] char get_collection_delimiter(int nesting_level) const {
-            CHECK(0 <= nesting_level && nesting_level <= 153);
+        /**
+         * The format of null value in nested type, eg:
+         *      NULL
+         *      null
+         */
+        const char* null_format = "\\N";
+        int null_len = 2;
 
-            char ans = '\002';
+        /**
+         * The wrapper char for string type in nested type.
+         *  eg, if set to empty, the array<string> will be:
+         *       [abc, def, , hig]
+         *      if set to '"', the array<string> will be:
+         *       ["abc", "def", "", "hig"]
+         */
+        const char* nested_string_wrapper;
+        int wrapper_len;
+
+        [[nodiscard]] char get_collection_delimiter(
+                int hive_text_complex_type_delimiter_level) const {
+            CHECK(0 <= hive_text_complex_type_delimiter_level &&
+                  hive_text_complex_type_delimiter_level <= 153);
+
+            char ans;
             //https://github.com/apache/hive/blob/master/serde/src/java/org/apache/hadoop/hive/serde2/lazy/LazySerDeParameters.java#L250
             //use only control chars that are very unlikely to be part of the string
             // the following might/likely to be used in text files for strings
@@ -153,26 +179,27 @@ public:
             // 12 (form feed, FF, \f, ^L),
             // 13 (carriage return, CR, \r, ^M),
             // 27 (escape, ESC, \e [GCC only], ^[).
-
-            if (nesting_level == 1) {
+            if (hive_text_complex_type_delimiter_level == 0) {
+                ans = field_delim[0];
+            } else if (hive_text_complex_type_delimiter_level == 1) {
                 ans = collection_delim;
-            } else if (nesting_level == 2) {
+            } else if (hive_text_complex_type_delimiter_level == 2) {
                 ans = map_key_delim;
-            } else if (nesting_level <= 7) {
+            } else if (hive_text_complex_type_delimiter_level <= 7) {
                 // [3, 7] -> [4, 8]
-                ans = nesting_level + 1;
-            } else if (nesting_level == 8) {
+                ans = hive_text_complex_type_delimiter_level + 1;
+            } else if (hive_text_complex_type_delimiter_level == 8) {
                 // [8] -> [11]
                 ans = 11;
-            } else if (nesting_level <= 21) {
+            } else if (hive_text_complex_type_delimiter_level <= 21) {
                 // [9, 21] -> [14, 26]
-                ans = nesting_level + 5;
-            } else if (nesting_level <= 25) {
+                ans = hive_text_complex_type_delimiter_level + 5;
+            } else if (hive_text_complex_type_delimiter_level <= 25) {
                 // [22, 25] -> [28, 31]
-                ans = nesting_level + 6;
-            } else if (nesting_level <= 153) {
+                ans = hive_text_complex_type_delimiter_level + 6;
+            } else {
                 // [26, 153] -> [-128, -1]
-                ans = nesting_level + (-26 - 128);
+                ans = hive_text_complex_type_delimiter_level + (-26 - 128);
             }
 
             return ans;
@@ -189,49 +216,74 @@ public:
     // buffer reserves 40 bytes. The reserved space is just to prevent Headp-Buffer-Overflow
     static constexpr size_t BUFFER_RESERVED_SIZE = 40;
 
+    // For the NULL value in the complex type, we use the `null` of the lowercase
+    static const std::string NULL_IN_COMPLEX_TYPE;
+
+    // For the NULL value in the ordinary type in csv file format, we use `\N`
+    static const std::string NULL_IN_CSV_FOR_ORDINARY_TYPE;
+
 public:
-    DataTypeSerDe();
+    DataTypeSerDe(int nesting_level = 1) : _nesting_level(nesting_level) {};
     virtual ~DataTypeSerDe();
     // Text serializer and deserializer with formatOptions to handle different text format
     virtual Status serialize_one_cell_to_json(const IColumn& column, int row_num,
-                                              BufferWritable& bw, FormatOptions& options,
-                                              int nesting_level = 1) const = 0;
+                                              BufferWritable& bw, FormatOptions& options) const = 0;
 
     // this function serialize multi-column to one row text to avoid virtual function call in complex type nested loop
     virtual Status serialize_column_to_json(const IColumn& column, int start_idx, int end_idx,
-                                            BufferWritable& bw, FormatOptions& options,
-                                            int nesting_level = 1) const = 0;
+                                            BufferWritable& bw, FormatOptions& options) const = 0;
 
     virtual Status deserialize_one_cell_from_json(IColumn& column, Slice& slice,
-                                                  const FormatOptions& options,
-                                                  int nesting_level = 1) const = 0;
+                                                  const FormatOptions& options) const = 0;
     // deserialize text vector is to avoid virtual function call in complex type nested loop
     virtual Status deserialize_column_from_json_vector(IColumn& column, std::vector<Slice>& slices,
                                                        int* num_deserialized,
-                                                       const FormatOptions& options,
-                                                       int nesting_level = 1) const = 0;
-
-    virtual Status deserialize_one_cell_from_hive_text(IColumn& column, Slice& slice,
-                                                       const FormatOptions& options,
-                                                       int nesting_level = 1) const {
-        return deserialize_one_cell_from_json(column, slice, options, nesting_level);
-    };
-    virtual Status deserialize_column_from_hive_text_vector(IColumn& column,
-                                                            std::vector<Slice>& slices,
-                                                            int* num_deserialized,
-                                                            const FormatOptions& options,
-                                                            int nesting_level = 1) const {
-        return deserialize_column_from_json_vector(column, slices, num_deserialized, options,
-                                                   nesting_level);
-    };
-    virtual void serialize_one_cell_to_hive_text(const IColumn& column, int row_num,
-                                                 BufferWritable& bw, FormatOptions& options,
-                                                 int nesting_level = 1) const {
-        Status st = serialize_one_cell_to_json(column, row_num, bw, options);
-        if (!st.ok()) {
-            throw doris::Exception(doris::ErrorCode::INTERNAL_ERROR,
-                                   "serialize_one_cell_to_json error: {}", st.to_string());
+                                                       const FormatOptions& options) const = 0;
+    // deserialize fixed values.Repeatedly insert the value row times into the column.
+    virtual Status deserialize_column_from_fixed_json(IColumn& column, Slice& slice, int rows,
+                                                      int* num_deserialized,
+                                                      const FormatOptions& options) const {
+        //In this function implementation, we need to consider the case where rows is 0, 1, and other larger integers.
+        if (rows < 1) [[unlikely]] {
+            return Status::OK();
         }
+        Status st = deserialize_one_cell_from_json(column, slice, options);
+        if (!st.ok()) {
+            *num_deserialized = 0;
+            return st;
+        }
+        if (rows > 1) [[likely]] {
+            insert_column_last_value_multiple_times(column, rows - 1);
+        }
+        *num_deserialized = rows;
+        return Status::OK();
+    }
+    // Insert the last value to the end of this column multiple times.
+    virtual void insert_column_last_value_multiple_times(IColumn& column, int times) const {
+        if (times < 1) [[unlikely]] {
+            return;
+        }
+        //If you try to simplify this operation by using `column.insert_many_from(column, column.size() - 1, rows - 1);`
+        // you are likely to get incorrect data results.
+        MutableColumnPtr dum_col = column.clone_empty();
+        dum_col->insert_from(column, column.size() - 1);
+        column.insert_many_from(*dum_col.get(), 0, times);
+    }
+
+    virtual Status deserialize_one_cell_from_hive_text(
+            IColumn& column, Slice& slice, const FormatOptions& options,
+            int hive_text_complex_type_delimiter_level = 1) const {
+        return deserialize_one_cell_from_json(column, slice, options);
+    };
+    virtual Status deserialize_column_from_hive_text_vector(
+            IColumn& column, std::vector<Slice>& slices, int* num_deserialized,
+            const FormatOptions& options, int hive_text_complex_type_delimiter_level = 1) const {
+        return deserialize_column_from_json_vector(column, slices, num_deserialized, options);
+    };
+    virtual Status serialize_one_cell_to_hive_text(
+            const IColumn& column, int row_num, BufferWritable& bw, FormatOptions& options,
+            int hive_text_complex_type_delimiter_level = 1) const {
+        return serialize_one_cell_to_json(column, row_num, bw, options);
     }
 
     // Protobuf serializer and deserializer
@@ -248,33 +300,54 @@ public:
 
     // MySQL serializer and deserializer
     virtual Status write_column_to_mysql(const IColumn& column, MysqlRowBuffer<false>& row_buffer,
-                                         int row_idx, bool col_const) const = 0;
+                                         int row_idx, bool col_const,
+                                         const FormatOptions& options) const = 0;
 
     virtual Status write_column_to_mysql(const IColumn& column, MysqlRowBuffer<true>& row_buffer,
-                                         int row_idx, bool col_const) const = 0;
+                                         int row_idx, bool col_const,
+                                         const FormatOptions& options) const = 0;
     // Thrift serializer and deserializer
-
-    // CSV serializer and deserializer
 
     // JSON serializer and deserializer
 
     // Arrow serializer and deserializer
     virtual void write_column_to_arrow(const IColumn& column, const NullMap* null_map,
-                                       arrow::ArrayBuilder* array_builder, int start,
-                                       int end) const = 0;
+                                       arrow::ArrayBuilder* array_builder, int start, int end,
+                                       const cctz::time_zone& ctz) const = 0;
     virtual void read_column_from_arrow(IColumn& column, const arrow::Array* arrow_array, int start,
                                         int end, const cctz::time_zone& ctz) const = 0;
 
     // ORC serializer
-    virtual Status write_column_to_orc(const IColumn& column, const NullMap* null_map,
+    virtual Status write_column_to_orc(const std::string& timezone, const IColumn& column,
+                                       const NullMap* null_map,
                                        orc::ColumnVectorBatch* orc_col_batch, int start, int end,
                                        std::vector<StringRef>& buffer_list) const = 0;
     // ORC deserializer
 
     virtual void set_return_object_as_string(bool value) { _return_object_as_string = value; }
 
+    // rapidjson
+    virtual Status write_one_cell_to_json(const IColumn& column, rapidjson::Value& result,
+                                          rapidjson::Document::AllocatorType& allocator,
+                                          Arena& mem_pool, int row_num) const;
+    virtual Status read_one_cell_from_json(IColumn& column, const rapidjson::Value& result) const;
+
 protected:
     bool _return_object_as_string = false;
+    // This parameter indicates what level the serde belongs to and is mainly used for complex types
+    // The default level is 1, and each time you nest, the level increases by 1,
+    // for example: struct<string>
+    // The _nesting_level of StructSerde is 1
+    // The _nesting_level of StringSerde is 2
+    int _nesting_level = 1;
+
+    static void convert_field_to_rapidjson(const vectorized::Field& field, rapidjson::Value& target,
+                                           rapidjson::Document::AllocatorType& allocator);
+    static void convert_array_to_rapidjson(const vectorized::Array& array, rapidjson::Value& target,
+                                           rapidjson::Document::AllocatorType& allocator);
+    static void convert_variant_map_to_rapidjson(const vectorized::VariantMap& array,
+                                                 rapidjson::Value& target,
+                                                 rapidjson::Document::AllocatorType& allocator);
 };
 
 /// Invert values since Arrow interprets 1 as a non-null value, while doris as a null
@@ -284,9 +357,11 @@ inline static NullMap revert_null_map(const NullMap* null_bytemap, size_t start,
         return res;
     }
 
-    res.reserve(end - start);
-    for (size_t i = start; i < end; ++i) {
-        res.emplace_back(!(*null_bytemap)[i]);
+    res.resize(end - start);
+    auto* __restrict src_data = (*null_bytemap).data();
+    auto* __restrict res_data = res.data();
+    for (size_t i = 0; i < res.size(); ++i) {
+        res_data[i] = !src_data[i + start];
     }
     return res;
 }

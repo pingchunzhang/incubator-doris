@@ -16,6 +16,7 @@
 // under the License.
 
 import org.codehaus.groovy.runtime.IOGroovyMethods
+import org.awaitility.Awaitility
 
 suite("test_compaction_agg_keys") {
     def tableName = "compaction_agg_keys_regression_test"
@@ -101,12 +102,12 @@ suite("test_compaction_agg_keys") {
         qt_select_default """ SELECT * FROM ${tableName} t ORDER BY user_id; """
 
         //TabletId,ReplicaId,BackendId,SchemaHash,Version,LstSuccessVersion,LstFailedVersion,LstFailedTime,LocalDataSize,RemoteDataSize,RowCount,State,LstConsistencyCheckTime,CheckVersion,QueryHits,VersionCount,PathHash,MetaUrl,CompactionStatus
-        String[][] tablets = sql """ show tablets from ${tableName}; """
+        def tablets = sql_return_maparray """ show tablets from ${tableName}; """
 
         // trigger compactions for all tablets in ${tableName}
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            backend_id = tablet[2]
+        for (def tablet in tablets) {
+            String tablet_id = tablet.TabletId
+            backend_id = tablet.BackendId
             (code, out, err) = be_run_cumulative_compaction(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id)
             logger.info("Run compaction: code=" + code + ", out=" + out + ", err=" + err)
             assertEquals(code, 0)
@@ -121,28 +122,28 @@ suite("test_compaction_agg_keys") {
         }
 
         // wait for all compactions done
-        for (String[] tablet in tablets) {
-            boolean running = true
-            do {
-                Thread.sleep(1000)
-                String tablet_id = tablet[0]
-                backend_id = tablet[2]
+        for (def tablet in tablets) {
+            Awaitility.await().untilAsserted(() -> {
+                String tablet_id = tablet.TabletId
+                backend_id = tablet.BackendId
                 (code, out, err) = be_get_compaction_status(backendId_to_backendIP.get(backend_id), backendId_to_backendHttpPort.get(backend_id), tablet_id)
                 logger.info("Get compaction status: code=" + code + ", out=" + out + ", err=" + err)
                 assertEquals(code, 0)
 
                 def compactionStatus = parseJson(out.trim())
                 assertEquals("success", compactionStatus.status.toLowerCase())
-                running = compactionStatus.run_status
-            } while (running)
+                return compactionStatus.run_status;                
+
+            });
         }
 
+        def replicaNum = get_table_replica_num(tableName)
+        logger.info("get table replica num: " + replicaNum)
         int rowCount = 0
-        for (String[] tablet in tablets) {
-            String tablet_id = tablet[0]
-            def compactionStatusUrlIndex = 18
+        for (def tablet in tablets) {
+            String tablet_id = tablet.TabletId
 
-            (code, out, err) = curl("GET", tablet[compactionStatusUrlIndex])
+            (code, out, err) = curl("GET", tablet.CompactionStatus)
             logger.info("Show tablets status: code=" + code + ", out=" + out + ", err=" + err)
             
             assertEquals(code, 0)
@@ -152,7 +153,7 @@ suite("test_compaction_agg_keys") {
                 rowCount += Integer.parseInt(rowset.split(" ")[1])
             }
         }
-        assert (rowCount < 8)
+        assert (rowCount < 8 * replicaNum)
         qt_select_default2 """ SELECT * FROM ${tableName} t ORDER BY user_id; """
     } finally {
         try_sql("DROP TABLE IF EXISTS ${tableName}")

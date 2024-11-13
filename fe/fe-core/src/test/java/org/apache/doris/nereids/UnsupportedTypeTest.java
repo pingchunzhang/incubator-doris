@@ -30,7 +30,7 @@ public class UnsupportedTypeTest extends TestWithFeService {
     @Override
     protected void runBeforeAll() throws Exception {
         createDatabase("test");
-        connectContext.setDatabase("default_cluster:test");
+        connectContext.setDatabase("test");
         createTables(
                 "create table type_tb (\n"
                 + "            id int NOT NULL, \n"
@@ -94,7 +94,7 @@ public class UnsupportedTypeTest extends TestWithFeService {
     }
 
     private void runPlanner(String sql) {
-        new NereidsPlanner(MemoTestUtils.createStatementContext(connectContext, sql)).plan(
+        new NereidsPlanner(MemoTestUtils.createStatementContext(connectContext, sql)).planWithLock(
                 new NereidsParser().parseSingle(sql),
                 PhysicalProperties.ANY
         );

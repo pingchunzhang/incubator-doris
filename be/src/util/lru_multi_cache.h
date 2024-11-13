@@ -29,7 +29,6 @@
 #include <tuple>
 #include <unordered_map>
 
-#include "gutil/hash/hash.h"
 #include "gutil/macros.h"
 #include "util/spinlock.h"
 
@@ -237,7 +236,7 @@ public:
         void destroy();
 
     private:
-        ValueType_internal* _p_value_internal;
+        ValueType_internal* _p_value_internal = nullptr;
     };
 };
 

@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-suite('test_cast') {
+suite('test_cast', "arrow_flight_sql") {
     def date = "date '2020-01-01'"
     def datev2 = "datev2 '2020-01-01'"
     def datetime = "timestamp '2020-01-01 12:34:45'"
@@ -46,6 +46,22 @@ suite('test_cast') {
         sql " select cast('-9999e-1' as DECIMALV3(2, 1)) "
         result([[-9.9]])
     }
+
+    // round
+    //result([[123456789]])
+    qt_sql_1 " select cast('123456789.0' as DECIMALV3(9, 0)) "
+
+    // result([[999999999]])
+    qt_sql_2 " select cast('999999999.0' as DECIMALV3(9, 0)) "
+
+    // result([[123456790]])
+    qt_sql_3 " select cast('123456789.9' as DECIMALV3(9, 0)) "
+
+    // result([[926895541712428044]])
+    qt_sql_4 " select cast('926895541712428044.1' as DECIMALV3(18,0)); "
+
+    // result([[99999999999999999.9]])
+    qt_sql_5 " select cast('926895541712428044.1' as DECIMAL(18,1)); "
 
     // leading-zeros
     qt_sql_decimalv3 """select CAST('0.29401599228723063' AS DECIMALV3)"""
@@ -129,4 +145,24 @@ suite('test_cast') {
         sql "select * from ${tbl} where case when k0 = 101 then 'true' else 1 end"
         result([[101]])
     }
+
+    sql "DROP TABLE IF EXISTS test_json"
+    sql """
+        CREATE TABLE IF NOT EXISTS test_json (
+          id INT not null,
+          j JSON not null,
+          v variant not null
+        )
+        DUPLICATE KEY(id)
+        DISTRIBUTED BY HASH(id) BUCKETS 10
+        PROPERTIES("replication_num" = "1");
+    """
+
+    sql """
+        INSERT INTO test_json VALUES(26, '{"k1":"v1", "k2": 200}', '[\"asd]');
+    """
+    sql "sync"
+    sql "Select cast(j as int) from test_json"
+    sql "select cast(v as int) from test_json"
+    sql "DROP TABLE IF EXISTS test_json"
 }

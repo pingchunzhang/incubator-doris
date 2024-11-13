@@ -18,49 +18,47 @@
 package org.apache.doris.statistics;
 
 import org.apache.doris.catalog.Env;
-import org.apache.doris.common.Config;
 import org.apache.doris.common.ThreadPoolManager;
 import org.apache.doris.common.ThreadPoolManager.BlockedPolicy;
+import org.apache.doris.statistics.util.StatisticsUtil;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.Comparator;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.Future;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
-public class AnalysisTaskExecutor extends Thread {
+public class AnalysisTaskExecutor {
 
     private static final Logger LOG = LogManager.getLogger(AnalysisTaskExecutor.class);
 
-    private final ThreadPoolExecutor executors;
+    protected final ThreadPoolExecutor executors;
 
     private final BlockingQueue<AnalysisTaskWrapper> taskQueue =
             new PriorityBlockingQueue<AnalysisTaskWrapper>(20,
                     Comparator.comparingLong(AnalysisTaskWrapper::getStartTime));
 
     public AnalysisTaskExecutor(int simultaneouslyRunningTaskNum) {
+        this(simultaneouslyRunningTaskNum, Integer.MAX_VALUE);
+    }
+
+    public AnalysisTaskExecutor(int simultaneouslyRunningTaskNum, int taskQueueSize) {
         if (!Env.isCheckpointThread()) {
             executors = ThreadPoolManager.newDaemonThreadPool(
                     simultaneouslyRunningTaskNum,
                     simultaneouslyRunningTaskNum, 0,
-                    TimeUnit.DAYS, new LinkedBlockingQueue<>(),
-                    new BlockedPolicy("Analysis Job Executor", Integer.MAX_VALUE),
+                    TimeUnit.DAYS, new LinkedBlockingQueue<>(taskQueueSize),
+                    new BlockedPolicy("Analysis Job Executor Block Policy", Integer.MAX_VALUE),
                     "Analysis Job Executor", true);
+            cancelExpiredTask();
         } else {
             executors = null;
         }
-    }
-
-    @Override
-    public void run() {
-        if (Env.isCheckpointThread()) {
-            return;
-        }
-        cancelExpiredTask();
     }
 
     private void cancelExpiredTask() {
@@ -72,24 +70,28 @@ public class AnalysisTaskExecutor extends Thread {
 
     private void doCancelExpiredJob() {
         for (;;) {
-            try {
-                AnalysisTaskWrapper taskWrapper = taskQueue.take();
-                try {
-                    long timeout = TimeUnit.HOURS.toMillis(Config.analyze_task_timeout_in_hours)
-                            - (System.currentTimeMillis() - taskWrapper.getStartTime());
-                    taskWrapper.get(timeout < 0 ? 0 : timeout, TimeUnit.MILLISECONDS);
-                } catch (Exception e) {
-                    taskWrapper.cancel(e.getMessage());
-                }
-            } catch (Throwable throwable) {
-                LOG.warn(throwable);
-            }
+            tryToCancel();
         }
     }
 
-    public void submitTask(BaseAnalysisTask task) {
+    protected void tryToCancel() {
+        try {
+            AnalysisTaskWrapper taskWrapper = taskQueue.take();
+            try {
+                long timeout = TimeUnit.SECONDS.toMillis(StatisticsUtil.getAnalyzeTimeout())
+                        - (System.currentTimeMillis() - taskWrapper.getStartTime());
+                taskWrapper.get(timeout < 0 ? 0 : timeout, TimeUnit.MILLISECONDS);
+            } catch (Exception e) {
+                taskWrapper.cancel(e.getMessage());
+            }
+        } catch (Throwable throwable) {
+            LOG.warn("cancel analysis task failed", throwable);
+        }
+    }
+
+    public Future<?> submitTask(BaseAnalysisTask task) {
         AnalysisTaskWrapper taskWrapper = new AnalysisTaskWrapper(this, task);
-        executors.submit(taskWrapper);
+        return executors.submit(taskWrapper);
     }
 
     public void putJob(AnalysisTaskWrapper wrapper) throws Exception {
@@ -103,5 +105,10 @@ public class AnalysisTaskExecutor extends Thread {
     public void clear() {
         executors.getQueue().clear();
         taskQueue.clear();
+    }
+
+    // For unit test only.
+    public BlockingQueue<AnalysisTaskWrapper> getTaskQueue() {
+        return taskQueue;
     }
 }

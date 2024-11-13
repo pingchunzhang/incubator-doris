@@ -38,14 +38,13 @@
 #include "vec/core/types.h"
 #include "vec/data_types/data_type.h"
 #include "vec/functions/function.h"
-namespace doris {
 
-namespace vectorized {
+namespace doris::vectorized {
 
 class JavaUdfPreparedFunction : public PreparedFunctionImpl {
 public:
     using execute_call_back = std::function<Status(FunctionContext* context, Block& block,
-                                                   const ColumnNumbers& arguments, size_t result,
+                                                   const ColumnNumbers& arguments, uint32_t result,
                                                    size_t input_rows_count)>;
 
     explicit JavaUdfPreparedFunction(const execute_call_back& func, const std::string& name)
@@ -55,7 +54,7 @@ public:
 
 protected:
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const override {
+                        uint32_t result, size_t input_rows_count) const override {
         return callback_function(context, block, arguments, result, input_rows_count);
     }
 
@@ -88,73 +87,70 @@ public:
     const DataTypePtr& get_return_type() const override { return _return_type; }
 
     PreparedFunctionPtr prepare(FunctionContext* context, const Block& sample_block,
-                                const ColumnNumbers& arguments, size_t result) const override {
+                                const ColumnNumbers& arguments, uint32_t result) const override {
         return std::make_shared<JavaUdfPreparedFunction>(
-                std::bind<Status>(&JavaFunctionCall::execute_impl, this, std::placeholders::_1,
-                                  std::placeholders::_2, std::placeholders::_3,
-                                  std::placeholders::_4, std::placeholders::_5),
+                [this](auto&& PH1, auto&& PH2, auto&& PH3, auto&& PH4, auto&& PH5) {
+                    return JavaFunctionCall::execute_impl(
+                            std::forward<decltype(PH1)>(PH1), std::forward<decltype(PH2)>(PH2),
+                            std::forward<decltype(PH3)>(PH3), std::forward<decltype(PH4)>(PH4),
+                            std::forward<decltype(PH5)>(PH5));
+                },
                 fn_.name.function_name);
     }
 
     Status open(FunctionContext* context, FunctionContext::FunctionStateScope scope) override;
 
     Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
-                        size_t result, size_t input_rows_count) const;
+                        uint32_t result, size_t input_rows_count) const;
 
     Status close(FunctionContext* context, FunctionContext::FunctionStateScope scope) override;
 
-    bool is_deterministic() const override { return false; }
-
-    bool is_deterministic_in_scope_of_query() const override { return false; }
-
     bool is_use_default_implementation_for_constants() const override { return true; }
+
+    bool is_udf_function() const override { return true; }
 
 private:
     const TFunction& fn_;
     const DataTypes _argument_types;
     const DataTypePtr _return_type;
 
-    struct JniEnv {
-        /// Global class reference to the UdfExecutor Java class and related method IDs. Set in
-        /// Init(). These have the lifetime of the process (i.e. 'executor_cl_' is never freed).
-        jclass executor_cl;
-        jmethodID executor_ctor_id;
-        jmethodID executor_evaluate_id;
-        jmethodID executor_close_id;
-    };
-
     struct JniContext {
         // Do not save parent directly, because parent is in VExpr, but jni context is in FunctionContext
         // The deconstruct sequence is not determined, it will core.
         // JniContext's lifecycle should same with function context, not related with expr
-        jclass executor_cl_;
-        jmethodID executor_close_id_;
+        jclass executor_cl;
+        jmethodID executor_ctor_id;
+        jmethodID executor_evaluate_id;
+        jmethodID executor_close_id;
         jobject executor = nullptr;
         bool is_closed = false;
+        bool open_successes = false;
 
-        JniContext(int64_t num_args, jclass executor_cl, jmethodID executor_close_id)
-                : executor_cl_(executor_cl), executor_close_id_(executor_close_id) {}
+        JniContext() = default;
 
-        void close() {
+        Status close() {
+            if (!open_successes) {
+                LOG_WARNING("maybe open failed, need check the reason");
+                return Status::OK(); //maybe open failed, so can't call some jni
+            }
             if (is_closed) {
-                return;
+                return Status::OK();
             }
             VLOG_DEBUG << "Free resources for JniContext";
-            JNIEnv* env;
+            JNIEnv* env = nullptr;
             Status status = JniUtil::GetJNIEnv(&env);
-            if (!status.ok()) {
+            if (!status.ok() || env == nullptr) {
                 LOG(WARNING) << "errors while get jni env " << status;
-                return;
+                return status;
             }
-            env->CallNonvirtualVoidMethodA(executor, executor_cl_, executor_close_id_, NULL);
+            env->CallNonvirtualVoidMethodA(executor, executor_cl, executor_close_id, nullptr);
             env->DeleteGlobalRef(executor);
-            env->DeleteGlobalRef(executor_cl_);
-            Status s = JniUtil::GetJniExceptionMsg(env);
-            if (!s.ok()) LOG(WARNING) << s;
+            env->DeleteGlobalRef(executor_cl);
+            RETURN_IF_ERROR(JniUtil::GetJniExceptionMsg(env));
             is_closed = true;
+            return Status::OK();
         }
     };
 };
 
-} // namespace vectorized
-} // namespace doris
+} // namespace doris::vectorized

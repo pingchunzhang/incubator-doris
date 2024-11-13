@@ -17,12 +17,12 @@
 
 package org.apache.doris.common.jni.vec;
 
-
 import org.apache.doris.common.jni.utils.OffHeap;
 import org.apache.doris.common.jni.utils.TypeNativeBytes;
 import org.apache.doris.common.jni.vec.ColumnType.Type;
 import org.apache.doris.common.jni.vec.NativeColumnValue.NativeValue;
 
+import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 import java.math.BigDecimal;
@@ -213,8 +213,12 @@ public class VectorColumn {
         return offsets;
     }
 
-    public ColumnType.Type getColumnTyp() {
+    public ColumnType.Type getColumnPrimitiveType() {
         return columnType.getType();
+    }
+
+    public ColumnType getColumnType() {
+        return columnType;
     }
 
     /**
@@ -1035,6 +1039,9 @@ public class VectorColumn {
     public int appendBytesAndOffset(byte[] src, int offset, int length) {
         int startOffset = childColumns[0].appendBytes(src, offset, length);
         reserve(appendIndex + 1);
+        if (startOffset + length < 0) {
+            throw new RuntimeException("String overflow, offset=" + startOffset + ", length=" + length);
+        }
         OffHeap.putInt(null, offsets + 4L * appendIndex, startOffset + length);
         return appendIndex++;
     }
@@ -1055,6 +1062,23 @@ public class VectorColumn {
                 bytes = v.getBytes(StandardCharsets.UTF_8);
             }
             int startOffset = childColumns[0].appendBytes(bytes, 0, bytes.length);
+            OffHeap.putInt(null, offsets + 4L * appendIndex, startOffset + bytes.length);
+            appendIndex++;
+        }
+    }
+
+    public void appendBinaryAndOffset(byte[][] batch, boolean isNullable) {
+        reserve(appendIndex + batch.length);
+        for (byte[] v : batch) {
+            byte[] bytes = v;
+            if (bytes == null) {
+                putNull(appendIndex);
+                bytes = new byte[0];
+            }
+            int startOffset = childColumns[0].appendBytes(bytes, 0, bytes.length);
+            if (startOffset + bytes.length < 0) {
+                throw new RuntimeException("Binary overflow, offset=" + startOffset + ", length=" + bytes.length);
+            }
             OffHeap.putInt(null, offsets + 4L * appendIndex, startOffset + bytes.length);
             appendIndex++;
         }
@@ -1089,6 +1113,9 @@ public class VectorColumn {
             childColumns[0].appendValue(v);
         }
         reserve(appendIndex + 1);
+        if (startOffset + length < 0) {
+            throw new RuntimeException("Array overflow, offset=" + startOffset + ", length=" + length);
+        }
         OffHeap.putLong(null, offsets + 8L * appendIndex, startOffset + length);
         return appendIndex++;
     }
@@ -1105,7 +1132,8 @@ public class VectorColumn {
             OffHeap.putLong(null, offsets + 8L * appendIndex, offset);
             appendIndex++;
         }
-        Object[] nested = newObjectContainerArray(childColumns[0].getColumnTyp(), offset - childColumns[0].appendIndex);
+        Object[] nested = newObjectContainerArray(childColumns[0].getColumnPrimitiveType(),
+                offset - childColumns[0].appendIndex);
         int index = 0;
         for (List<Object> v : batch) {
             if (v != null) {
@@ -1145,6 +1173,9 @@ public class VectorColumn {
             childColumns[1].appendValue(v);
         }
         reserve(appendIndex + 1);
+        if (startOffset + length < 0) {
+            throw new RuntimeException("Map overflow, offset=" + startOffset + ", length=" + length);
+        }
         OffHeap.putLong(null, offsets + 8L * appendIndex, startOffset + length);
         return appendIndex++;
     }
@@ -1161,8 +1192,10 @@ public class VectorColumn {
             OffHeap.putLong(null, offsets + 8L * appendIndex, offset);
             appendIndex++;
         }
-        Object[] keys = newObjectContainerArray(childColumns[0].getColumnTyp(), offset - childColumns[0].appendIndex);
-        Object[] values = newObjectContainerArray(childColumns[1].getColumnTyp(), offset - childColumns[0].appendIndex);
+        Object[] keys = newObjectContainerArray(childColumns[0].getColumnPrimitiveType(),
+                offset - childColumns[0].appendIndex);
+        Object[] values = newObjectContainerArray(childColumns[1].getColumnPrimitiveType(),
+                offset - childColumns[0].appendIndex);
         int index = 0;
         for (Map<Object, Object> v : batch) {
             if (v != null) {
@@ -1216,8 +1249,9 @@ public class VectorColumn {
     public void appendStruct(Map<String, Object>[] batch, boolean isNullable) {
         reserve(appendIndex + batch.length);
         Object[][] columnData = new Object[childColumns.length][];
+        Preconditions.checkArgument(this.getColumnType().getChildNames().size() == childColumns.length);
         for (int j = 0; j < childColumns.length; ++j) {
-            columnData[j] = newObjectContainerArray(childColumns[j].getColumnTyp(), batch.length);
+            columnData[j] = newObjectContainerArray(childColumns[j].getColumnPrimitiveType(), batch.length);
         }
         int index = 0;
         for (Map<String, Object> v : batch) {
@@ -1227,8 +1261,8 @@ public class VectorColumn {
                     columnData[j][index] = null;
                 }
             } else {
-                for (int j = 0; j < childColumns.length; ++j) {
-                    columnData[j][index] = v.get(childColumns[j].getColumnTyp().name());
+                for (int j = 0; j < this.getColumnType().getChildNames().size(); ++j) {
+                    columnData[j][index] = v.get(this.getColumnType().getChildNames().get(j));
                 }
             }
             index++;
@@ -1241,8 +1275,12 @@ public class VectorColumn {
 
     public HashMap<String, Object> getStruct(int rowId) {
         HashMap<String, Object> result = new HashMap<>();
-        for (VectorColumn column : childColumns) {
-            result.put(column.getColumnTyp().name(), column.getObjectColumn(rowId, rowId + 1)[0]);
+        Preconditions.checkArgument(this.getColumnType().getChildNames().size() == childColumns.length);
+        for (int i = 0; i < childColumns.length; ++i) {
+            // here use the hashmap to return struct data, the key is the nested_column name
+            // and value is the nested_column data
+            result.put(this.getColumnType().getChildNames().get(i),
+                    childColumns[i].getObjectColumn(rowId, rowId + 1)[0]);
         }
         return result;
     }
@@ -1391,7 +1429,11 @@ public class VectorColumn {
             case CHAR:
             case VARCHAR:
             case STRING:
-                appendStringAndOffset((String[]) batch, isNullable);
+                if (batch instanceof String[]) {
+                    appendStringAndOffset((String[]) batch, isNullable);
+                } else {
+                    appendBinaryAndOffset((byte[][]) batch, isNullable);
+                }
                 break;
             case ARRAY:
                 appendArray((List<Object>[]) batch, isNullable);
@@ -1498,6 +1540,12 @@ public class VectorColumn {
                 appendDateTime(o.getDateTime());
                 break;
             case CHAR:
+                if (o.canGetCharAsBytes()) {
+                    appendBytesAndOffset(o.getCharAsBytes());
+                } else {
+                    appendStringAndOffset(o.getChar());
+                }
+                break;
             case VARCHAR:
             case STRING:
                 if (o.canGetStringAsBytes()) {

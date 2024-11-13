@@ -19,7 +19,6 @@ package org.apache.doris.nereids.properties;
 
 import org.apache.doris.common.Id;
 import org.apache.doris.nereids.trees.expressions.ExprId;
-import org.apache.doris.nereids.trees.expressions.NamedExpression;
 import org.apache.doris.nereids.trees.expressions.Slot;
 
 import com.google.common.base.Supplier;
@@ -42,10 +41,12 @@ public class LogicalProperties {
     protected final Supplier<Set<Slot>> outputSetSupplier;
     protected final Supplier<Map<Slot, Slot>> outputMapSupplier;
     protected final Supplier<Set<ExprId>> outputExprIdSetSupplier;
+    protected final Supplier<DataTrait> dataTraitSupplier;
     private Integer hashCode = null;
 
-    public LogicalProperties(Supplier<List<Slot>> outputSupplier) {
-        this(outputSupplier, ImmutableList::of);
+    public LogicalProperties(Supplier<List<Slot>> outputSupplier,
+            Supplier<DataTrait> dataTraitSupplier) {
+        this(outputSupplier, dataTraitSupplier, ImmutableList::of);
     }
 
     /**
@@ -54,24 +55,48 @@ public class LogicalProperties {
      * @param outputSupplier provide the output. Supplier can lazy compute output without
      *                       throw exception for which children have UnboundRelation
      */
-    public LogicalProperties(Supplier<List<Slot>> outputSupplier, Supplier<List<Slot>> nonUserVisibleOutputSupplier) {
+    public LogicalProperties(Supplier<List<Slot>> outputSupplier,
+            Supplier<DataTrait> dataTraitSupplier,
+            Supplier<List<Slot>> nonUserVisibleOutputSupplier) {
         this.outputSupplier = Suppliers.memoize(
                 Objects.requireNonNull(outputSupplier, "outputSupplier can not be null")
         );
-        this.outputExprIdsSupplier = Suppliers.memoize(
-                () -> this.outputSupplier.get().stream().map(NamedExpression::getExprId).map(Id.class::cast)
-                        .collect(ImmutableList.toImmutableList())
-        );
-        this.outputSetSupplier = Suppliers.memoize(
-                () -> ImmutableSet.copyOf(this.outputSupplier.get())
-        );
-        this.outputMapSupplier = Suppliers.memoize(
-                () -> this.outputSetSupplier.get().stream().collect(ImmutableMap.toImmutableMap(s -> s, s -> s))
-        );
-        this.outputExprIdSetSupplier = Suppliers.memoize(
-                () -> this.outputSupplier.get().stream()
-                        .map(NamedExpression::getExprId)
-                        .collect(ImmutableSet.toImmutableSet())
+        this.outputExprIdsSupplier = Suppliers.memoize(() -> {
+            List<Slot> output = this.outputSupplier.get();
+            ImmutableList.Builder<Id> exprIdSet
+                    = ImmutableList.builderWithExpectedSize(output.size());
+            for (Slot slot : output) {
+                exprIdSet.add(slot.getExprId());
+            }
+            return exprIdSet.build();
+        });
+        this.outputSetSupplier = Suppliers.memoize(() -> {
+            List<Slot> output = outputSupplier.get();
+            ImmutableSet.Builder<Slot> slots = ImmutableSet.builderWithExpectedSize(output.size());
+            for (Slot slot : output) {
+                slots.add(slot);
+            }
+            return slots.build();
+        });
+        this.outputMapSupplier = Suppliers.memoize(() -> {
+            Set<Slot> slots = outputSetSupplier.get();
+            ImmutableMap.Builder<Slot, Slot> map = ImmutableMap.builderWithExpectedSize(slots.size());
+            for (Slot slot : slots) {
+                map.put(slot, slot);
+            }
+            return map.build();
+        });
+        this.outputExprIdSetSupplier = Suppliers.memoize(() -> {
+            List<Slot> output = this.outputSupplier.get();
+            ImmutableSet.Builder<ExprId> exprIdSet
+                    = ImmutableSet.builderWithExpectedSize(output.size());
+            for (Slot slot : output) {
+                exprIdSet.add(slot.getExprId());
+            }
+            return exprIdSet.build();
+        });
+        this.dataTraitSupplier = Suppliers.memoize(
+                Objects.requireNonNull(dataTraitSupplier, "Data Trait can not be null")
         );
     }
 
@@ -89,6 +114,10 @@ public class LogicalProperties {
 
     public Set<ExprId> getOutputExprIdSet() {
         return outputExprIdSetSupplier.get();
+    }
+
+    public DataTrait getTrait() {
+        return dataTraitSupplier.get();
     }
 
     public List<Id> getOutputExprIds() {

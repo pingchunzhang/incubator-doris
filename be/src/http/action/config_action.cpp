@@ -45,9 +45,9 @@ const static std::string PERSIST_PARAM = "persist";
 const std::string CONF_ITEM = "conf_item";
 
 void ConfigAction::handle(HttpRequest* req) {
-    if (_type == ConfigActionType::UPDATE_CONFIG) {
+    if (_config_type == ConfigActionType::UPDATE_CONFIG) {
         handle_update_config(req);
-    } else if (_type == ConfigActionType::SHOW_CONFIG) {
+    } else if (_config_type == ConfigActionType::SHOW_CONFIG) {
         handle_show_config(req);
     }
 }
@@ -62,7 +62,7 @@ void ConfigAction::handle_show_config(HttpRequest* req) {
 
     writer.StartArray();
     for (const auto& _config : config_info) {
-        if (conf_item != nullptr || conf_item != "") {
+        if (!conf_item.empty()) {
             if (_config[0] == conf_item) {
                 writer.StartArray();
                 for (const std::string& config_filed : _config) {
@@ -118,7 +118,6 @@ void ConfigAction::handle_update_config(HttpRequest* req) {
             std::string status(s.ok() ? "OK" : "BAD");
             rapidjson::Value result;
             result.SetObject();
-            rapidjson::Value(key.c_str(), key.size(), results.GetAllocator());
             result.AddMember("config_name",
                              rapidjson::Value(key.c_str(), key.size(), results.GetAllocator()),
                              results.GetAllocator());

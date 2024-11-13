@@ -25,6 +25,7 @@ import org.apache.paimon.types.BigIntType;
 import org.apache.paimon.types.BinaryType;
 import org.apache.paimon.types.BooleanType;
 import org.apache.paimon.types.CharType;
+import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataType;
 import org.apache.paimon.types.DataTypeDefaultVisitor;
 import org.apache.paimon.types.DateType;
@@ -45,6 +46,11 @@ import org.apache.paimon.types.VarCharType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+
 /**
  * Convert paimon type to doris type.
  */
@@ -56,9 +62,11 @@ public class PaimonTypeUtils {
 
     public static ColumnType fromPaimonType(String columnName, DataType type) {
         PaimonColumnType paimonColumnType = type.accept(PaimonToDorisTypeVisitor.INSTANCE);
-        return new ColumnType(columnName, paimonColumnType.getType(), paimonColumnType.getLength(),
+        ColumnType columnType = new ColumnType(columnName, paimonColumnType.getType(), paimonColumnType.getLength(),
                 paimonColumnType.getPrecision(),
                 paimonColumnType.getScale());
+        columnType.setChildTypes(paimonColumnType.getChildTypes());
+        return columnType;
     }
 
     private static class PaimonToDorisTypeVisitor extends DataTypeDefaultVisitor<PaimonColumnType> {
@@ -92,7 +100,16 @@ public class PaimonTypeUtils {
 
         @Override
         public PaimonColumnType visit(DecimalType decimalType) {
-            return new PaimonColumnType(Type.DECIMAL128, decimalType.getPrecision(), decimalType.getScale());
+            int precision = decimalType.getPrecision();
+            Type type;
+            if (precision <= ColumnType.MAX_DECIMAL32_PRECISION) {
+                type = Type.DECIMAL32;
+            } else if (precision <= ColumnType.MAX_DECIMAL64_PRECISION) {
+                type = Type.DECIMAL64;
+            } else {
+                type = Type.DECIMAL128;
+            }
+            return new PaimonColumnType(type, decimalType.getPrecision(), decimalType.getScale());
         }
 
         @Override
@@ -153,7 +170,10 @@ public class PaimonTypeUtils {
 
         @Override
         public PaimonColumnType visit(ArrayType arrayType) {
-            return this.defaultMethod(arrayType);
+            PaimonColumnType paimonColumnType = new PaimonColumnType(Type.ARRAY);
+            ColumnType elementColumnType = fromPaimonType("dummy-element", arrayType.getElementType());
+            paimonColumnType.setChildTypes(Collections.singletonList(elementColumnType));
+            return paimonColumnType;
         }
 
         @Override
@@ -163,12 +183,22 @@ public class PaimonTypeUtils {
 
         @Override
         public PaimonColumnType visit(MapType mapType) {
-            return this.defaultMethod(mapType);
+            PaimonColumnType paimonColumnType = new PaimonColumnType(Type.MAP);
+            ColumnType key = fromPaimonType("dummy-key", mapType.getKeyType());
+            ColumnType value = fromPaimonType("dummy-value", mapType.getValueType());
+            paimonColumnType.setChildTypes(Arrays.asList(key, value));
+            return paimonColumnType;
         }
 
         @Override
         public PaimonColumnType visit(RowType rowType) {
-            return this.defaultMethod(rowType);
+            PaimonColumnType paimonColumnType = new PaimonColumnType(Type.STRUCT);
+            List<DataField> fields = rowType.getFields();
+            List<ColumnType> childTypes = fields.stream()
+                    .map(field -> fromPaimonType(field.name(), field.type()))
+                    .collect(Collectors.toList());
+            paimonColumnType.setChildTypes(childTypes);
+            return paimonColumnType;
         }
 
         @Override
@@ -184,6 +214,7 @@ public class PaimonTypeUtils {
         private int length;
         private int precision;
         private int scale;
+        private List<ColumnType> childTypes;
 
         public PaimonColumnType(Type type) {
             this.type = type;
@@ -224,6 +255,14 @@ public class PaimonTypeUtils {
 
         public void setPrecision(int precision) {
             this.precision = precision;
+        }
+
+        public void setChildTypes(List<ColumnType> childTypes) {
+            this.childTypes = childTypes;
+        }
+
+        public List<ColumnType> getChildTypes() {
+            return childTypes;
         }
     }
 }
